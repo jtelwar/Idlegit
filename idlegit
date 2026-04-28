@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Launches the interactive multi-repo git menu.
+set -euo pipefail
+exec "$(dirname "$0")/idlegit.py" "$@"
