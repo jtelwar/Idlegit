@@ -41,6 +41,7 @@ DEFAULT_BRANCH_DISPLAY_MAX = 12
 DEFAULT_NAME_DISPLAY_MAX = 40
 DEFAULT_TRUNCATION_MODE = "middle"
 TRUNCATION_MODES = ("start", "middle", "end")
+DEFAULT_MAX_VISIBLE_REPO_ROWS = 0  # 0 = use all available height
 
 SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
@@ -78,6 +79,7 @@ class Config:
     name_display_max: int = DEFAULT_NAME_DISPLAY_MAX
     name_truncation: str = DEFAULT_TRUNCATION_MODE
     branch_truncation: str = DEFAULT_TRUNCATION_MODE
+    max_visible_repo_rows: int = DEFAULT_MAX_VISIBLE_REPO_ROWS
     subtrees: List["SubtreeSpec"] = field(default_factory=list)
 
 
@@ -95,6 +97,7 @@ def load_config() -> Config:
     name_display_max = DEFAULT_NAME_DISPLAY_MAX
     name_truncation = DEFAULT_TRUNCATION_MODE
     branch_truncation = DEFAULT_TRUNCATION_MODE
+    max_visible_repo_rows = DEFAULT_MAX_VISIBLE_REPO_ROWS
     subtrees: List[SubtreeSpec] = []
 
     if CONFIG_FILE.exists():
@@ -120,6 +123,8 @@ def load_config() -> Config:
             branch_truncation = cp.get(
                 "idlegit", "branch_truncation",
                 fallback=DEFAULT_TRUNCATION_MODE).strip().lower()
+            max_visible_repo_rows = cp.getint(
+                "idlegit", "max_visible_repo_rows", fallback=DEFAULT_MAX_VISIBLE_REPO_ROWS)
             for section in cp.sections():
                 if not section.startswith("subtree."):
                     continue
@@ -156,6 +161,7 @@ def load_config() -> Config:
         name_display_max=name_display_max,
         name_truncation=name_truncation,
         branch_truncation=branch_truncation,
+        max_visible_repo_rows=max(0, max_visible_repo_rows),
         subtrees=subtrees,
     )
 
@@ -184,6 +190,8 @@ class Repo:
     error: str = ""
     merging: bool = False
     conflict_paths: List[str] = field(default_factory=list)
+    suggesting: bool = False  # background suggest in flight for this row
+    refreshing: bool = False  # inline refresh in flight for this row
 
     @property
     def display_name(self) -> str:
@@ -324,6 +332,8 @@ class ChildRef:
     in_sync: bool = True
     kind: str = "submodule"
     message: str = ""
+    dirty: bool = False  # working-tree changes in the nested checkout
+    suggesting: bool = False  # background suggest in flight for this row
 
 
 @dataclass
@@ -378,8 +388,10 @@ class State:
     name_display_max: int = DEFAULT_NAME_DISPLAY_MAX
     name_truncation: str = DEFAULT_TRUNCATION_MODE
     branch_truncation: str = DEFAULT_TRUNCATION_MODE
+    max_visible_repo_rows: int = DEFAULT_MAX_VISIBLE_REPO_ROWS
     subtrees: List[SubtreeSpec] = field(default_factory=list)
     selected: int = 2  # 0,1 = toggles; 2..N+1 = repos
+    body_scroll: int = 0  # how many body rows are scrolled past the top
     auto_stage: bool = True
     auto_push: bool = True
     tasks: Tasks = field(default_factory=Tasks)
@@ -387,6 +399,12 @@ class State:
     # Cursor position within the focused row's message field. Reset to the
     # end of the message whenever the focused row changes (see _reset_field_cursor).
     field_cursor: int = 0
+    # Modal stack — only the topmost modal handles input. Esc closes the
+    # topmost; closing the action menu returns to the main view.
+    action_menu: Optional["ActionMenu"] = None
+    branch_picker: Optional["BranchPicker"] = None
+    reset_prompt: Optional["ResetPrompt"] = None
+    global_menu: Optional["GlobalMenu"] = None
 
     def selectable_rows(self) -> List[Tuple]:
         """Flat selectable list: ('toggle', 0|1, None), ('repo', repo, None),
@@ -456,6 +474,77 @@ class FileChange:
     weight: float = 0.0
 
 
+@dataclass
+class ActionMenuItem:
+    """One row in the Tab-context-menu. `enabled=False` greys it out and
+    Enter is a no-op; `reason` (if any) appears next to the label."""
+    id: str
+    label: str
+    enabled: bool = True
+    reason: str = ""
+
+
+@dataclass
+class ActionMenu:
+    """Modal opened with Tab on a repo / submodule child row. Carries the
+    pre-computed metadata (branch, upstream, ahead/behind…) and recent
+    commits so we don't have to query git on every redraw."""
+    target_label: str          # e.g. "Upskill.Health.API" / "↳ Domain.Models in API"
+    target_path: Path          # where git commands run for this menu
+    # Reference back to whatever owns the row so post-action refresh knows
+    # what to rescan. Exactly one of these is set.
+    target_repo: Optional[Repo] = None
+    target_parent: Optional[Repo] = None
+    target_child: Optional[ChildRef] = None
+    # Pre-computed metadata (frozen at open time).
+    branch: str = ""
+    upstream: Optional[str] = None
+    ahead: int = 0
+    behind: int = 0
+    state_label: str = "clean"
+    state_pair: int = 0
+    items: List[ActionMenuItem] = field(default_factory=list)
+    selected: int = 0
+    commits: List[str] = field(default_factory=list)
+
+
+@dataclass
+class BranchPicker:
+    """Sub-modal triggered from the action menu's "switch branch" item."""
+    target_label: str
+    target_path: Path
+    target_repo: Optional[Repo] = None
+    target_parent: Optional[Repo] = None
+    target_child: Optional[ChildRef] = None
+    branches: List[str] = field(default_factory=list)
+    current: str = ""
+    selected: int = 0
+    scroll: int = 0
+
+
+@dataclass
+class ResetPrompt:
+    """Sub-modal triggered from the action menu's "soft reset" item.
+    `count` is the user-typed number; 0 means "wipe all unpushed (reset to
+    @{u})"."""
+    target_label: str
+    target_path: Path
+    target_repo: Optional[Repo] = None
+    target_parent: Optional[Repo] = None
+    target_child: Optional[ChildRef] = None
+    ahead: int = 0
+    count: int = 0
+    typed: str = ""  # raw input buffer; empty means count=0
+
+
+@dataclass
+class GlobalMenu:
+    """Modal opened with Shift+Tab — workspace-wide actions that aren't
+    tied to a single row."""
+    items: List[ActionMenuItem] = field(default_factory=list)
+    selected: int = 0
+
+
 # ---------- Git -------------------------------------------------------------
 
 
@@ -488,7 +577,8 @@ def canonicalize_url(url: str) -> str:
 def discover_repos(workspace: Path) -> List[Repo]:
     """Return the workspace itself (if it's a git repo) plus every immediate
     child folder containing .git, sorted alphabetically. The folder this
-    script lives in is always skipped."""
+    script lives in is included if (and only if) it's also a git repo —
+    handy for managing idlegit's own checkout from idlegit itself."""
     repos: List[Repo] = []
     if (workspace / ".git").exists():
         repos.append(Repo(rel=".", path=workspace))
@@ -500,11 +590,6 @@ def discover_repos(workspace: Path) -> List[Repo]:
         if not child.is_dir():
             continue
         if child.name.startswith("."):
-            continue
-        try:
-            if child.resolve() == TOOL_DIR:
-                continue
-        except OSError:
             continue
         if (child / ".git").exists():
             repos.append(Repo(rel=child.name, path=child.resolve()))
@@ -528,6 +613,7 @@ def link_siblings(repos: List[Repo],
         r.children = []
 
     # Submodule references — discovered from each parent's .gitmodules.
+    submodule_refs: List[ChildRef] = []
     for parent in repos:
         if parent.rel == ".":
             continue
@@ -537,13 +623,24 @@ def link_siblings(repos: List[Repo],
                 continue
             target.siblings.append((parent, sub_path))
             ref = ChildRef(repo=target, nested_path=sub_path, kind="submodule")
-            rc, out, _ = git(sub_path, ["rev-parse", "HEAD"])
-            if rc == 0:
-                ref.head = out.strip()
-                ref.in_sync = bool(target.head) and ref.head == target.head
-            else:
-                ref.in_sync = False
             parent.children.append(ref)
+            submodule_refs.append(ref)
+
+    # Populate per-child state (HEAD + dirty flag) in parallel — one git
+    # status + one rev-parse per child, capped at the number of children.
+    def _populate(ref: ChildRef) -> None:
+        rc, out, _ = git(ref.nested_path, ["rev-parse", "HEAD"])
+        if rc == 0:
+            ref.head = out.strip()
+            ref.in_sync = bool(ref.repo.head) and ref.head == ref.repo.head
+        else:
+            ref.in_sync = False
+        rc, out, _ = git(ref.nested_path, ["status", "--porcelain=v1"])
+        ref.dirty = rc == 0 and bool(out.strip())
+
+    if submodule_refs:
+        with ThreadPoolExecutor(max_workers=len(submodule_refs)) as ex:
+            list(ex.map(_populate, submodule_refs))
 
     # Subtree references — declared in idlegit.conf.
     for spec in subtrees or []:
@@ -587,6 +684,122 @@ def sync_subtree(parent_path: Path, prefix: str,
     if rc != 0:
         return False, f"subtree pull failed: {first_line(err)}"
     return True, "subtree pulled"
+
+
+# ---------- Target-state query (for the action menu) -----------------------
+
+
+@dataclass
+class TargetState:
+    """Snapshot of a working tree's state, queried fresh when the action
+    menu opens — covers both top-level repos and nested submodule paths."""
+    branch: str
+    upstream: Optional[str]
+    ahead: int
+    behind: int
+    has_origin: bool
+    merging: bool
+    dirty: bool
+    recent_commits: List[str]
+
+
+def query_target_state(path: Path, max_commits: int = 5) -> TargetState:
+    branch = ""
+    rc, out, _ = git(path, ["branch", "--show-current"])
+    if rc == 0:
+        branch = out.strip() or "(detached)"
+
+    upstream: Optional[str] = None
+    rc, out, _ = git(path, [
+        "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
+    if rc == 0 and out.strip():
+        upstream = out.strip()
+
+    ahead = 0
+    behind = 0
+    if upstream:
+        rc, out, _ = git(path, [
+            "rev-list", "--count", "--left-right", f"{upstream}...HEAD"])
+        if rc == 0:
+            parts = out.split()
+            if len(parts) == 2:
+                try:
+                    behind = int(parts[0])
+                    ahead = int(parts[1])
+                except ValueError:
+                    pass
+
+    rc, out, _ = git(path, ["remote", "get-url", "origin"])
+    has_origin = rc == 0 and bool(out.strip())
+
+    merging = False
+    rc, out, _ = git(path, ["rev-parse", "--git-dir"])
+    if rc == 0 and out.strip():
+        gd = Path(out.strip())
+        if not gd.is_absolute():
+            gd = (path / gd).resolve()
+        for marker in MERGE_MARKER_FILES:
+            if (gd / marker).exists():
+                merging = True
+                break
+        if not merging:
+            for marker in MERGE_MARKER_DIRS:
+                if (gd / marker).is_dir():
+                    merging = True
+                    break
+
+    rc, out, _ = git(path, ["status", "--porcelain=v1"])
+    dirty = rc == 0 and bool(out.strip())
+
+    commits: List[str] = []
+    rc, out, _ = git(path, [
+        "log", f"-n{max_commits}", "--pretty=format:%h %s (%cr)"])
+    if rc == 0 and out.strip():
+        commits = out.strip().splitlines()
+
+    return TargetState(
+        branch=branch, upstream=upstream, ahead=ahead, behind=behind,
+        has_origin=has_origin, merging=merging, dirty=dirty,
+        recent_commits=commits,
+    )
+
+
+def list_branches(path: Path) -> Tuple[List[str], str]:
+    """Return (sorted unique branch names, current_branch). Local branches
+    listed first; remote-tracking branches without a local counterpart
+    come second (their `origin/` prefix stripped). HEAD is excluded."""
+    current = ""
+    rc, out, _ = git(path, ["branch", "--show-current"])
+    if rc == 0:
+        current = out.strip()
+
+    rc, out, _ = git(path, [
+        "branch", "-a", "--format=%(refname:short)"])
+    if rc != 0:
+        return [], current
+
+    locals_seen: List[str] = []
+    remote_only: List[str] = []
+    have_local = set()
+    for line in out.strip().splitlines():
+        name = line.strip()
+        if not name:
+            continue
+        if name.startswith("origin/HEAD"):
+            continue
+        if name.startswith("origin/"):
+            short = name[len("origin/"):]
+            if short and short not in have_local:
+                if short not in remote_only:
+                    remote_only.append(short)
+        else:
+            if name not in locals_seen:
+                locals_seen.append(name)
+                have_local.add(name)
+
+    # Filter out remote-only entries that already have a local
+    remote_only = [b for b in remote_only if b not in have_local]
+    return locals_seen + remote_only, current
 
 
 # ---------- Commit-message suggestion --------------------------------------
@@ -945,6 +1158,62 @@ def kick_off_sync_siblings(state: State) -> None:
     threading.Thread(target=worker, daemon=True).start()
 
 
+def kick_off_inline_refresh(state: State) -> None:
+    """Re-discover repos in the workspace, removing gone entries and adding
+    new ones inline, and refresh every kept/new repo in parallel — each
+    one toggling its `refreshing` flag so the row spinner animates next to
+    its name. The main view stays visible the whole time; no overlay."""
+    workspace = (TOOL_DIR / DEFAULT_ROOT).resolve()
+    # If the user pointed root somewhere else via config, the existing repos
+    # all share a common parent — use any one as the workspace anchor.
+    if state.repos:
+        workspace = state.repos[0].path.parent
+        if state.repos[0].rel == ".":
+            workspace = state.repos[0].path
+
+    def worker() -> None:
+        # Re-discover to pick up newly-added / removed folders.
+        try:
+            fresh = discover_repos(workspace)
+        except Exception:
+            fresh = []
+        fresh_by_rel = {r.rel: r for r in fresh}
+        kept_rels = {r.rel for r in state.repos if r.rel in fresh_by_rel}
+
+        # Remove repos that vanished from disk.
+        state.repos[:] = [r for r in state.repos if r.rel in kept_rels]
+
+        # Insert any newly-discovered repos in the original sort order.
+        existing_rels = {r.rel for r in state.repos}
+        for r in fresh:
+            if r.rel not in existing_rels:
+                state.repos.append(r)
+        state.repos.sort(
+            key=lambda r: (r.rel != ".", r.rel.lower() if r.rel != "." else ""))
+
+        # Mark every repo as refreshing, then run refreshes in parallel.
+        for r in state.repos:
+            r.refreshing = True
+
+        def refresh_one(r: Repo) -> None:
+            try:
+                r.refresh()
+            finally:
+                r.refreshing = False
+
+        if state.repos:
+            with ThreadPoolExecutor(max_workers=len(state.repos)) as ex:
+                list(ex.map(refresh_one, state.repos))
+        link_siblings(state.repos, state.subtrees)
+
+        # Clamp selection in case we trimmed/grew the row list.
+        state.selected = max(0, min(state.selected, max(0, state.total_rows - 1)))
+        state.body_scroll = max(
+            0, min(state.body_scroll, max(0, state.total_rows - 1)))
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
 def kick_off_workers(state: State, candidates: List[LFSCandidate]) -> None:
     """Launch one worker thread per repo / nested-child with a queued
     message and a supervisor thread that silently re-fetches repo state
@@ -1002,6 +1271,435 @@ def kick_off_workers(state: State, candidates: List[LFSCandidate]) -> None:
         link_siblings(state.repos, state.subtrees)
 
     threading.Thread(target=supervisor, daemon=True).start()
+
+
+# ---------- Action menu helpers -------------------------------------------
+
+
+def _refresh_target_state(state: State,
+                          target_repo: Optional[Repo],
+                          target_parent: Optional[Repo]) -> None:
+    """Re-fetch state for just one row's repo (the user's spec — don't
+    refresh-all). For top-level rows we refresh the Repo itself; for
+    submodule child rows we refresh the parent (its dirty state changes
+    when the nested checkout moves) and then re-link siblings so the
+    child's HEAD/in_sync/dirty fields catch up."""
+    if target_repo is not None:
+        target_repo.refresh()
+    if target_parent is not None:
+        target_parent.refresh()
+    link_siblings(state.repos, state.subtrees)
+
+
+def kick_off_action(state: State, action_id: str, *,
+                    target_label: str, target_path: Path,
+                    target_repo: Optional[Repo],
+                    target_parent: Optional[Repo],
+                    branch_arg: str = "",
+                    reset_count: int = 0) -> None:
+    """Spawn a daemon worker that runs one git action against `target_path`,
+    publishes its progress to the sidebar, and quietly re-queries that one
+    repo's state when it finishes. Returns immediately so the UI is free."""
+
+    def worker() -> None:
+        if action_id == "fetch":
+            t = state.tasks.add(f"{target_label}: fetch")
+            rc, _, err = git(target_path, ["fetch", "--all"])
+            state.tasks.update(
+                t, "ok" if rc == 0 else "fail",
+                "" if rc == 0 else first_line(err))
+        elif action_id == "pull":
+            t = state.tasks.add(f"{target_label}: pull")
+            rc, _, err = git(target_path, ["pull"])
+            state.tasks.update(
+                t, "ok" if rc == 0 else "fail",
+                "" if rc == 0 else first_line(err))
+        elif action_id == "push":
+            t = state.tasks.add(f"{target_label}: push")
+            rc_b, b_out, _ = git(target_path, ["branch", "--show-current"])
+            cur_branch = b_out.strip() if rc_b == 0 else ""
+            rc_u, u_out, _ = git(target_path, [
+                "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
+            has_upstream = rc_u == 0 and bool(u_out.strip())
+            if has_upstream:
+                rc, _, err = git(target_path, ["push"])
+            elif cur_branch:
+                rc, _, err = git(target_path, [
+                    "push", "--set-upstream", "origin", cur_branch])
+            else:
+                rc, err = 1, "no current branch"
+            state.tasks.update(
+                t, "ok" if rc == 0 else "fail",
+                "" if rc == 0 else first_line(err))
+        elif action_id == "soft_reset":
+            if reset_count <= 0:
+                t = state.tasks.add(
+                    f"{target_label}: soft reset all unpushed (to @{{u}})")
+                rc, _, err = git(target_path, ["reset", "--soft", "@{u}"])
+            else:
+                t = state.tasks.add(
+                    f"{target_label}: soft reset HEAD~{reset_count}")
+                rc, _, err = git(target_path, [
+                    "reset", "--soft", f"HEAD~{reset_count}"])
+            state.tasks.update(
+                t, "ok" if rc == 0 else "fail",
+                "" if rc == 0 else first_line(err))
+        elif action_id == "switch_branch":
+            t = state.tasks.add(f"{target_label}: checkout {branch_arg}")
+            rc, _, err = git(target_path, ["checkout", branch_arg])
+            state.tasks.update(
+                t, "ok" if rc == 0 else "fail",
+                "" if rc == 0 else first_line(err))
+        else:
+            return  # unknown action — nothing to do
+
+        _refresh_target_state(state, target_repo, target_parent)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def open_action_menu(state: State) -> None:
+    """Build and install the ActionMenu modal for the focused row."""
+    if state.on_toggle:
+        return
+    cur_repo = state.current_repo
+    cur_child = state.current_child
+
+    target_repo: Optional[Repo] = None
+    target_parent: Optional[Repo] = None
+    target_child: Optional[ChildRef] = None
+    if cur_repo is not None:
+        label = cur_repo.display_name
+        target_path = cur_repo.path
+        target_repo = cur_repo
+    elif cur_child is not None and cur_child[1].kind == "submodule":
+        parent, child = cur_child
+        label = f"↳ {child.repo.display_name} in {parent.display_name}"
+        target_path = child.nested_path
+        target_parent = parent
+        target_child = child
+    else:
+        return  # subtree row or otherwise unsupported
+
+    ts = query_target_state(target_path)
+
+    items = [
+        ActionMenuItem(
+            id="fetch", label="fetch (all branches)",
+            enabled=ts.has_origin,
+            reason="" if ts.has_origin else "no origin"),
+        ActionMenuItem(
+            id="pull", label="pull",
+            enabled=ts.has_origin and ts.upstream is not None and not ts.merging,
+            reason=("merging" if ts.merging
+                    else ("no upstream" if ts.upstream is None
+                          else ("" if ts.has_origin else "no origin")))),
+        ActionMenuItem(
+            id="switch_branch", label="switch branch…",
+            enabled=not ts.merging,
+            reason="" if not ts.merging else "merging"),
+        ActionMenuItem(
+            id="soft_reset",
+            label=f"soft reset ({ts.ahead} unpushed)…",
+            enabled=ts.ahead > 0,
+            reason="" if ts.ahead > 0 else "no unpushed commits"),
+        ActionMenuItem(
+            id="push", label="push",
+            enabled=ts.has_origin,
+            reason="" if ts.has_origin else "no origin"),
+    ]
+
+    # Pick the first enabled item as the initial selection.
+    initial = 0
+    for i, it in enumerate(items):
+        if it.enabled:
+            initial = i
+            break
+
+    # State badge for the metadata header.
+    if ts.merging:
+        state_label, state_pair = "merging", PAIR_ERR
+    elif ts.ahead > 0 and ts.behind > 0:
+        state_label, state_pair = "diverged", PAIR_ERR
+    elif ts.dirty:
+        state_label, state_pair = "dirty", PAIR_DIRTY
+    elif ts.behind > 0:
+        state_label, state_pair = "behind", PAIR_BEHIND
+    elif ts.ahead > 0:
+        state_label, state_pair = "ahead", PAIR_AHEAD
+    elif ts.upstream is None:
+        state_label, state_pair = "no upstream", 0  # 0 = no pair → A_DIM only
+    else:
+        state_label, state_pair = "clean", PAIR_OK
+
+    state.action_menu = ActionMenu(
+        target_label=label,
+        target_path=target_path,
+        target_repo=target_repo,
+        target_parent=target_parent,
+        target_child=target_child,
+        branch=ts.branch,
+        upstream=ts.upstream,
+        ahead=ts.ahead,
+        behind=ts.behind,
+        state_label=state_label,
+        state_pair=state_pair,
+        items=items,
+        selected=initial,
+        commits=ts.recent_commits,
+    )
+
+
+def open_branch_picker(state: State) -> None:
+    """Open the branch picker submodal off the active action menu."""
+    menu = state.action_menu
+    if menu is None:
+        return
+    branches, current = list_branches(menu.target_path)
+    initial = 0
+    for i, b in enumerate(branches):
+        if b == current:
+            initial = i
+            break
+    state.branch_picker = BranchPicker(
+        target_label=menu.target_label,
+        target_path=menu.target_path,
+        target_repo=menu.target_repo,
+        target_parent=menu.target_parent,
+        target_child=menu.target_child,
+        branches=branches,
+        current=current,
+        selected=initial,
+    )
+
+
+def open_reset_prompt(state: State) -> None:
+    """Open the soft-reset count prompt off the active action menu."""
+    menu = state.action_menu
+    if menu is None:
+        return
+    state.reset_prompt = ResetPrompt(
+        target_label=menu.target_label,
+        target_path=menu.target_path,
+        target_repo=menu.target_repo,
+        target_parent=menu.target_parent,
+        target_child=menu.target_child,
+        ahead=menu.ahead,
+    )
+
+
+def open_global_menu(state: State) -> None:
+    """Open the workspace-wide modal (Shift+Tab)."""
+    has_dirty_empty = False
+    for repo in state.repos:
+        if repo.is_dirty and not repo.message.strip():
+            has_dirty_empty = True
+            break
+    if not has_dirty_empty:
+        for parent in state.repos:
+            for child in parent.children:
+                if (child.kind == "submodule" and child.dirty
+                        and not child.message.strip()):
+                    has_dirty_empty = True
+                    break
+            if has_dirty_empty:
+                break
+    items = [
+        ActionMenuItem(
+            id="suggest_all", label="Suggest all empty commit messages",
+            enabled=has_dirty_empty,
+            reason="" if has_dirty_empty else "no dirty rows with empty message"),
+        ActionMenuItem(
+            id="refresh_all", label="Refresh all repos", enabled=True),
+    ]
+    state.global_menu = GlobalMenu(items=items, selected=0)
+
+
+# ---------- Background suggest workers ------------------------------------
+
+
+def _suggest_into_repo(state: State, repo: Repo) -> None:
+    repo.suggesting = True
+    try:
+        result = suggest_commit_message(
+            repo,
+            max_added=state.suggest_added,
+            max_updated=state.suggest_updated,
+            max_deleted=state.suggest_deleted,
+            auto_stage=state.auto_stage,
+        )
+        if result:
+            repo.message = result
+    finally:
+        repo.suggesting = False
+
+
+def _suggest_into_child(state: State, child: ChildRef) -> None:
+    child.suggesting = True
+    try:
+        result = suggest_commit_message_at(
+            child.nested_path,
+            max_added=state.suggest_added,
+            max_updated=state.suggest_updated,
+            max_deleted=state.suggest_deleted,
+            auto_stage=state.auto_stage,
+        )
+        if result:
+            child.message = result
+    finally:
+        child.suggesting = False
+
+
+def kick_off_suggest_for(state: State, target) -> None:
+    """Run a single suggestion in a background thread; UI shows a spinner
+    in the field meanwhile via target.suggesting."""
+    if isinstance(target, Repo):
+        threading.Thread(
+            target=_suggest_into_repo, args=(state, target), daemon=True).start()
+    else:  # ChildRef
+        threading.Thread(
+            target=_suggest_into_child, args=(state, target), daemon=True).start()
+
+
+def kick_off_bulk_suggest(state: State) -> None:
+    """For every dirty row with an empty message, kick off a background
+    suggestion. Each row animates independently."""
+    for repo in state.repos:
+        if repo.is_dirty and not repo.message.strip() and not repo.suggesting:
+            kick_off_suggest_for(state, repo)
+    for parent in state.repos:
+        for child in parent.children:
+            if (child.kind == "submodule" and child.dirty
+                    and not child.message.strip() and not child.suggesting):
+                kick_off_suggest_for(state, child)
+
+
+# ---------- Modal key handlers --------------------------------------------
+
+
+def handle_action_menu_key(state: State, key: int) -> None:
+    menu = state.action_menu
+    if menu is None:
+        return
+    if key == 27:
+        state.action_menu = None
+        return
+    if key == curses.KEY_UP and menu.items:
+        menu.selected = (menu.selected - 1) % len(menu.items)
+        return
+    if key == curses.KEY_DOWN and menu.items:
+        menu.selected = (menu.selected + 1) % len(menu.items)
+        return
+    if key in (10, 13, curses.KEY_ENTER) and menu.items:
+        item = menu.items[menu.selected]
+        if not item.enabled:
+            return
+        if item.id == "switch_branch":
+            open_branch_picker(state)
+            return
+        if item.id == "soft_reset":
+            open_reset_prompt(state)
+            return
+        kick_off_action(
+            state, item.id,
+            target_label=menu.target_label,
+            target_path=menu.target_path,
+            target_repo=menu.target_repo,
+            target_parent=menu.target_parent,
+        )
+        state.action_menu = None
+
+
+def handle_branch_picker_key(state: State, key: int) -> None:
+    picker = state.branch_picker
+    if picker is None:
+        return
+    if key == 27:
+        state.branch_picker = None
+        return
+    if not picker.branches:
+        return
+    if key == curses.KEY_UP:
+        picker.selected = max(0, picker.selected - 1)
+        return
+    if key == curses.KEY_DOWN:
+        picker.selected = min(len(picker.branches) - 1, picker.selected + 1)
+        return
+    if key == curses.KEY_PPAGE:
+        picker.selected = max(0, picker.selected - 10)
+        return
+    if key == curses.KEY_NPAGE:
+        picker.selected = min(len(picker.branches) - 1, picker.selected + 10)
+        return
+    if key in (10, 13, curses.KEY_ENTER):
+        branch = picker.branches[picker.selected]
+        kick_off_action(
+            state, "switch_branch",
+            target_label=picker.target_label,
+            target_path=picker.target_path,
+            target_repo=picker.target_repo,
+            target_parent=picker.target_parent,
+            branch_arg=branch,
+        )
+        state.branch_picker = None
+        state.action_menu = None
+
+
+def handle_reset_prompt_key(state: State, key: int) -> None:
+    prompt = state.reset_prompt
+    if prompt is None:
+        return
+    if key == 27:
+        state.reset_prompt = None
+        return
+    if key in (10, 13, curses.KEY_ENTER):
+        try:
+            n = int(prompt.typed) if prompt.typed else 0
+        except ValueError:
+            n = 0
+        kick_off_action(
+            state, "soft_reset",
+            target_label=prompt.target_label,
+            target_path=prompt.target_path,
+            target_repo=prompt.target_repo,
+            target_parent=prompt.target_parent,
+            reset_count=max(0, n),
+        )
+        state.reset_prompt = None
+        state.action_menu = None
+        return
+    if key in (curses.KEY_BACKSPACE, 127, 8):
+        prompt.typed = prompt.typed[:-1]
+        return
+    if 48 <= key <= 57:  # 0–9
+        prompt.typed += chr(key)
+
+
+def handle_global_menu_key(state: State, key: int) -> Optional[str]:
+    menu = state.global_menu
+    if menu is None:
+        return None
+    if key == 27:
+        state.global_menu = None
+        return None
+    if key == curses.KEY_UP and menu.items:
+        menu.selected = (menu.selected - 1) % len(menu.items)
+        return None
+    if key == curses.KEY_DOWN and menu.items:
+        menu.selected = (menu.selected + 1) % len(menu.items)
+        return None
+    if key in (10, 13, curses.KEY_ENTER) and menu.items:
+        item = menu.items[menu.selected]
+        if not item.enabled:
+            return None
+        if item.id == "suggest_all":
+            kick_off_bulk_suggest(state)
+            state.global_menu = None
+            return None
+        if item.id == "refresh_all":
+            state.global_menu = None
+            return "refresh"
+    return None
 
 
 # ---------- Colors ----------------------------------------------------------
@@ -1255,15 +1953,44 @@ def draw_sidebar(stdscr, state: State, x: int, w: int) -> None:
 # ---------- Main screen -----------------------------------------------------
 
 
+def _body_height_for(state: State, h: int) -> int:
+    """Height (in rows) available for the repo body. Reserves space for the
+    title (1), toggles row (1) + blank (1), one blank line before hints,
+    two hint lines, and the state legend (1) — 7 rows of chrome total.
+    Capped by `state.max_visible_repo_rows` if > 0; floored at 1 so at least one
+    repo row is always visible."""
+    chrome = 7
+    avail = h - chrome
+    if avail < 1:
+        return 1
+    if state.max_visible_repo_rows > 0:
+        avail = min(avail, state.max_visible_repo_rows)
+    return max(1, avail)
+
+
+def _ensure_focused_visible(state: State, body_h: int, total_body: int) -> None:
+    """Adjust state.body_scroll so the focused body row is on-screen."""
+    if state.on_toggle:
+        return
+    body_idx = state.selected - 2
+    if body_idx < 0 or body_idx >= total_body:
+        return
+    if body_idx < state.body_scroll:
+        state.body_scroll = body_idx
+    elif body_idx >= state.body_scroll + body_h:
+        state.body_scroll = body_idx - body_h + 1
+    state.body_scroll = max(0, min(state.body_scroll, max(0, total_body - body_h)))
+
+
 def draw_main(stdscr, state: State) -> None:
     stdscr.erase()
     h, w = stdscr.getmaxyx()
-    visual_rows = len(state.repos) + sum(len(r.children) for r in state.repos)
 
     sidebar_x, sidebar_w = sidebar_geometry(w)
     main_w = sidebar_x
 
-    if main_w < 80 or h < 9 + visual_rows:
+    body_h = _body_height_for(state, h)
+    if main_w < 80 or h < 8:
         safe_addstr(stdscr, 0, 0, "terminal too small — resize and try again",
                     curses.color_pair(PAIR_ERR))
         stdscr.refresh()
@@ -1294,37 +2021,51 @@ def draw_main(stdscr, state: State) -> None:
     field_x = 2 + name_w + branch_w + marker_w
     field_w = max(20, main_w - field_x - 2)
 
-    # Repo rows, with any tracked-repo children rendered indented underneath.
-    # `y_for_body` is parallel to selectable_rows()[2:] (i.e., everything
-    # below the toggle row) so the cursor logic below can map state.selected
-    # straight to a screen y.
+    # Body rows: every selectable row below the toggles. Scroll so the
+    # focused row stays visible inside the [body_scroll, body_scroll+body_h)
+    # window before rendering.
     base_y = 4
-    y_for_body: List[int] = []
     body_rows = state.selectable_rows()[2:]
-    y = base_y
-    for i, row in enumerate(body_rows):
-        y_for_body.append(y)
-        full_idx = i + 2
+    _ensure_focused_visible(state, body_h, len(body_rows))
+    visible_start = state.body_scroll
+    visible_end = min(len(body_rows), visible_start + body_h)
+
+    spinner_char = SPINNER_FRAMES[state.spinner_frame % len(SPINNER_FRAMES)]
+    y_for_body: Dict[int, int] = {}
+    for screen_i, body_idx in enumerate(range(visible_start, visible_end)):
+        row = body_rows[body_idx]
+        y = base_y + screen_i
+        y_for_body[body_idx] = y
+        full_idx = body_idx + 2
         focused = (state.selected == full_idx)
         if row[0] == "repo":
             row_cursor = state.field_cursor if focused else 0
             draw_repo_row(stdscr, y, row[1], focused,
                           name_w, branch_w, field_x, field_w,
-                          nm, bm, nmode, bmode, row_cursor)
+                          nm, bm, nmode, bmode, row_cursor, spinner_char)
         else:  # child
             row_cursor = state.field_cursor if focused else 0
             draw_child_row(stdscr, y, row[2], focused,
                            name_w, branch_w, field_x, field_w, nm, nmode,
-                           row_cursor)
-        y += 1
+                           row_cursor, spinner_char)
 
-    # Hints + state legend
-    hint_y = y + 1
+    # Subtle scroll markers when content is clipped above / below.
+    if visible_start > 0:
+        safe_addstr(stdscr, base_y - 1, 2,
+                    f"↑ {visible_start} more above", curses.A_DIM)
+    if visible_end < len(body_rows):
+        below = len(body_rows) - visible_end
+        safe_addstr(stdscr, base_y + body_h, 2,
+                    f"↓ {below} more below", curses.A_DIM)
+
+    # Hints + state legend (anchored to the bottom of the available height
+    # so a shrunken terminal still shows them).
+    hint_y = base_y + body_h + 1
     safe_addstr(stdscr, hint_y, 2,
-                "↑/↓ navigate · ←/→/Home/End move cursor · Tab suggests · Enter review",
+                "↑/↓ navigate · Tab menu · Shift+Tab workspace · Left/Shift+Left suggest · Enter review",
                 curses.A_DIM)
     safe_addstr(stdscr, hint_y + 1, 2,
-                "Space toggles · Ctrl+R refresh · Ctrl+S sync subs · Esc clears row / quits",
+                "Space toggles · Ctrl+R refresh · Ctrl+S sync · Esc clears / back / quits",
                 curses.A_DIM)
     draw_state_legend(stdscr, hint_y + 2, 2)
 
@@ -1332,19 +2073,34 @@ def draw_main(stdscr, state: State) -> None:
     if sidebar_w > 0:
         draw_sidebar(stdscr, state, sidebar_x, sidebar_w)
 
-    # Cursor — only fire on rows with an editable message field. The cursor's
-    # on-screen x mirrors field_visible's window so the rendered text and
-    # blinking cursor always agree.
+    # Modals overlay the main panel. Draw the deepest active modal last so
+    # it ends up on top. The sidebar is left untouched.
+    modal_active = (state.action_menu is not None
+                    or state.global_menu is not None
+                    or state.branch_picker is not None
+                    or state.reset_prompt is not None)
+    if state.action_menu is not None:
+        draw_action_menu(stdscr, state, sidebar_x)
+    if state.global_menu is not None:
+        draw_global_menu(stdscr, state, sidebar_x)
+    if state.branch_picker is not None:
+        draw_branch_picker(stdscr, state, sidebar_x)
+    if state.reset_prompt is not None:
+        draw_reset_prompt(stdscr, state, sidebar_x)
+
+    # Cursor — only fire on rows with an editable message field that's
+    # currently visible in the body window. Skipped when a modal is open
+    # (the modal owns its own cursor / no cursor).
     cursor_set = False
-    if not state.on_toggle:
+    if not modal_active and not state.on_toggle:
         body_idx = state.selected - 2
-        if 0 <= body_idx < len(body_rows):
+        if 0 <= body_idx < len(body_rows) and body_idx in y_for_body:
             row = body_rows[body_idx]
             target = None
             if row[0] == "repo":
-                target = row[1]
+                target = row[1] if (row[1].is_dirty or row[1].message) else None
             elif row[0] == "child" and row[2].kind == "submodule":
-                target = row[2]
+                target = row[2] if (row[2].dirty or row[2].message) else None
             if target is not None:
                 inner_w = field_w - 2
                 cur = max(0, min(state.field_cursor, len(target.message)))
@@ -1394,7 +2150,8 @@ def draw_repo_row(stdscr, y: int, repo: Repo, focused: bool,
                   name_w: int, branch_w: int, field_x: int, field_w: int,
                   name_max: int, branch_max: int,
                   name_mode: str, branch_mode: str,
-                  field_cursor: int = 0) -> None:
+                  field_cursor: int = 0,
+                  spinner_char: str = " ") -> None:
     name_attr = curses.A_BOLD if focused else 0
     safe_addstr(stdscr, y, 2,
                 truncate(repo.display_name, name_max, name_mode).ljust(name_w),
@@ -1404,20 +2161,34 @@ def draw_repo_row(stdscr, y: int, repo: Repo, focused: bool,
     safe_addstr(stdscr, y, 2 + name_w, branch_str,
                 curses.color_pair(PAIR_BRANCH))
 
-    _, state_attr = state_color(repo)
-    safe_addstr(stdscr, y, 2 + name_w + branch_w, " ● ", state_attr)
+    if repo.refreshing:
+        safe_addstr(stdscr, y, 2 + name_w + branch_w,
+                    f" {spinner_char} ", curses.color_pair(PAIR_BRANCH))
+    else:
+        _, state_attr = state_color(repo)
+        safe_addstr(stdscr, y, 2 + name_w + branch_w, " ● ", state_attr)
 
-    inner_w = field_w - 2
-    visible, _ = field_visible(repo.message, field_cursor, inner_w, focused)
-    field_text = " " + visible.ljust(inner_w) + " "
-    field_attr = curses.A_REVERSE if focused else curses.A_UNDERLINE
-    safe_addstr(stdscr, y, field_x, field_text, field_attr)
+    # Field rendering: live message field if there's something to commit;
+    # spinner placeholder while a background suggest is in flight; otherwise
+    # nothing — the row stays clean and Tab opens the action menu.
+    if repo.suggesting and not repo.message:
+        inner_w = field_w - 2
+        text = (f" {spinner_char} generating…").ljust(inner_w + 2)
+        safe_addstr(stdscr, y, field_x, text,
+                    curses.color_pair(PAIR_BRANCH) | curses.A_DIM)
+    elif repo.is_dirty or repo.message:
+        inner_w = field_w - 2
+        visible, _ = field_visible(repo.message, field_cursor, inner_w, focused)
+        field_text = " " + visible.ljust(inner_w) + " "
+        field_attr = curses.A_REVERSE if focused else curses.A_UNDERLINE
+        safe_addstr(stdscr, y, field_x, field_text, field_attr)
 
 
 def draw_child_row(stdscr, y: int, child: ChildRef, focused: bool,
                    name_w: int, branch_w: int, field_x: int, field_w: int,
                    name_max: int, name_mode: str,
-                   field_cursor: int = 0) -> None:
+                   field_cursor: int = 0,
+                   spinner_char: str = " ") -> None:
     glyph = "↳" if child.kind == "submodule" else "⊕"
     name_attr = curses.A_BOLD if focused else curses.A_DIM
     safe_addstr(stdscr, y, 4,
@@ -1427,15 +2198,251 @@ def draw_child_row(stdscr, y: int, child: ChildRef, focused: bool,
         dot_color = PAIR_OK if child.in_sync else PAIR_BEHIND
         safe_addstr(stdscr, y, 2 + name_w + branch_w, " ● ",
                     curses.color_pair(dot_color))
-        # Editable commit-message field — committing here writes to
-        # `child.nested_path`, not the top-level checkout.
-        inner_w = field_w - 2
-        visible, _ = field_visible(child.message, field_cursor, inner_w, focused)
-        field_text = " " + visible.ljust(inner_w) + " "
-        field_attr = curses.A_REVERSE if focused else curses.A_UNDERLINE
-        safe_addstr(stdscr, y, field_x, field_text, field_attr)
+        # Field: spinner while a background suggest is in flight, the
+        # editable message field when there's something to commit, nothing
+        # otherwise.
+        if child.suggesting and not child.message:
+            inner_w = field_w - 2
+            text = (f" {spinner_char} generating…").ljust(inner_w + 2)
+            safe_addstr(stdscr, y, field_x, text,
+                        curses.color_pair(PAIR_BRANCH) | curses.A_DIM)
+        elif child.dirty or child.message:
+            inner_w = field_w - 2
+            visible, _ = field_visible(
+                child.message, field_cursor, inner_w, focused)
+            field_text = " " + visible.ljust(inner_w) + " "
+            field_attr = curses.A_REVERSE if focused else curses.A_UNDERLINE
+            safe_addstr(stdscr, y, field_x, field_text, field_attr)
     # Subtrees skip the sync-status dot AND the field — files belong to the
     # parent's working tree, so commits go via the parent row.
+
+
+# ---------- Modal drawing --------------------------------------------------
+
+
+def _modal_geometry(stdscr, sidebar_x: int, content_w: int,
+                    content_h: int) -> Tuple[int, int, int, int]:
+    """Return (x, y, w, h) for a centered modal box that fits within the
+    main panel (left of the sidebar) and leaves the sidebar visible."""
+    h, w = stdscr.getmaxyx()
+    main_w = sidebar_x if sidebar_x > 0 else w
+    box_w = min(content_w, max(40, main_w - 2))
+    box_h = min(content_h, max(8, h - 2))
+    x = max(1, (main_w - box_w) // 2)
+    y = max(1, (h - box_h) // 2)
+    return x, y, box_w, box_h
+
+
+def _draw_modal_fill(stdscr, x: int, y: int, w: int, h: int, sb: int) -> None:
+    fill = " " * w
+    for row in range(y, y + h):
+        safe_addstr(stdscr, row, x, fill, sb)
+
+
+def draw_action_menu(stdscr, state: State, sidebar_x: int) -> None:
+    menu = state.action_menu
+    if menu is None:
+        return
+    n_items = len(menu.items)
+    n_commits = max(1, min(5, len(menu.commits)))
+    # title + blank + branch + metadata + sep + items + sep + commits-header
+    # + commits + blank + hint
+    content_h = 1 + 1 + 1 + 1 + 1 + n_items + 1 + 1 + n_commits + 1 + 1
+    x, y, w, h = _modal_geometry(stdscr, sidebar_x, 70, content_h)
+    sb = curses.color_pair(PAIR_SB_FG)
+    _draw_modal_fill(stdscr, x, y, w, h, sb)
+
+    inner_x = x + 2
+    safe_addstr(stdscr, y, inner_x, menu.target_label[: w - 4],
+                curses.A_BOLD | curses.color_pair(PAIR_SB_CYAN))
+
+    # Metadata: branch + state badge, then upstream/ahead/behind line.
+    line = y + 2
+    branch_str = f"[{menu.branch}]"
+    safe_addstr(stdscr, line, inner_x, branch_str,
+                curses.color_pair(PAIR_BRANCH))
+    state_attr = (curses.color_pair(menu.state_pair)
+                  if menu.state_pair else (sb | curses.A_DIM))
+    safe_addstr(stdscr, line, inner_x + len(branch_str) + 1,
+                f"● {menu.state_label}", state_attr)
+
+    line += 1
+    if menu.upstream:
+        meta = f"upstream: {menu.upstream}  ·  ahead {menu.ahead} / behind {menu.behind}"
+    else:
+        meta = "no upstream"
+    safe_addstr(stdscr, line, inner_x, meta[: w - 4], sb | curses.A_DIM)
+
+    line += 1
+    safe_addstr(stdscr, line, inner_x, "─" * (w - 4), sb | curses.A_DIM)
+
+    # Action items.
+    line += 1
+    for i, item in enumerate(menu.items):
+        focused = (i == menu.selected)
+        prefix = "→ " if focused else "  "
+        label = item.label
+        if not item.enabled and item.reason:
+            label = f"{label}  ({item.reason})"
+        if focused and item.enabled:
+            attr = sb | curses.A_REVERSE
+        elif focused:
+            attr = sb | curses.A_REVERSE | curses.A_DIM
+        elif not item.enabled:
+            attr = sb | curses.A_DIM
+        else:
+            attr = sb
+        text = (prefix + label).ljust(w - 4)
+        safe_addstr(stdscr, line, inner_x, text, attr)
+        line += 1
+
+    # Separator + recent commits.
+    safe_addstr(stdscr, line, inner_x, "─" * (w - 4), sb | curses.A_DIM)
+    line += 1
+    safe_addstr(stdscr, line, inner_x, "Recent commits",
+                sb | curses.A_BOLD)
+    line += 1
+    if menu.commits:
+        for commit_line in menu.commits[:5]:
+            safe_addstr(stdscr, line, inner_x + 2,
+                        commit_line[: w - 6], sb | curses.A_DIM)
+            line += 1
+    else:
+        safe_addstr(stdscr, line, inner_x + 2,
+                    "(no commits on this branch yet)",
+                    sb | curses.A_DIM)
+        line += 1
+
+    # Hints at the bottom row of the box.
+    safe_addstr(stdscr, y + h - 1, inner_x,
+                "↑/↓ select · Enter run · Esc back",
+                sb | curses.A_DIM)
+
+
+def draw_global_menu(stdscr, state: State, sidebar_x: int) -> None:
+    menu = state.global_menu
+    if menu is None:
+        return
+    n_items = len(menu.items)
+    content_h = 1 + 1 + n_items + 1 + 1
+    x, y, w, h = _modal_geometry(stdscr, sidebar_x, 50, content_h)
+    sb = curses.color_pair(PAIR_SB_FG)
+    _draw_modal_fill(stdscr, x, y, w, h, sb)
+
+    inner_x = x + 2
+    safe_addstr(stdscr, y, inner_x, "Workspace actions",
+                curses.A_BOLD | curses.color_pair(PAIR_SB_CYAN))
+
+    line = y + 2
+    for i, item in enumerate(menu.items):
+        focused = (i == menu.selected)
+        prefix = "→ " if focused else "  "
+        label = item.label
+        if not item.enabled and item.reason:
+            label = f"{label}  ({item.reason})"
+        if focused and item.enabled:
+            attr = sb | curses.A_REVERSE
+        elif focused:
+            attr = sb | curses.A_REVERSE | curses.A_DIM
+        elif not item.enabled:
+            attr = sb | curses.A_DIM
+        else:
+            attr = sb
+        safe_addstr(stdscr, line, inner_x, (prefix + label).ljust(w - 4), attr)
+        line += 1
+
+    safe_addstr(stdscr, y + h - 1, inner_x,
+                "↑/↓ select · Enter run · Esc back",
+                sb | curses.A_DIM)
+
+
+def draw_branch_picker(stdscr, state: State, sidebar_x: int) -> None:
+    picker = state.branch_picker
+    if picker is None:
+        return
+    body_h = max(3, min(15, len(picker.branches)))
+    content_h = 1 + 1 + body_h + 1 + 1
+    x, y, w, h = _modal_geometry(stdscr, sidebar_x, 50, content_h)
+    sb = curses.color_pair(PAIR_SB_FG)
+    _draw_modal_fill(stdscr, x, y, w, h, sb)
+
+    inner_x = x + 2
+    safe_addstr(stdscr, y, inner_x,
+                f"Switch branch — {picker.target_label}"[: w - 4],
+                curses.A_BOLD | curses.color_pair(PAIR_SB_CYAN))
+
+    if not picker.branches:
+        safe_addstr(stdscr, y + 2, inner_x,
+                    "(no branches found)", sb | curses.A_DIM)
+        safe_addstr(stdscr, y + h - 1, inner_x,
+                    "Esc back", sb | curses.A_DIM)
+        return
+
+    # Clamp scroll so the selected entry is visible.
+    if picker.selected < picker.scroll:
+        picker.scroll = picker.selected
+    elif picker.selected >= picker.scroll + body_h:
+        picker.scroll = picker.selected - body_h + 1
+    picker.scroll = max(0, min(picker.scroll,
+                               max(0, len(picker.branches) - body_h)))
+
+    for i in range(body_h):
+        idx = picker.scroll + i
+        if idx >= len(picker.branches):
+            break
+        name = picker.branches[idx]
+        focused = (idx == picker.selected)
+        is_current = (name == picker.current)
+        marker = "* " if is_current else "  "
+        prefix = "→ " if focused else marker
+        text = (prefix + name).ljust(w - 4)
+        attr = sb | curses.A_REVERSE if focused else sb
+        if is_current and not focused:
+            attr |= curses.A_BOLD
+        safe_addstr(stdscr, y + 2 + i, inner_x, text, attr)
+
+    if picker.scroll > 0:
+        safe_addstr(stdscr, y + 1, inner_x,
+                    f"↑ {picker.scroll} more above", sb | curses.A_DIM)
+    if picker.scroll + body_h < len(picker.branches):
+        below = len(picker.branches) - (picker.scroll + body_h)
+        safe_addstr(stdscr, y + 2 + body_h, inner_x,
+                    f"↓ {below} more below", sb | curses.A_DIM)
+
+    safe_addstr(stdscr, y + h - 1, inner_x,
+                "↑/↓ select · Enter checkout · Esc back",
+                sb | curses.A_DIM)
+
+
+def draw_reset_prompt(stdscr, state: State, sidebar_x: int) -> None:
+    prompt = state.reset_prompt
+    if prompt is None:
+        return
+    content_h = 7
+    x, y, w, h = _modal_geometry(stdscr, sidebar_x, 56, content_h)
+    sb = curses.color_pair(PAIR_SB_FG)
+    _draw_modal_fill(stdscr, x, y, w, h, sb)
+
+    inner_x = x + 2
+    safe_addstr(stdscr, y, inner_x,
+                f"Soft reset — {prompt.target_label}"[: w - 4],
+                curses.A_BOLD | curses.color_pair(PAIR_SB_CYAN))
+
+    safe_addstr(stdscr, y + 2, inner_x,
+                f"unpushed commits on this branch: {prompt.ahead}",
+                sb | curses.A_DIM)
+    safe_addstr(stdscr, y + 3, inner_x,
+                "Number to reset:  (Enter on 0 wipes ALL unpushed)",
+                sb | curses.A_DIM)
+
+    visible = prompt.typed if prompt.typed else "0"
+    field_text = f" {visible} "
+    safe_addstr(stdscr, y + 4, inner_x, field_text.ljust(w - 4),
+                sb | curses.A_REVERSE)
+
+    safe_addstr(stdscr, y + h - 1, inner_x,
+                "type a number · Enter run · Esc back",
+                sb | curses.A_DIM)
 
 
 # ---------- LFS helpers -----------------------------------------------------
@@ -1736,6 +2743,15 @@ def handle_main_key(state: State, key: int) -> Optional[str]:
             return "confirm"
         return None
 
+    # Tab opens the per-row action menu; Shift+Tab opens the workspace-wide
+    # menu. Both work regardless of whether the focused row has a field.
+    if key == 9:  # Tab
+        open_action_menu(state)
+        return None
+    if key == curses.KEY_BTAB:  # Shift+Tab
+        open_global_menu(state)
+        return None
+
     target_message_holder = _focused_message_holder(state)
 
     if key == 27:
@@ -1761,10 +2777,19 @@ def handle_main_key(state: State, key: int) -> Optional[str]:
     msg = target_message_holder.message
     cur = max(0, min(state.field_cursor, len(msg)))
 
-    # Cursor movement within the field.
+    # Left on an empty row generates a single suggestion (cursor-left has
+    # nothing to do anyway). Shift+Left does the same for every dirty row
+    # with an empty message.
     if key == curses.KEY_LEFT:
+        if not msg:
+            kick_off_suggest_for(state, target_message_holder)
+            return None
         state.field_cursor = max(0, cur - 1)
         return None
+    if key == curses.KEY_SLEFT and not msg:
+        kick_off_bulk_suggest(state)
+        return None
+
     if key == curses.KEY_RIGHT:
         state.field_cursor = min(len(msg), cur + 1)
         return None
@@ -1773,31 +2798,6 @@ def handle_main_key(state: State, key: int) -> Optional[str]:
         return None
     if key == curses.KEY_END or key == 5:  # End or Ctrl+E
         state.field_cursor = len(msg)
-        return None
-
-    # Tab — replace the message with a working-tree-derived suggestion.
-    # Top-level repos use the cached status; child rows scan their nested
-    # checkout fresh.
-    if key == 9:
-        if isinstance(target_message_holder, Repo):
-            suggested = suggest_commit_message(
-                target_message_holder,
-                max_added=state.suggest_added,
-                max_updated=state.suggest_updated,
-                max_deleted=state.suggest_deleted,
-                auto_stage=state.auto_stage,
-            )
-        else:  # ChildRef (kind="submodule" — checked when target was set)
-            suggested = suggest_commit_message_at(
-                target_message_holder.nested_path,
-                max_added=state.suggest_added,
-                max_updated=state.suggest_updated,
-                max_deleted=state.suggest_deleted,
-                auto_stage=state.auto_stage,
-            )
-        if suggested:
-            target_message_holder.message = suggested
-            state.field_cursor = len(suggested)
         return None
 
     if key in (curses.KEY_BACKSPACE, 127, 8):
@@ -1896,6 +2896,7 @@ def run(stdscr, cfg: Config) -> None:
         name_display_max=cfg.name_display_max,
         name_truncation=cfg.name_truncation,
         branch_truncation=cfg.branch_truncation,
+        max_visible_repo_rows=cfg.max_visible_repo_rows,
         subtrees=cfg.subtrees,
         auto_stage=cfg.default_auto_stage,
         auto_push=cfg.default_auto_push,
@@ -1903,9 +2904,13 @@ def run(stdscr, cfg: Config) -> None:
 
     while True:
         draw_main(stdscr, state)
-        # Advance spinner only when there is something running, so completed
-        # icons don't re-render unnecessarily on every tick.
-        if state.tasks.has_running():
+        # Advance spinner whenever any background work is in flight so
+        # animations (sidebar tasks, in-field suggest, in-row refresh) tick.
+        anim_running = (state.tasks.has_running()
+                        or any(r.suggesting or r.refreshing for r in state.repos)
+                        or any(c.suggesting
+                               for r in state.repos for c in r.children))
+        if anim_running:
             state.spinner_frame = (state.spinner_frame + 1) % len(SPINNER_FRAMES)
 
         try:
@@ -1914,6 +2919,23 @@ def run(stdscr, cfg: Config) -> None:
             return
         if key == -1:
             continue  # tick — loop back to redraw and animate
+
+        # Modal dispatch (deepest first). Each modal owns its key handling
+        # and may close itself by clearing its slot on state.
+        if state.reset_prompt is not None:
+            handle_reset_prompt_key(state, key)
+            continue
+        if state.branch_picker is not None:
+            handle_branch_picker_key(state, key)
+            continue
+        if state.action_menu is not None:
+            handle_action_menu_key(state, key)
+            continue
+        if state.global_menu is not None:
+            res = handle_global_menu_key(state, key)
+            if res == "refresh":
+                kick_off_inline_refresh(state)
+            continue
 
         action = handle_main_key(state, key)
         if action == "quit":
@@ -1924,8 +2946,7 @@ def run(stdscr, cfg: Config) -> None:
             continue
         if action == "refresh":
             state.tasks.prune_completed()
-            refresh_all(stdscr, state.repos, state.name_display_max,
-                        state.name_truncation, state.subtrees, "refreshing")
+            kick_off_inline_refresh(state)
             continue
         if action == "sync":
             kick_off_sync_siblings(state)

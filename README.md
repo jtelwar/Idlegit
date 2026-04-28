@@ -5,9 +5,11 @@ push across every repo in a workspace.
 
 ## Why
 
-Built because clicking through a GUI git tool to commit-and-push the same set
+Because clicking through a GUI git tool to commit-and-push the same set
 of repos every day got old. Drop the `idlegit/` folder next to the repos you
 want to manage and run it; everything is on one keyboard-driven screen.
+
+And because the name lazygit was already taken, but it's just not lazy enough for me...
 
 ## Run
 
@@ -25,12 +27,16 @@ workspace itself if it is one, plus any immediate child folder containing
 |---|---|
 | `↑` `↓` | Navigate rows |
 | typing | Enter a per-row commit message |
-| `Tab` | Auto-suggest a commit message from the working tree |
+| `←` / `→` / `Home` / `End` | Move the cursor inside the message field |
+| `Left` on an empty row | Generate a single commit-message suggestion (in the background) |
+| `Shift+Left` on an empty row | Generate suggestions for every dirty row with no message yet |
+| `Tab` | Open the per-row action menu (fetch / pull / switch branch / soft reset / push) |
+| `Shift+Tab` | Open the workspace-wide menu (Suggest all messages / Refresh all) |
 | `Space` | Flip the focused toggle |
 | `Enter` | Open the review screen, or kick off the work from review |
-| `Ctrl+R` / `F5` | Prune completed tasks and re-fetch all repo state |
+| `Ctrl+R` / `F5` | Prune completed tasks and re-fetch every repo (inline — no overlay) |
 | `Ctrl+S` | Sync every tracked sibling submodule (fetch + checkout, no commits) |
-| `Esc` | Clear the row's message, or quit (with confirmation if any messages are queued) |
+| `Esc` | Close the topmost modal, clear the row's message, or quit (with confirmation if any messages are queued) |
 
 ## Highlights
 
