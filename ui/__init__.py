@@ -566,7 +566,10 @@ def build_confirm_lines(
         #  - the repo's remote URL must parse as a github.com slug
         #  - the user is auto-pushing (no push → no run to track)
         #  - `would_run_on_push` must be True for the repo's current branch
-        #    (active state, push trigger present, branch matches)
+        #    (push trigger present, branch matches)
+        #  - the workflow's GitHub-side state isn't `disabled_*` (a
+        #    disabled workflow won't fire on push, so there's no run
+        #    to track and offering the toggle is misleading)
         # Each toggle's live state lives in repo.track_workflow[wf.name];
         # initialise it from the global default the first time we see it.
         if (state.auto_push and have_gh and repo.workflows
@@ -577,6 +580,8 @@ def build_confirm_lines(
             ]
             for wf in repo.workflows:
                 if not would_run_on_push(wf, repo.branch):
+                    continue
+                if wf.state.startswith("disabled"):
                     continue
                 if wf.name not in repo.track_workflow:
                     repo.track_workflow[wf.name] = state.track_actions_default
