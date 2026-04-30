@@ -1,4 +1,46 @@
 #!/usr/bin/env bash
 # Launches the interactive multi-repo git menu.
+#
+# We don't just exec idlegit.py directly: VS Code's terminal tab title
+# (and `ps -o comm`, and similar tools) reads the kernel-reported binary
+# name. With a plain shebang exec, that name is "python3.11", which VS
+# Code shows on the tab. To get "idlegit" instead, we hardlink python3
+# to ~/.cache/idlegit/idlegit (instant, no disk cost) and exec through
+# the renamed link. The kernel records that path, so `comm` becomes
+# "idlegit". Falls back to a copy if the hardlink can't be made (cross-
+# device, read-only home, etc.).
 set -euo pipefail
-exec "$(dirname "$0")/idlegit.py" "$@"
+
+DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT="$DIR/idlegit.py"
+
+if ! command -v python3 >/dev/null 2>&1 && ! command -v python >/dev/null 2>&1; then
+    echo "idlegit: python3 not found on PATH" >&2
+    exit 1
+fi
+# Resolve to the actual interpreter binary, NOT a pyenv shim or similar
+# wrapper. pyenv shims dispatch on the script's argv[0] basename, so
+# hardlinking a shim to "idlegit" makes it search for an "idlegit" python
+# program and fail. `sys.executable` is the real interpreter path.
+PY="$(python3 -c 'import sys; print(sys.executable)' 2>/dev/null \
+   || python -c 'import sys; print(sys.executable)')"
+PY="$(readlink -f "$PY" 2>/dev/null || python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$PY")"
+
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/idlegit"
+LINK="$CACHE_DIR/idlegit"
+
+mkdir -p "$CACHE_DIR"
+
+# Refresh the link if missing or pointing at a stale interpreter.
+needs_relink=1
+if [[ -e "$LINK" ]]; then
+    if [[ "$LINK" -ef "$PY" ]]; then
+        needs_relink=0
+    fi
+fi
+if (( needs_relink )); then
+    rm -f "$LINK"
+    ln "$PY" "$LINK" 2>/dev/null || cp "$PY" "$LINK"
+fi
+
+exec "$LINK" "$SCRIPT" "$@"
