@@ -28,7 +28,9 @@ from ..colors import (
     PAIR_PASTEL_BLUE, PAIR_PASTEL_GREEN, PAIR_PASTEL_RED, PAIR_PASTEL_YELLOW,
     PAIR_SB_CYAN, PAIR_SB_FG,
 )
-from ..geometry import draw_modal_fill, modal_geometry, safe_addstr, truncate
+from ..geometry import (
+    draw_modal_fill, end_truncate, modal_geometry, safe_addstr, truncate,
+)
 from ..hints import (
     KEY_DOWN, KEY_ENTER, KEY_ESC, KEY_HOME, KEY_LEFT_RIGHT, KEY_UP_DOWN,
     Hint, render_hints,
@@ -149,6 +151,8 @@ def _build_items(branch_meta) -> List[ActionMenuItem]:
     ahead = branch_meta["ahead"]
     has_workflows = branch_meta["has_any_workflow"]
     workflow_reason = branch_meta["run_workflow_reason"]
+    branch = branch_meta.get("branch") or ""
+    detached = (not branch) or branch == "(detached)"
     return [
         ActionMenuItem(
             id="fetch", label="fetch (all branches)",
@@ -164,6 +168,22 @@ def _build_items(branch_meta) -> List[ActionMenuItem]:
             id="switch_branch", label="switch branch…",
             enabled=not merging,
             reason="" if not merging else "merging"),
+        # Detached-HEAD recovery: park HEAD's commits on a fresh branch
+        # so the user can push / merge them via the normal flows. Only
+        # surfaced when actually detached — not useful otherwise.
+        ActionMenuItem(
+            id="branch_from_head", label="save HEAD to new branch…",
+            enabled=detached and not merging,
+            reason=("merging" if merging
+                    else ("" if detached else "already on a branch"))),
+        # FF-only merge of another branch into the current one. Refuses
+        # on its own when a real merge would be needed; that's exactly
+        # the safety we want here.
+        ActionMenuItem(
+            id="merge_branch", label="merge in branch…",
+            enabled=(not detached) and (not merging),
+            reason=("merging" if merging
+                    else ("detached HEAD" if detached else ""))),
         ActionMenuItem(
             id="soft_reset",
             label=f"soft reset ({ahead} unpushed)…",
@@ -503,9 +523,12 @@ def draw_action_menu(stdscr, state: State, sidebar_x: int) -> None:
     # Title row: repo name (cyan-bold) + middle-truncated full path
     # in brackets (dim) so users with multiple repository_folders can
     # tell which on-disk location this menu targets at a glance.
+    # The repo name uses end-only truncation (no middle-truncation of
+    # repo names — modal-wide rule); only the on-disk path keeps the
+    # middle-truncation since the leaf folder is what users recognise.
     name = menu.target_label
     path_str = str(menu.target_path)
-    name_clip = name[:inner_w]
+    name_clip = end_truncate(name, inner_w)
     safe_addstr(stdscr, y + 1, inner_x, name_clip,
                 curses.A_BOLD | curses.color_pair(PAIR_SB_CYAN))
     # Reserve room for "  [<path>]" — 4 cells of fixed chrome around
@@ -860,6 +883,14 @@ def handle_action_menu_key(state: State, key: int) -> None:
         if item.id == "switch_branch":
             from .branch_picker import open_branch_picker
             open_branch_picker(state)
+            return
+        if item.id == "merge_branch":
+            from .branch_picker import open_branch_picker
+            open_branch_picker(state, mode="merge")
+            return
+        if item.id == "branch_from_head":
+            from .branch_name_prompt import open_branch_name_prompt
+            open_branch_name_prompt(state)
             return
         if item.id == "soft_reset":
             from .reset_prompt import open_reset_prompt

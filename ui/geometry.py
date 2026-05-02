@@ -49,6 +49,62 @@ def field_visible(message: str, cursor: int, inner_w: int,
     return message[start:start + inner_w], cursor - start
 
 
+def end_truncate(text: str, max_w: int) -> str:
+    """End-only truncation: keep the front, drop the tail with an
+    ellipsis. Differs from `truncate(..., mode="end")` only in how it
+    behaves at degenerate widths — `max_w <= 0` returns ``""`` instead
+    of pass-through, which is what callers laying out modal content
+    actually want when their available width has shrunk to zero."""
+    if max_w <= 0:
+        return ""
+    if len(text) <= max_w:
+        return text
+    if max_w == 1:
+        return "…"
+    return text[: max_w - 1] + "…"
+
+
+def wrap_label_value(label: str, value: str, max_w: int) -> "list[str]":
+    """Lay out one "label: value" pair across one or two lines.
+
+    Repo-name modals use this to keep names readable when the window is
+    narrow. The strict no-mid-truncation rule the user wants:
+
+      - Try to fit ``"label: value"`` on one line. If it does → that's
+        the only line.
+      - Otherwise put ``"label:"`` on its own line, then the value
+        indented two cells on the next.
+      - If the value still overflows max_w on its own line, end-truncate
+        with "…" — never middle-truncate, since the head of a long repo
+        name (e.g. ``Upskill.Health.Domain.Models``) is what users
+        actually recognise.
+
+    Returns a list of strings. Caller renders each at successive y
+    coordinates. ``max_w <= 0`` returns ``[]`` so callers in the
+    pathological-narrow case render nothing rather than crash.
+
+    >>> wrap_label_value("Winner", "short", 20)
+    ['Winner: short']
+    >>> wrap_label_value("Winner", "this-name-is-long", 20)
+    ['Winner:', '  this-name-is-long']
+    >>> wrap_label_value("Winner", "this-name-is-way-too-long-to-fit", 20)
+    ['Winner:', '  this-name-is-way…']
+    """
+    if max_w <= 0:
+        return []
+    label_part = f"{label}:" if label else ""
+    one_liner = f"{label_part} {value}".strip()
+    if len(one_liner) <= max_w:
+        return [one_liner]
+    if not label_part:
+        # No label: there's no two-line form, so just end-truncate the
+        # value and return.
+        return [end_truncate(value, max_w)]
+    indent = "  "
+    value_room = max_w - len(indent)
+    return [label_part, indent + end_truncate(value, value_room)]
+
+
 def safe_addstr(stdscr, y: int, x: int, text: str, attr: int = 0) -> None:
     """addstr that swallows errors when writing to the bottom-right corner
     or off-screen after a resize."""

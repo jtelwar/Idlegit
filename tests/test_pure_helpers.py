@@ -28,6 +28,7 @@ from workers import (  # noqa: E402
 # helpers still run on machines/CIs without a tty.
 try:
     from ui import field_visible, truncate
+    from ui.geometry import end_truncate, wrap_label_value
     UI_AVAILABLE = True
 except Exception:  # pragma: no cover — only triggers when curses is unusable
     UI_AVAILABLE = False
@@ -73,6 +74,81 @@ class TestTruncate(unittest.TestCase):
         a = truncate("Upskill.Health.Domain.Models", 20, "garbage")
         b = truncate("Upskill.Health.Domain.Models", 20, "middle")
         self.assertEqual(a, b)
+
+
+@unittest.skipUnless(UI_AVAILABLE, "ui module unavailable (no curses)")
+class TestEndTruncate(unittest.TestCase):
+    def test_short_unchanged(self) -> None:
+        self.assertEqual(end_truncate("hello", 20), "hello")
+
+    def test_zero_or_negative_returns_empty(self) -> None:
+        # Differs from `truncate(..., mode="end")` — modal callers
+        # depend on this so a 0-cell column doesn't fall through to a
+        # full-width string.
+        self.assertEqual(end_truncate("anything", 0), "")
+        self.assertEqual(end_truncate("anything", -3), "")
+
+    def test_one_is_just_ellipsis(self) -> None:
+        self.assertEqual(end_truncate("longstring", 1), "…")
+
+    def test_keeps_head_drops_tail(self) -> None:
+        out = end_truncate("Upskill.Health.Domain.Models", 12)
+        self.assertEqual(len(out), 12)
+        self.assertTrue(out.endswith("…"))
+        self.assertTrue(out.startswith("Upskill.Hea"))
+
+
+@unittest.skipUnless(UI_AVAILABLE, "ui module unavailable (no curses)")
+class TestWrapLabelValue(unittest.TestCase):
+    """Modal layout helper: keeps "label: value" on one line when it
+    fits, otherwise splits the value onto its own indented line. End-
+    truncation is the only allowed truncation — the head of a long
+    repo name is what users actually recognise."""
+
+    def test_one_liner_when_it_fits(self) -> None:
+        self.assertEqual(
+            wrap_label_value("Winner", "short-name", 30),
+            ["Winner: short-name"])
+
+    def test_splits_to_two_lines_when_value_fits_alone(self) -> None:
+        # 14-char value, 20 max width → fits fine on its own indented line.
+        out = wrap_label_value("Winner", "Upskill.Health", 20)
+        self.assertEqual(out, ["Winner:", "  Upskill.Health"])
+
+    def test_splits_to_two_lines_with_end_truncation(self) -> None:
+        # 28-char value, 20 max width, 18 cells of value_room → trims
+        # the tail with an ellipsis. Head ("Upskill.Health.D…") is what
+        # the user reads.
+        out = wrap_label_value("Winner", "Upskill.Health.Domain.Models", 20)
+        self.assertEqual(len(out), 2)
+        self.assertEqual(out[0], "Winner:")
+        self.assertEqual(len(out[1]), 20)  # padded indent + value
+        self.assertTrue(out[1].startswith("  Upskill.Health"))
+        self.assertTrue(out[1].endswith("…"))
+
+    def test_end_truncates_when_value_overflows_alone(self) -> None:
+        out = wrap_label_value("Syncing", "this-name-is-way-too-long-to-fit", 20)
+        self.assertEqual(len(out), 2)
+        self.assertEqual(out[0], "Syncing:")
+        self.assertTrue(out[1].endswith("…"))
+        self.assertLessEqual(len(out[1]), 20)
+        # Head of the name is preserved — that's the part users read.
+        self.assertTrue(out[1].startswith("  this-name"))
+
+    def test_empty_label_skips_label_row(self) -> None:
+        # Used when laying out a continuation line ("to <repo>") —
+        # callers pass an empty label and the helper still end-truncates
+        # the value for them.
+        self.assertEqual(
+            wrap_label_value("", "short-value", 20),
+            ["short-value"])
+        self.assertEqual(
+            wrap_label_value("", "this-name-is-way-too-long-to-fit", 15),
+            ["this-name-is-w…"])
+
+    def test_zero_width_returns_empty_list(self) -> None:
+        self.assertEqual(wrap_label_value("Winner", "anything", 0), [])
+        self.assertEqual(wrap_label_value("Winner", "anything", -3), [])
 
 
 @unittest.skipUnless(UI_AVAILABLE, "ui module unavailable (no curses)")

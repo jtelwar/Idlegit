@@ -8,10 +8,19 @@ from models import State, WorkflowPicker
 from workers import kick_off_manual_dispatch
 
 from ..colors import PAIR_SB_CYAN, PAIR_SB_FG
-from ..geometry import draw_modal_fill, modal_geometry, safe_addstr
+from ..geometry import (
+    draw_modal_fill, end_truncate, modal_geometry, safe_addstr,
+    wrap_label_value,
+)
 from ..hints import (
     KEY_ENTER, KEY_ESC, KEY_UP_DOWN, Hint, render_hints,
 )
+
+
+_PAD_TOP = 1
+_PAD_BOTTOM = 1
+_PAD_X = 2
+_MODAL_W = 70
 
 
 def _hints(picker) -> list:
@@ -78,48 +87,98 @@ def open_workflow_picker(state: State) -> None:
     )
 
 
+def _title_lines(picker: WorkflowPicker, inner_w: int) -> "list[str]":
+    """Title rows: "Run workflow on <branch>" first, then the repo
+    name on its own line via wrap_label_value (so long display names
+    don't get middle-truncated, which used to be the only option when
+    everything was crammed onto one line)."""
+    rows = [end_truncate(f"Run workflow on {picker.branch}", inner_w)]
+    rows.extend(wrap_label_value("Repo", picker.target_label, inner_w))
+    return rows
+
+
 def draw_workflow_picker(stdscr, state: State, sidebar_x: int) -> None:
     picker = state.workflow_picker
     if picker is None:
         return
-    body_h = max(3, min(15, len(picker.workflows)))
-    # +2 reserves a blank row above the title and below the footer
-    # hint so the modal doesn't feel pasted against its own edges.
-    content_h = 1 + 1 + body_h + 1 + 1 + 2
-    x, y, w, h = modal_geometry(stdscr, sidebar_x, 70, content_h)
+
     sb = curses.color_pair(PAIR_SB_FG)
+    target_inner_w = max(1, _MODAL_W - 2 * _PAD_X)
+    title_rows = _title_lines(picker, target_inner_w)
+
+    n_workflows = max(1, len(picker.workflows))
+    blank_after_title = 1
+    blank_after_list = 1
+    hint_rows = 1
+    desired_h = (
+        _PAD_TOP + len(title_rows) + blank_after_title + n_workflows
+        + blank_after_list + hint_rows + _PAD_BOTTOM
+    )
+    x, y, w, h = modal_geometry(stdscr, sidebar_x, _MODAL_W, desired_h)
     draw_modal_fill(stdscr, x, y, w, h, sb)
 
-    inner_x = x + 2
-    safe_addstr(stdscr, y + 1, inner_x,
-                f"Run workflow on {picker.branch} — {picker.target_label}"
-                [: w - 4],
-                curses.A_BOLD | curses.color_pair(PAIR_SB_CYAN))
+    inner_x = x + _PAD_X
+    inner_w = max(1, w - 2 * _PAD_X)
+
+    if inner_w != target_inner_w:
+        title_rows = _title_lines(picker, inner_w)
+
+    fixed_rows = (
+        _PAD_TOP + len(title_rows) + blank_after_title
+        + blank_after_list + hint_rows + _PAD_BOTTOM
+    )
+    visible_rows = max(1, h - fixed_rows)
+
+    line = y + _PAD_TOP
+    for i, text in enumerate(title_rows):
+        attr = (curses.A_BOLD | curses.color_pair(PAIR_SB_CYAN)
+                if i == 0 else sb)
+        safe_addstr(stdscr, line, inner_x,
+                    end_truncate(text, inner_w), attr)
+        line += 1
+    line += blank_after_title
 
     if not picker.workflows:
-        safe_addstr(stdscr, y + 3, inner_x,
-                    "(no workflows in this repo)", sb | curses.A_DIM)
-        safe_addstr(stdscr, y + h - 2, inner_x,
-                    "Esc back", sb | curses.A_DIM)
+        safe_addstr(stdscr, line, inner_x,
+                    end_truncate("(no workflows in this repo)", inner_w),
+                    sb | curses.A_DIM)
+        render_hints(stdscr, y + h - _PAD_BOTTOM - 1, inner_x, inner_w,
+                     _hints(picker), attr=sb | curses.A_DIM)
         return
 
     if picker.selected < picker.scroll:
         picker.scroll = picker.selected
-    elif picker.selected >= picker.scroll + body_h:
-        picker.scroll = picker.selected - body_h + 1
-    picker.scroll = max(0, min(picker.scroll,
-                               max(0, len(picker.workflows) - body_h)))
+    elif picker.selected >= picker.scroll + visible_rows:
+        picker.scroll = picker.selected - visible_rows + 1
+    picker.scroll = max(0, min(
+        picker.scroll, max(0, len(picker.workflows) - visible_rows)))
 
-    for i in range(body_h):
-        idx = picker.scroll + i
-        if idx >= len(picker.workflows):
+    n = len(picker.workflows)
+    end = min(n, picker.scroll + visible_rows)
+    for slot in range(visible_rows):
+        idx = picker.scroll + slot
+        if idx >= n:
             break
+        row_y = line + slot
+
+        if slot == 0 and picker.scroll > 0:
+            msg = f"  ↑ {picker.scroll} more above"
+            safe_addstr(stdscr, row_y, inner_x,
+                        end_truncate(msg, inner_w), sb | curses.A_DIM)
+            continue
+        if slot == visible_rows - 1 and end < n:
+            below = n - end + 1
+            msg = f"  ↓ {below} more below"
+            safe_addstr(stdscr, row_y, inner_x,
+                        end_truncate(msg, inner_w), sb | curses.A_DIM)
+            continue
+
         wf = picker.workflows[idx]
         focused = (idx == picker.selected)
         runnable, reason = _workflow_row_status(wf)
         prefix = "→ " if focused else "  "
         label = wf.name if runnable else f"{wf.name}  {reason}"
-        text = (prefix + label).ljust(w - 4)
+        text = end_truncate(prefix + label, inner_w).ljust(inner_w)
         if focused and runnable:
             attr = sb | curses.A_REVERSE
         elif focused:
@@ -128,18 +187,10 @@ def draw_workflow_picker(stdscr, state: State, sidebar_x: int) -> None:
             attr = sb | curses.A_DIM
         else:
             attr = sb
-        safe_addstr(stdscr, y + 3 + i, inner_x, text, attr)
+        safe_addstr(stdscr, row_y, inner_x, text, attr)
 
-    if picker.scroll > 0:
-        safe_addstr(stdscr, y + 2, inner_x,
-                    f"↑ {picker.scroll} more above", sb | curses.A_DIM)
-    if picker.scroll + body_h < len(picker.workflows):
-        below = len(picker.workflows) - (picker.scroll + body_h)
-        safe_addstr(stdscr, y + 3 + body_h, inner_x,
-                    f"↓ {below} more below", sb | curses.A_DIM)
-
-    render_hints(stdscr, y + h - 2, inner_x, w - 4, _hints(picker),
-                 attr=sb | curses.A_DIM)
+    render_hints(stdscr, y + h - _PAD_BOTTOM - 1, inner_x, inner_w,
+                 _hints(picker), attr=sb | curses.A_DIM)
 
 
 def handle_workflow_picker_key(state: State, key: int) -> None:

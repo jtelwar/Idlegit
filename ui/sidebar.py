@@ -179,7 +179,12 @@ def draw_sidebar(stdscr, state: State, x: int, w: int) -> None:
         safe_addstr(stdscr, y, x + 1, icon, curses.color_pair(color))
         if is_selected:
             label_attr = curses.color_pair(PAIR_SB_CYAN) | curses.A_BOLD
-        elif t.status in ("running", "pending"):
+        elif t.status == "pending":
+            # Subtle cyan + dim so the "↪ then run: …" placeholder reads
+            # as a chained follow-up rather than another regular running
+            # row — matches the cyan icon in the gutter.
+            label_attr = curses.color_pair(PAIR_SB_CYAN) | curses.A_DIM
+        elif t.status == "running":
             label_attr = sb
         else:
             label_attr = sb | curses.A_DIM

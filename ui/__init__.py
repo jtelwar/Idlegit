@@ -18,6 +18,7 @@ from git_ops import (
     parse_github_slug, would_run_on_push,
 )
 from workers import (
+    _build_recovery_prompt, execute_detached_recovery,
     kick_off_bulk_suggest, kick_off_suggest_for, kick_off_workers,
     refresh_repo_with_remote_state,
 )
@@ -47,17 +48,20 @@ from .hints import (  # noqa: F401  (re-exported public API)
 # of the package don't have to know which submodule owns which modal.
 from .modals import (  # noqa: F401  (re-exported public API)
     commit_workspace_creator,
-    draw_action_menu, draw_align_heads_prompt, draw_branch_picker,
-    draw_reset_prompt, draw_task_action_menu, draw_workflow_picker,
-    draw_workspace_creator, draw_workspace_menu, draw_workspaces_picker,
+    draw_action_menu, draw_align_heads_prompt, draw_branch_name_prompt,
+    draw_branch_picker, draw_detached_recovery_prompt, draw_reset_prompt,
+    draw_task_action_menu, draw_workflow_picker, draw_workspace_creator,
+    draw_workspace_menu, draw_workspaces_picker,
     handle_action_menu_key, handle_align_heads_prompt_key,
-    handle_branch_picker_key, handle_reset_prompt_key,
+    handle_branch_name_prompt_key, handle_branch_picker_key,
+    handle_detached_recovery_prompt_key, handle_reset_prompt_key,
     handle_task_action_menu_key, handle_workflow_picker_key,
     handle_workspace_creator_key, handle_workspace_menu_key,
     handle_workspaces_picker_key,
-    open_action_menu, open_align_heads_prompt, open_branch_picker,
-    open_reset_prompt, open_task_action_menu, open_workflow_picker,
-    open_workspace_creator, open_workspace_menu, open_workspaces_picker,
+    open_action_menu, open_align_heads_prompt, open_branch_name_prompt,
+    open_branch_picker, open_detached_recovery_prompt, open_reset_prompt,
+    open_task_action_menu, open_workflow_picker, open_workspace_creator,
+    open_workspace_menu, open_workspaces_picker,
     tick_creator_checks, tick_menu_path_checks,
 )
 # Right-hand task panel.
@@ -347,7 +351,12 @@ def draw_main(stdscr, state: State) -> None:
         # primary content; with a single workspace they're cosmetic
         # (cycling is a no-op) but the visual cue still tells the user
         # "this row is focused".
-        ws_focused = state.on_workspace_row
+        # Chevrons only render when the workspace row is BOTH selected
+        # AND the repos panel itself is focused — otherwise they stay
+        # lit when the user has tabbed over to the task panel, which
+        # reads as both panels claiming focus simultaneously.
+        ws_focused = (state.on_workspace_row
+                      and state.focused_panel == "repos")
         x = len("idlegit") + 3
         if ws_focused:
             safe_addstr(stdscr, 0, x, "‹ ", curses.A_DIM)
@@ -417,11 +426,17 @@ def draw_main(stdscr, state: State) -> None:
 
     spinner_char = SPINNER_FRAMES[state.spinner_frame % len(SPINNER_FRAMES)]
     y_for_body: Dict[int, int] = {}
+    # The repos panel only shows its focus arrow when it's the active
+    # panel. If the user has Shift+Tab'd over to the task panel,
+    # `state.selected` still names a repo row but it shouldn't be
+    # highlighted as focused on the repos side — otherwise both panels
+    # appear to have focus simultaneously, which reads as confusing.
+    repos_panel_active = state.focused_panel == "repos"
     for screen_i, body_idx in enumerate(range(visible_start, visible_end)):
         row = body_rows[body_idx]
         y = base_y + screen_i
         y_for_body[body_idx] = y
-        focused = (state.selected == body_idx)
+        focused = repos_panel_active and (state.selected == body_idx)
         if row[0] == "repo":
             row_cursor = state.field_cursor if focused else 0
             draw_repo_row(stdscr, y, row[1], focused,
@@ -445,9 +460,11 @@ def draw_main(stdscr, state: State) -> None:
     # Subtle focus marker at column 0 of the active body row. Skipped
     # on the workspace row (selected = -1) since the chevrons around
     # the workspace name already advertise focus and an extra glyph at
-    # column 0 would clobber the "i" of "idlegit".
+    # column 0 would clobber the "i" of "idlegit". Also skipped when
+    # the user has tabbed over to the task panel — having the marker
+    # lit on both sides reads as "both panels are active".
     focus_y: Optional[int] = None
-    if state.selected >= 0:
+    if repos_panel_active and state.selected >= 0:
         focus_y = y_for_body.get(state.selected)
     if focus_y is not None:
         safe_addstr(stdscr, focus_y, 0, "›",
@@ -463,6 +480,8 @@ def draw_main(stdscr, state: State) -> None:
 
     modal_active = (state.action_menu is not None
                     or state.branch_picker is not None
+                    or state.branch_name_prompt is not None
+                    or state.detached_recovery_prompt is not None
                     or state.reset_prompt is not None
                     or state.workflow_picker is not None
                     or state.align_heads_prompt is not None
@@ -474,6 +493,10 @@ def draw_main(stdscr, state: State) -> None:
         draw_action_menu(stdscr, state, sidebar_x)
     if state.branch_picker is not None:
         draw_branch_picker(stdscr, state, sidebar_x)
+    if state.branch_name_prompt is not None:
+        draw_branch_name_prompt(stdscr, state, sidebar_x)
+    if state.detached_recovery_prompt is not None:
+        draw_detached_recovery_prompt(stdscr, state, sidebar_x)
     if state.reset_prompt is not None:
         draw_reset_prompt(stdscr, state, sidebar_x)
     if state.workflow_picker is not None:
@@ -601,13 +624,24 @@ def draw_child_row(stdscr, y: int, child: ChildRef, focused: bool,
                    spinner_char: str = " ") -> None:
     glyph = "↳" if child.kind == "submodule" else "⊕"
     name_attr = curses.A_BOLD if focused else curses.A_DIM
-    # Submodule glyph carries the sync-vs-canonical signal: green when
-    # the nested HEAD matches the canonical, pink when it has drifted.
-    # Subtree rows have no such relationship, so the glyph stays in the
-    # row's normal name attribute.
+    # Submodule glyph is a composite "needs your attention?" indicator:
+    #   pink   — out of sync vs canonical (drift takes precedence — the
+    #            nested checkout is on the wrong commit, fixing that is
+    #            the bigger problem)
+    #   yellow — in sync with canonical but the working tree is dirty
+    #            (uncommitted edits — easy to miss when scanning if the
+    #            glyph were green)
+    #   green  — in sync AND clean (truly nothing to do)
+    # Subtree rows have no canonical relationship, so the glyph stays
+    # in the row's normal name attribute.
     if child.kind == "submodule":
-        glyph_attr = (curses.color_pair(PAIR_OK) if child.in_sync
-                      else curses.color_pair(PAIR_BEHIND))
+        if not child.in_sync:
+            glyph_pair = PAIR_BEHIND
+        elif child.dirty:
+            glyph_pair = PAIR_DIRTY
+        else:
+            glyph_pair = PAIR_OK
+        glyph_attr = curses.color_pair(glyph_pair)
         if focused:
             glyph_attr |= curses.A_BOLD
     else:
@@ -625,9 +659,16 @@ def draw_child_row(stdscr, y: int, child: ChildRef, focused: bool,
                 .ljust(branch_w))
             safe_addstr(stdscr, y, 2 + name_w, branch_str,
                         curses.color_pair(PAIR_BRANCH) | curses.A_DIM)
-        # Main state dot — same precedence as a top-level repo.
-        _, state_attr = child_state_color(child)
-        safe_addstr(stdscr, y, 2 + name_w + branch_w, " ● ", state_attr)
+        # Main state dot — same precedence as a top-level repo. While
+        # the child is mid-action / mid-refresh, swap the dot for the
+        # global spinner so the row is obviously in-flight instead of
+        # carrying a stale state colour.
+        if child.refreshing:
+            safe_addstr(stdscr, y, 2 + name_w + branch_w,
+                        f" {spinner_char} ", curses.color_pair(PAIR_BRANCH))
+        else:
+            _, state_attr = child_state_color(child)
+            safe_addstr(stdscr, y, 2 + name_w + branch_w, " ● ", state_attr)
         if child.suggesting and not child.message:
             inner_w = field_w - 1
             text = (f"{spinner_char} generating…").ljust(inner_w + 1)
@@ -1085,11 +1126,14 @@ def handle_task_panel_key(state: State, key: int) -> Optional[str]:
         return None
 
     if key in (10, 13, curses.KEY_ENTER):
-        # Enter on a finished task removes it. Running tasks are kept so
-        # the user can't accidentally drop something mid-flight.
+        # Enter on a finished task removes it. `running` AND `pending`
+        # rows are both kept so the user can't accidentally drop
+        # something mid-flight — `pending` is the chained-then-run
+        # placeholder waiting on a parent run to land, and dropping it
+        # would silently cancel the queued follow-up.
         if 0 <= state.task_selected < n:
             t = items[state.task_selected]
-            if t.status != "running":
+            if t.status not in ("running", "pending"):
                 state.tasks.remove(t)
                 _clamp_task_selection(state)
         return None
@@ -1280,6 +1324,100 @@ def confirm_quit(stdscr, state: State) -> bool:
             return False
 
 
+def _detached_review_preflight(stdscr, state: State) -> bool:
+    """Pop the recovery modal for every detached-HEAD repo / submodule
+    child that has a queued commit message, BEFORE the review screen
+    draws. Returns True when the review can proceed (every detached
+    target either got fast-forwarded or wasn't on the commit list);
+    False if the user cancelled any prompt — in which case the review
+    is aborted and the cursor goes back to the main panel.
+
+    Without this preflight, a detached canonical row got past review
+    all the way to `commit_worker` before the recovery modal popped,
+    which felt like idlegit was "about to push on origin/(detached)"
+    even though the commit_worker guard would still have caught it.
+    Surfacing the modal at review time matches the user's mental
+    model of "I just told it to commit; ask now"."""
+    while True:
+        target = _next_detached_review_target(state)
+        if target is None:
+            return True
+        path, label = target
+        prompt = _build_recovery_prompt(path, label)
+        if prompt is None:
+            # No recovery branch available — surface a one-shot warn
+            # task and abort the review so commit_worker doesn't try
+            # to push a (detached) refspec.
+            t = state.tasks.add(f"{label}: cannot commit")
+            state.tasks.update(
+                t, "fail",
+                "detached HEAD with no recoverable target branch")
+            return False
+        state.detached_recovery_prompt = prompt
+        if not _drive_modal_until_closed(stdscr, state,
+                                         "detached_recovery_prompt"):
+            return False
+        if prompt.chosen_action != "ff":
+            return False
+        ok, msg = execute_detached_recovery(path, prompt.target_branch)
+        if not ok:
+            t = state.tasks.add(f"{label}: cannot commit")
+            state.tasks.update(t, "fail", msg or "recovery failed")
+            return False
+        # Loop back — the next iteration finds the next detached
+        # target (if any) and runs the same flow.
+
+
+def _next_detached_review_target(state: State):
+    """Return `(path, label)` for the next detached commit target with
+    a queued message, or None when none remain. Walks top-level repos
+    first, then submodule children — so the modal sequence is stable
+    and predictable."""
+    from git_ops import git
+    for repo in state.repos:
+        if not repo.message.strip():
+            continue
+        rc, out, _ = git(repo.path, ["branch", "--show-current"])
+        if rc == 0 and not out.strip():
+            return repo.path, repo.display_name
+    for parent in state.repos:
+        for child in parent.children:
+            if child.kind != "submodule" or not child.message.strip():
+                continue
+            rc, out, _ = git(child.nested_path, ["branch", "--show-current"])
+            if rc == 0 and not out.strip():
+                label = (f"↳ {child.repo.display_name} "
+                         f"in {parent.display_name}")
+                return child.nested_path, label
+    return None
+
+
+def _drive_modal_until_closed(stdscr, state: State, slot: str) -> bool:
+    """Inner event loop that draws the main UI plus whichever modal
+    `state.<slot>` is set to, dispatching keys to the matching
+    handler until the modal clears its slot. Used by the review-
+    screen preflight to surface a `DetachedRecoveryPrompt` from the
+    main thread (workers use `result_event` instead).
+
+    Returns True when the modal closed normally; False on a Ctrl+C
+    interrupt (caller treats this as a cancel)."""
+    handler = {
+        "detached_recovery_prompt": handle_detached_recovery_prompt_key,
+    }[slot]
+    while getattr(state, slot) is not None:
+        draw_main(stdscr, state)
+        stdscr.refresh()
+        try:
+            key = stdscr.getch()
+        except KeyboardInterrupt:
+            setattr(state, slot, None)
+            return False
+        if key == curses.KEY_RESIZE:
+            continue
+        handler(state, key)
+    return True
+
+
 def handle_confirm(stdscr, state: State) -> None:
     """Inner loop for the review screen. Returns when the user confirms or
     backs out; commits run async after Enter, so we just hand off and exit.
@@ -1289,6 +1427,8 @@ def handle_confirm(stdscr, state: State) -> None:
     screen. Each item is `(kind, obj)` where kind is "lfs", "toggle",
     or "then_run"; Space flips boolean items, ←/→ cycles a then-run
     selector through its repo's dispatchable workflows."""
+    if not _detached_review_preflight(stdscr, state):
+        return
     lines, candidates, wf_toggles, then_run_items = build_confirm_lines(state)
     # Build one focus list ordered by visible line so a Down keystroke
     # always lands on the row directly below — toggles + then-run rows

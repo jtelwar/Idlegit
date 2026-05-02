@@ -12,8 +12,16 @@ from .align_heads_prompt import (
     draw_align_heads_prompt, handle_align_heads_prompt_key,
     open_align_heads_prompt,
 )
+from .branch_name_prompt import (
+    draw_branch_name_prompt, handle_branch_name_prompt_key,
+    open_branch_name_prompt,
+)
 from .branch_picker import (
     draw_branch_picker, handle_branch_picker_key, open_branch_picker,
+)
+from .detached_recovery_prompt import (
+    draw_detached_recovery_prompt, handle_detached_recovery_prompt_key,
+    open_detached_recovery_prompt,
 )
 from .reset_prompt import (
     draw_reset_prompt, handle_reset_prompt_key, open_reset_prompt,
@@ -43,7 +51,11 @@ __all__ = [
     "draw_action_menu", "handle_action_menu_key", "open_action_menu",
     "draw_align_heads_prompt", "handle_align_heads_prompt_key",
     "open_align_heads_prompt",
+    "draw_branch_name_prompt", "handle_branch_name_prompt_key",
+    "open_branch_name_prompt",
     "draw_branch_picker", "handle_branch_picker_key", "open_branch_picker",
+    "draw_detached_recovery_prompt", "handle_detached_recovery_prompt_key",
+    "open_detached_recovery_prompt",
     "draw_reset_prompt", "handle_reset_prompt_key", "open_reset_prompt",
     "draw_task_action_menu", "handle_task_action_menu_key",
     "open_task_action_menu",

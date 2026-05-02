@@ -117,6 +117,11 @@ class ChildRef:
     message: str = ""
     dirty: bool = False  # working-tree changes in the nested checkout
     suggesting: bool = False  # background suggest in flight for this row
+    # True while an action / refresh is in flight against this child —
+    # the row's state dot renders as the global spinner glyph instead
+    # of the dirty/clean/etc. colour, so it's obvious the row's
+    # "current" state is in transition. Same role as `Repo.refreshing`.
+    refreshing: bool = False
     # Full per-checkout state, populated by link_siblings._populate so
     # the row can be coloured with the same precedence as a top-level
     # Repo (dirty / ahead / behind / diverged / no-upstream / clean /
@@ -293,8 +298,15 @@ class Tasks:
             return list(self.items)
 
     def prune_completed(self) -> None:
+        """Drop terminal tasks (ok / fail / warn) only. `running` and
+        `pending` rows stay — `pending` in particular is a non-terminal
+        "waiting on parent" placeholder (e.g. a chained then-run sitting
+        under its parent workflow run), and dropping it on Ctrl+R would
+        wipe the user's queued follow-up before the parent has had a
+        chance to fire it."""
         with self.lock:
-            kept = [t for t in self.items if t.status == "running"]
+            kept = [t for t in self.items
+                    if t.status in ("running", "pending")]
             self._drop_meta_outside(kept)
             self.items = kept
 
@@ -501,7 +513,12 @@ class ActionMenu:
 
 @dataclass
 class BranchPicker:
-    """Sub-modal triggered from the action menu's "switch branch" item."""
+    """Sub-modal triggered from the action menu's "switch branch" or
+    "merge in branch" items. `mode` is "switch" (default) or "merge"
+    — same picker, two effects: switch_branch dispatches `switch_branch`
+    on Enter; merge dispatches `ff_merge`. The current branch is shown
+    as a "(current)" marker; in merge mode it's also disabled (you
+    can't merge a branch into itself)."""
     target_label: str
     target_path: Path
     target_repo: Optional[Repo] = None
@@ -511,6 +528,44 @@ class BranchPicker:
     current: str = ""
     selected: int = 0
     scroll: int = 0
+    mode: str = "switch"
+
+
+@dataclass
+class BranchNamePrompt:
+    """Sub-modal for typing a new branch name — used by the action
+    menu's "Save HEAD to new branch…" item to recover a detached HEAD
+    by parking its commits on a fresh branch. Cardinal-rule safe:
+    creating a ref never destroys content."""
+    target_label: str
+    target_path: Path
+    target_repo: Optional[Repo] = None
+    target_parent: Optional[Repo] = None
+    target_child: Optional[ChildRef] = None
+    typed: str = ""           # user's typed text (empty → use default_name)
+    default_name: str = ""    # placeholder shown when typed is empty
+    head_sha: str = ""        # short sha rendered in the subtitle
+
+
+@dataclass
+class DetachedRecoveryPrompt:
+    """Modal popped by the smart-sync / commit pipelines when they
+    encounter a detached HEAD that needs to be parked on a branch
+    before they can continue. Cardinal-rule safety is decided BEFORE
+    the modal opens — `can_ff` is True iff `target_branch` is already
+    an ancestor of HEAD, in which case `git checkout -B target HEAD`
+    fast-forwards the branch without orphaning any commits.
+
+    The worker thread that triggered the modal blocks on
+    `result_event` until the user picks (sets `chosen_action` to
+    "ff" or "cancel")."""
+    target_label: str       # full repo display name, no truncation
+    head_sha: str           # full sha; rendered as :8 in the modal
+    target_branch: str      # the branch we'd FF (e.g. "master")
+    n_extra: int            # commits HEAD has that target_branch doesn't
+    can_ff: bool            # True iff target_branch is ancestor of HEAD
+    chosen_action: Optional[str] = None  # "ff" / "cancel"
+    result_event: threading.Event = field(default_factory=threading.Event)
 
 
 @dataclass
@@ -578,12 +633,22 @@ class AlignHeadsPrompt:
     winner is on a detached HEAD — we can't push without first switching
     to a branch, and only the user can decide which one. The worker that
     triggered the modal blocks on `result_event` until the user picks
-    (sets `chosen_branch`) or cancels (sets `chosen_branch = ""`)."""
-    canonical_label: str
-    winner_label: str
+    (sets `chosen_branch`) or cancels (sets `chosen_branch = ""`).
+
+    `canonical_name` and `winner_parent_name` are the full
+    `Repo.display_name` strings — the modal lays them out itself with
+    `wrap_label_value` rather than receiving a pre-truncated string.
+    `winner_parent_name` is empty when the winner is the canonical's
+    own top-level checkout (no parent)."""
+    canonical_name: str
+    winner_parent_name: str
     winner_sha: str
     branches: List[str] = field(default_factory=list)
     selected: int = 0
+    # First-visible-branch index when the list overflows the modal's
+    # available height. The draw routine clamps + adjusts so the
+    # selected row stays in view even on tiny terminals.
+    scroll: int = 0
     chosen_branch: Optional[str] = None    # None → still waiting; "" → cancelled
     result_event: threading.Event = field(default_factory=threading.Event)
 
@@ -826,9 +891,11 @@ class State:
     task_scroll: int = 0
     action_menu: Optional[ActionMenu] = None
     branch_picker: Optional[BranchPicker] = None
+    branch_name_prompt: Optional[BranchNamePrompt] = None
     reset_prompt: Optional[ResetPrompt] = None
     workflow_picker: Optional[WorkflowPicker] = None
     align_heads_prompt: Optional[AlignHeadsPrompt] = None
+    detached_recovery_prompt: Optional[DetachedRecoveryPrompt] = None
     task_action_menu: Optional[TaskActionMenu] = None
     workspace_menu: Optional["WorkspaceMenu"] = None
     workspace_creator: Optional["WorkspaceCreator"] = None

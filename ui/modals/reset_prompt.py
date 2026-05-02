@@ -7,8 +7,16 @@ from models import ResetPrompt, State
 from workers import kick_off_action
 
 from ..colors import PAIR_SB_CYAN, PAIR_SB_FG
-from ..geometry import draw_modal_fill, modal_geometry, safe_addstr
+from ..geometry import (
+    draw_modal_fill, end_truncate, modal_geometry, safe_addstr,
+    wrap_label_value,
+)
 from ..hints import KEY_BACKSPACE, KEY_ENTER, KEY_ESC, Hint, render_hints
+
+_PAD_TOP = 1
+_PAD_BOTTOM = 1
+_PAD_X = 2
+_MODAL_W = 60
 
 
 def _hints(prompt: ResetPrompt) -> list:
@@ -49,36 +57,66 @@ def open_reset_prompt(state: State) -> None:
     )
 
 
+def _title_lines(prompt: ResetPrompt, inner_w: int) -> "list[str]":
+    return wrap_label_value("Soft reset", prompt.target_label, inner_w)
+
+
 def draw_reset_prompt(stdscr, state: State, sidebar_x: int) -> None:
     prompt = state.reset_prompt
     if prompt is None:
         return
-    # +2 reserves a blank row above the title and below the footer
-    # hint so the modal doesn't feel pasted against its own edges.
-    content_h = 7 + 2
-    x, y, w, h = modal_geometry(stdscr, sidebar_x, 56, content_h)
+
     sb = curses.color_pair(PAIR_SB_FG)
+    target_inner_w = max(1, _MODAL_W - 2 * _PAD_X)
+    title_rows = _title_lines(prompt, target_inner_w)
+
+    # Body: "unpushed commits…" + "Number to reset…" + count field +
+    # blank above the hint.
+    body_rows = 1 + 1 + 1 + 1
+    blank_after_title = 1
+    hint_rows = 1
+    desired_h = (
+        _PAD_TOP + len(title_rows) + blank_after_title + body_rows
+        + hint_rows + _PAD_BOTTOM
+    )
+    x, y, w, h = modal_geometry(stdscr, sidebar_x, _MODAL_W, desired_h)
     draw_modal_fill(stdscr, x, y, w, h, sb)
 
-    inner_x = x + 2
-    safe_addstr(stdscr, y + 1, inner_x,
-                f"Soft reset — {prompt.target_label}"[: w - 4],
-                curses.A_BOLD | curses.color_pair(PAIR_SB_CYAN))
+    inner_x = x + _PAD_X
+    inner_w = max(1, w - 2 * _PAD_X)
 
-    safe_addstr(stdscr, y + 3, inner_x,
-                f"unpushed commits on this branch: {prompt.ahead}",
+    if inner_w != target_inner_w:
+        title_rows = _title_lines(prompt, inner_w)
+
+    line = y + _PAD_TOP
+    for i, text in enumerate(title_rows):
+        attr = (curses.A_BOLD | curses.color_pair(PAIR_SB_CYAN)
+                if i == 0 else sb)
+        safe_addstr(stdscr, line, inner_x,
+                    end_truncate(text, inner_w), attr)
+        line += 1
+    line += blank_after_title
+
+    safe_addstr(stdscr, line, inner_x,
+                end_truncate(
+                    f"unpushed commits on this branch: {prompt.ahead}",
+                    inner_w),
                 sb | curses.A_DIM)
-    safe_addstr(stdscr, y + 4, inner_x,
-                "Number to reset:  (Enter on 0 wipes ALL unpushed)",
+    line += 1
+    safe_addstr(stdscr, line, inner_x,
+                end_truncate(
+                    "Number to reset:  (Enter on 0 wipes ALL unpushed)",
+                    inner_w),
                 sb | curses.A_DIM)
+    line += 1
 
     visible = prompt.typed if prompt.typed else "0"
     field_text = f" {visible} "
-    safe_addstr(stdscr, y + 5, inner_x, field_text.ljust(w - 4),
+    safe_addstr(stdscr, line, inner_x, field_text.ljust(inner_w),
                 sb | curses.A_REVERSE)
 
-    render_hints(stdscr, y + h - 2, inner_x, w - 4, _hints(prompt),
-                 attr=sb | curses.A_DIM)
+    render_hints(stdscr, y + h - _PAD_BOTTOM - 1, inner_x, inner_w,
+                 _hints(prompt), attr=sb | curses.A_DIM)
 
 
 def handle_reset_prompt_key(state: State, key: int) -> None:

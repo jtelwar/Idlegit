@@ -14,6 +14,8 @@ folders = /Users/joel/Workspace/4low
 
 [workspace.Upskill.Health]
 folders = /Users/joel/Workspace/Upskill.Health
+suggest_added = 3
+suggest_updated = 3
 
 [workspace.idlegit]
 folders = /Users/joel/Workspace/idlegit

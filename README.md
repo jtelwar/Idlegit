@@ -1,12 +1,11 @@
 # idlegit
 
-A small interactive multi-repo git tool. One screen for status, commit, and
-push across every repo in a workspace.
+A small interactive multi-repo git tool. One screen for status of the whole workspace. Stage, commit, and
+push across every repo and track the resulting actions.
 
 ## Why
 
-Because clicking through a GUI git tool to commit-and-push the same set
-of repos every day got old. 
+Because clicking through a painfully inefficient GUI git tool to commit-and-push the same set of repos every day, then navigating to github to track their actions, got old. 
 
 And because the name lazygit was already taken, but it's just not lazy enough for me...
 
@@ -28,14 +27,18 @@ that workspace's overrides). Workspaces are persisted to
 ## Design Goals
 
 - Frictionless 
-- Completely non-destructive
-- Opinionated but configurable
+- Safe
+- Opinionated 
+- Configurable
 
 ## Features
 
-- Two-keypress staging, committing, pushing, github action tracking and chaining
-- Smart-sync submodules across monitored repos
-- Does everything heavy with background workers
+- Two-keypress staging, committing, pushing
+- Github action running, tracking, chaining
+- Completely non-destructive*
+- Auto-writes commit messages in an instant
+- Smart-syncs submodules across a workspace
+- Uses background workers
 - Tracks every operation
 - Small footprint, light on resources
 
@@ -50,3 +53,6 @@ Defaults are sensible — you can run with no config at all.
 - `git` on `$PATH`
 - `git-lfs` on `$PATH` if you want to use the LFS toggle on the review screen
 - `gh` on `$PATH` if you want github action running/tracking
+
+
+* NB no legal warranty to this effect is implied or offered. Don't come for me if this thing calls `rm -rf .git`. (It won't).

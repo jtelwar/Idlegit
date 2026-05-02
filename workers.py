@@ -10,7 +10,8 @@ from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
 
 from models import (
-    AlignHeadsPrompt, ChildRef, LFSCandidate, Repo, SmartSyncCheckout, State,
+    AlignHeadsPrompt, ChildRef, DetachedRecoveryPrompt, LFSCandidate,
+    Repo, SmartSyncCheckout, State,
     Task,
 )
 from git_ops import (
@@ -90,19 +91,22 @@ def _format_job_label(job_name: str, current_step: str = "") -> str:
 
 def _poll_run(state: State, slug: str, run_id: int,
               repo: Repo, workflow_name: str,
-              run_task: Task) -> None:
+              run_task: Task,
+              pending_task: Optional[Task] = None) -> None:
     """Poll one run's detailed view until it terminates, mirroring its
     progress to the sidebar. Each job materialises as its own indented
     sub-task, and the parent task's label refreshes with the current step
     of whichever job is most active. When the run finishes successfully,
     fire the repo's "then run after <workflow>" chain — if any.
 
-    If a then-run is wired up, we add a `pending`-status placeholder task
-    indented under the parent before polling so the user sees the chain
-    queued from the start. On success the placeholder transforms (via
-    `existing_task=` on `kick_off_manual_dispatch`) into the dispatch
-    step rather than leaving a duplicate row behind; on fail/warn it
-    short-circuits to a "skipped" warn."""
+    `pending_task`, when set, is a `pending`-status placeholder row
+    that the caller already inserted directly under `run_task` (so the
+    "↪ then run: X" line stays adjacent to its parent even when other
+    workflow runs land in the panel between this call and the first
+    poll). On success the placeholder transforms (via `existing_task=`
+    on `kick_off_manual_dispatch`) into the dispatch step rather than
+    leaving a duplicate row behind; on fail/warn it short-circuits to
+    a "skipped" warn."""
     base_interval = max(0.5, state.actions_poll_seconds)
     poll_interval = base_interval
     # Cap the backed-off interval — long-queued runs still want to be
@@ -124,21 +128,6 @@ def _poll_run(state: State, slug: str, run_id: int,
     state.tasks.set_meta(
         run_task, repo=repo, slug=slug, run_id=run_id,
         workflow_name=workflow_name)
-
-    # Snapshot the chained then-run target up front (don't pop yet —
-    # we still need it visible in the dict so the row can render the
-    # "waiting on …" message until the parent finishes).
-    pending_then_run = repo.then_run_after_workflow.get(workflow_name, "")
-    pending_task: Optional[Task] = None
-    if pending_then_run:
-        pending_task = state.tasks.add(
-            f"  ↪ then run: {pending_then_run}", parent=run_task)
-        state.tasks.update(pending_task, "pending",
-                           f"waiting on {workflow_name}")
-        state.tasks.set_meta(
-            pending_task, repo=repo,
-            pending_after_workflow=workflow_name,
-            pending_target=pending_then_run)
 
     while True:
         view = get_run_view(slug, run_id)
@@ -245,7 +234,15 @@ def kick_off_workflow_tracking(state: State, slug: str, run: dict,
                                repo: Repo) -> Optional[Task]:
     """Add a sidebar task for a known GitHub Actions run and spawn a daemon
     that updates it (and its job sub-tasks) until completion. Returns the
-    parent task on success, or None when the run dict is unusable."""
+    parent task on success, or None when the run dict is unusable.
+
+    If the repo has a chained then-run wired up for `workflow_name`,
+    we insert its `pending`-status placeholder row SYNCHRONOUSLY here,
+    immediately after the run task — that way the "↪ then run: …"
+    line stays adjacent to its parent even when another tracked run
+    lands in the panel before this run's poller has had a chance to
+    start. The placeholder is then handed to `_poll_run` so it can
+    transform / fail it as the parent run progresses."""
     workflow_name = run.get("workflowName") or run.get("name") or "workflow"
     repo_label = state.task_repo_label(repo)
     run_id = run.get("databaseId")
@@ -254,9 +251,22 @@ def kick_off_workflow_tracking(state: State, slug: str, run: dict,
         state.tasks.update(t, "fail", "no run id")
         return None
     t = state.tasks.add(_format_run_label(repo_label, workflow_name))
+
+    pending_then_run = repo.then_run_after_workflow.get(workflow_name, "")
+    pending_task: Optional[Task] = None
+    if pending_then_run:
+        pending_task = state.tasks.add(
+            f"  ↪ then run: {pending_then_run}", parent=t)
+        state.tasks.update(pending_task, "pending",
+                           f"waiting on {workflow_name}")
+        state.tasks.set_meta(
+            pending_task, repo=repo,
+            pending_after_workflow=workflow_name,
+            pending_target=pending_then_run)
+
     threading.Thread(
         target=_poll_run,
-        args=(state, slug, run_id, repo, workflow_name, t),
+        args=(state, slug, run_id, repo, workflow_name, t, pending_task),
         daemon=True,
     ).start()
     return t
@@ -392,6 +402,19 @@ def _refresh_target_state(state: State,
 # ---------- Single git-action launcher ------------------------------------
 
 
+def _find_child_at(parent: Optional[Repo],
+                   path: Path) -> Optional[ChildRef]:
+    """Locate the ChildRef inside `parent` whose nested checkout lives
+    at `path`. Used by `kick_off_action` to flip the row's refreshing
+    spinner while an action runs against a nested submodule child."""
+    if parent is None:
+        return None
+    for child in parent.children:
+        if child.nested_path == path:
+            return child
+    return None
+
+
 def kick_off_action(state: State, action_id: str, *,
                     target_label: str, target_path: Path,
                     target_repo: Optional[Repo],
@@ -400,9 +423,24 @@ def kick_off_action(state: State, action_id: str, *,
                     reset_count: int = 0) -> None:
     """Spawn a daemon worker that runs one git action against `target_path`,
     publishes its progress to the sidebar, and quietly re-queries that one
-    repo's state when it finishes. Returns immediately so the UI is free."""
+    repo's state when it finishes. Returns immediately so the UI is free.
+
+    The targeted row's `refreshing` flag is held high from the moment
+    the action is submitted until the post-action refresh completes —
+    its state dot renders as the global spinner glyph during that
+    window, so it's obvious the row's state is in transition rather
+    than the user wondering whether their keystroke registered."""
+    target_child = _find_child_at(target_parent, target_path)
+    # Flip refreshing SYNCHRONOUSLY before returning so the very next
+    # redraw shows the spinner — the daemon worker may not run for a
+    # tick, and even a 100ms gap reads as "did anything happen?".
+    if target_repo is not None:
+        target_repo.refreshing = True
+    if target_child is not None:
+        target_child.refreshing = True
 
     def worker() -> None:
+      try:
         if action_id == "fetch":
             t = state.tasks.add(f"{target_label}: fetch")
             rc, _, err = git(target_path, ["fetch", "--all"])
@@ -462,10 +500,46 @@ def kick_off_action(state: State, action_id: str, *,
                 state.tasks.update(
                     t, "ok" if rc == 0 else "fail",
                     "" if rc == 0 else first_line(err))
+        elif action_id == "branch_from_head":
+            # Save a detached HEAD's commits onto a fresh branch.
+            # `git checkout -b <name>` only creates a ref + flips HEAD
+            # to it — non-destructive (cardinal-rule safe). The new
+            # branch points at the SAME commit HEAD was on, so every
+            # unique commit is now reachable from a named branch and
+            # `merge-base --is-ancestor` checks elsewhere will treat
+            # the work as no longer at risk of being orphaned.
+            t = state.tasks.add(
+                f"{target_label}: branch HEAD as {branch_arg}")
+            rc, _, err = git(target_path, ["checkout", "-b", branch_arg])
+            state.tasks.update(
+                t, "ok" if rc == 0 else "fail",
+                "" if rc == 0 else first_line(err))
+        elif action_id == "ff_merge":
+            # Fast-forward-only merge: refuses on its own if a real
+            # merge commit would be needed, so divergent histories
+            # never silently get a merge commit the user didn't ask
+            # for. The lack of `--no-ff` etc. keeps this strict.
+            t = state.tasks.add(
+                f"{target_label}: merge --ff-only {branch_arg}")
+            rc, _, err = git(target_path, [
+                "merge", "--ff-only", branch_arg])
+            if rc == 0:
+                state.tasks.update(t, "ok")
+            else:
+                state.tasks.update(
+                    t, "fail",
+                    first_line(err) or "not a fast-forward")
         else:
             return  # unknown action — nothing to do
 
         _refresh_target_state(state, target_repo, target_parent)
+      finally:
+        # Always release the refreshing flags — even on early-return
+        # / exception paths — so a row never gets stuck spinning.
+        if target_repo is not None:
+            target_repo.refreshing = False
+        if target_child is not None:
+            target_child.refreshing = False
 
     threading.Thread(target=worker, daemon=True).start()
 
@@ -557,22 +631,25 @@ def commit_worker(state: State, repo: Repo, msg: str,
         tasks.update(t, "warn", "merge in progress")
         return
 
-    # Refuse the whole pipeline when the repo is on a detached HEAD.
-    # Committing on a detached HEAD silently creates an orphan commit;
-    # pushing it then tries `git push --set-upstream origin "(detached)"`
-    # (the sentinel string from refresh_repo) and fails with `error:
-    # src refspec (detached) does not match`. Mirrors the same guard
-    # commit_worker_for_child has had since the start. The user resolves
-    # via the action menu's "switch branch…" item — that path is
-    # already cardinal-rule safe (it refuses if HEAD has commits not on
-    # the chosen branch).
+    # Detached-HEAD pre-flight. Committing on a detached HEAD silently
+    # creates an orphan commit; pushing it then tries `git push
+    # --set-upstream origin "(detached)"` (the sentinel string from
+    # refresh_repo) and fails with `error: src refspec (detached) does
+    # not match`. Before the cardinal-rule rewrite, this code just
+    # refused; now it tries to recover safely first by asking the user
+    # via the DetachedRecoveryPrompt modal. On confirm + a successful
+    # FF, HEAD lands on the resolved default branch and the pipeline
+    # continues with that branch as the new commit/push target.
     rc, branch_out, _ = git(repo.path, ["branch", "--show-current"])
     if rc != 0 or not branch_out.strip():
-        t = tasks.add(f"{name}: cannot commit")
-        tasks.update(t, "fail",
-                     "detached HEAD — switch to a branch first via the "
-                     "action menu's \"switch branch…\" item")
-        return
+        recovered, rmsg = _attempt_detached_recovery(state, repo.path, name)
+        if not recovered:
+            t = tasks.add(f"{name}: cannot commit")
+            tasks.update(t, "fail",
+                         "detached HEAD — " + (rmsg or "user cancelled"))
+            return
+        t = tasks.add(f"{name}: recovered detached HEAD")
+        tasks.update(t, "ok", "branch fast-forwarded to HEAD")
 
     if auto_stage:
         t = tasks.add(f"{name}: stage all")
@@ -656,11 +733,28 @@ def commit_worker_for_child(state: State, parent: Repo, ref: ChildRef,
     rc, out, _ = git(ref.nested_path, ["branch", "--show-current"])
     nested_branch = out.strip() if rc == 0 else ""
     if not nested_branch:
-        t = tasks.add(f"{name}: cannot commit")
-        tasks.update(t, "fail",
-                     "detached HEAD — checkout a branch in the nested "
-                     "submodule first")
-        return
+        # Try cardinal-rule-safe recovery (modal asks the user). On
+        # success the nested checkout lands on the resolved default
+        # branch and the rest of the pipeline runs against that branch
+        # as the commit/push target.
+        recovered, rmsg = _attempt_detached_recovery(
+            state, ref.nested_path, name)
+        if not recovered:
+            t = tasks.add(f"{name}: cannot commit")
+            tasks.update(t, "fail",
+                         "detached HEAD — " + (rmsg or "user cancelled"))
+            return
+        t = tasks.add(f"{name}: recovered detached HEAD")
+        tasks.update(t, "ok", "branch fast-forwarded to HEAD")
+        # Re-read the now-current branch so the rest of the pipeline
+        # uses the recovered branch as its push refspec.
+        rc, out, _ = git(ref.nested_path, ["branch", "--show-current"])
+        nested_branch = out.strip() if rc == 0 else ""
+        if not nested_branch:
+            t = tasks.add(f"{name}: cannot commit")
+            tasks.update(t, "fail",
+                         "recovery succeeded but branch lookup failed")
+            return
 
     if auto_stage:
         t = tasks.add(f"{name}: stage all")
@@ -927,6 +1021,186 @@ def _head_is_ancestor_of(path: Path, ref: str) -> bool:
     return rc == 0
 
 
+def _ref_is_ancestor_of_head(path: Path, ref: str) -> bool:
+    """Mirror of `_head_is_ancestor_of`, but the other direction —
+    True when `ref` is fully contained in HEAD's history. This is the
+    auto-recovery condition: if `ref` is an ancestor of HEAD, then
+    `git checkout -B <ref> HEAD` (which moves the branch ref forward
+    to HEAD's commit) is a fast-forward of `<ref>` — every commit
+    that was reachable from `<ref>` before is still reachable from it
+    now, and HEAD's unique commits are also captured by the branch."""
+    rc, _, _ = git(path, [
+        "merge-base", "--is-ancestor", ref, "HEAD",
+    ])
+    return rc == 0
+
+
+def _count_commits_between(path: Path, base_ref: str,
+                           head_ref: str = "HEAD") -> int:
+    """`git rev-list --count base_ref..head_ref` — number of commits
+    reachable from `head_ref` but not from `base_ref`. Used by the
+    recovery prompt to tell the user how many commits would be saved
+    by the FF. Returns 0 on any error so the prompt still renders
+    (just without the count)."""
+    rc, out, _ = git(path, [
+        "rev-list", "--count", f"{base_ref}..{head_ref}",
+    ])
+    if rc != 0:
+        return 0
+    try:
+        return int(out.strip())
+    except ValueError:
+        return 0
+
+
+def _ff_branch_to_head(path: Path, branch: str) -> Tuple[bool, str]:
+    """Fast-forward `<branch>` to HEAD's current commit and switch onto
+    it. Cardinal-rule safe IFF the caller has already verified that
+    `_ref_is_ancestor_of_head(path, branch)` — without that check this
+    would silently abandon any commits that were unique to <branch>'s
+    prior tip.
+
+    Implemented as `git checkout -B <branch> HEAD`: an existing branch
+    gets its ref reset to HEAD (no commits orphaned because `<branch>`'s
+    old position is in HEAD's history); the working tree shouldn't
+    change because HEAD's tree IS the new branch tip's tree.
+
+    Returns (ok, message). Empty message on success."""
+    rc, _, err = git(path, ["checkout", "-B", branch, "HEAD"])
+    if rc != 0:
+        return False, first_line(err) or "checkout -B failed"
+    return True, ""
+
+
+def _default_recovery_target(path: Path) -> str:
+    """Pick a sensible default branch to recover a detached HEAD onto.
+    Tries `origin/HEAD` (which records the remote's default branch),
+    then falls back to `master` and `main`. Returns "" when none of
+    those refs exist — callers refuse the recovery in that case."""
+    rc, out, _ = git(path, [
+        "symbolic-ref", "--short", "refs/remotes/origin/HEAD",
+    ])
+    if rc == 0 and out.strip().startswith("origin/"):
+        candidate = out.strip()[len("origin/"):]
+        rc2, _, _ = git(path, ["rev-parse", "--verify", candidate])
+        if rc2 == 0:
+            return candidate
+    for candidate in ("master", "main"):
+        rc, _, _ = git(path, ["rev-parse", "--verify", candidate])
+        if rc == 0:
+            return candidate
+    return ""
+
+
+def _build_recovery_prompt(path: Path, target_label: str,
+                           target_branch: str = ""
+                           ) -> Optional[DetachedRecoveryPrompt]:
+    """Compute the metadata for a `DetachedRecoveryPrompt` against
+    `path` — `(target_branch, can_ff, n_extra, head_sha)` — without
+    blocking. Returns `None` when the path isn't actually detached or
+    no recovery target exists; otherwise a fully-populated prompt the
+    caller can install on `state` and resolve via either the worker-
+    thread `result_event` pattern or a synchronous main-thread inner
+    event loop."""
+    rc, branch_out, _ = git(path, ["branch", "--show-current"])
+    if rc == 0 and branch_out.strip():
+        return None
+
+    if not target_branch:
+        target_branch = _default_recovery_target(path)
+    if not target_branch:
+        return None
+
+    head_to_branch = _head_is_ancestor_of(path, target_branch)
+    branch_to_head = _ref_is_ancestor_of_head(path, target_branch)
+    can_ff = head_to_branch or branch_to_head
+
+    n_extra = (0 if head_to_branch
+               else _count_commits_between(path, target_branch, "HEAD"))
+
+    rc, head_out, _ = git(path, ["rev-parse", "HEAD"])
+    head_sha = head_out.strip() if rc == 0 else ""
+
+    return DetachedRecoveryPrompt(
+        target_label=target_label,
+        head_sha=head_sha,
+        target_branch=target_branch,
+        n_extra=n_extra,
+        can_ff=can_ff,
+    )
+
+
+def execute_detached_recovery(path: Path,
+                              target_branch: str) -> Tuple[bool, str]:
+    """Run the cardinal-rule-safe recovery checkout AFTER the user has
+    confirmed via the modal. Picks strategy A (`git checkout <branch>`
+    when HEAD is an ancestor of branch) vs strategy B (`git checkout
+    -B <branch> HEAD` when branch is an ancestor of HEAD), defending
+    against the divergent case so the caller can't accidentally turn
+    a "user said yes" signal into orphaned commits."""
+    if _head_is_ancestor_of(path, target_branch):
+        rc, _, err = git(path, ["checkout", target_branch])
+    elif _ref_is_ancestor_of_head(path, target_branch):
+        rc, _, err = git(path, ["checkout", "-B", target_branch, "HEAD"])
+    else:
+        return False, "auto-recovery not safe (divergent histories)"
+    if rc != 0:
+        return False, first_line(err) or "recovery checkout failed"
+    return True, ""
+
+
+def _attempt_detached_recovery(state: State, path: Path,
+                               target_label: str,
+                               target_branch: str = ""
+                               ) -> Tuple[bool, str]:
+    """When `path` has a detached HEAD, ask the user (via the
+    `DetachedRecoveryPrompt` modal) for permission to safely park HEAD
+    on a branch — then do it.
+
+    Two safe shapes (cardinal-rule preserving):
+
+      A) HEAD is an ancestor of `target_branch`. `git checkout
+         <branch>` advances HEAD without orphaning anything; HEAD's
+         old position is already on the branch.
+
+      B) `target_branch` is an ancestor of HEAD. `git checkout -B
+         <branch> HEAD` fast-forwards the branch ref to HEAD; the
+         branch's old commits are still in HEAD's history, so nothing
+         is lost.
+
+    Anything else (real divergence, or no recovery target found) is
+    refused — the modal opens with `can_ff=False` so the user sees
+    why and what to do manually.
+
+    `target_branch=""` lets the helper resolve `origin/HEAD` and fall
+    back to master/main. Smart-sync passes the user-picked branch
+    explicitly so the prompt reflects their choice.
+
+    Returns (recovered, msg):
+      (True, "")            HEAD is now on a branch; caller continues.
+      (False, reason)       user cancelled or no safe path; refuse."""
+    # Pre-flight check — if we're not actually detached, recovery is
+    # a no-op and the caller's flow can continue.
+    rc, branch_out, _ = git(path, ["branch", "--show-current"])
+    if rc == 0 and branch_out.strip():
+        return True, "not detached"
+
+    prompt = _build_recovery_prompt(path, target_label, target_branch)
+    if prompt is None:
+        return False, "no recovery target branch available"
+    state.detached_recovery_prompt = prompt
+    prompt.result_event.wait()
+
+    if prompt.chosen_action != "ff":
+        return False, "user cancelled recovery"
+    if not prompt.can_ff:
+        # Defensive — the modal's Enter handler shouldn't return "ff"
+        # when can_ff is False, but if it ever does we refuse rather
+        # than execute an unsafe operation.
+        return False, "auto-recovery not safe (divergent histories)"
+    return execute_detached_recovery(path, prompt.target_branch)
+
+
 def _switch_to_branch(state: State, c: SmartSyncCheckout,
                       branch: str, name: str) -> bool:
     """Move a checkout onto a named branch. Git refuses if the WT has
@@ -1174,11 +1448,27 @@ def _stash_switch_pop_winner(state: State, winner: SmartSyncCheckout,
     # git would silently orphan them (rc=0 with a stderr warning)
     # and any files unique to those commits would vanish from the
     # working tree because the new branch's tree replaces them. The
-    # user has to deal with this manually (e.g. by creating a branch
-    # at HEAD first, or merging into the target branch). This guard
-    # is the reason your file got deleted last time, so we treat it
-    # as an absolute red line.
+    # guard is the reason your file got deleted last time, so we
+    # treat it as an absolute red line.
     if not _head_is_ancestor_of(winner.path, branch):
+        # Auto-recovery: when `branch` is an ancestor of HEAD, the
+        # winner's detached commits are a strict superset of the
+        # chosen branch — a `git checkout -B <branch> HEAD` is a
+        # fast-forward of the branch ref, fully cardinal-rule safe.
+        # Pop a modal asking the user's permission first; on confirm
+        # we do the FF and continue with the rest of the switch flow.
+        if _ref_is_ancestor_of_head(winner.path, branch):
+            recovered, msg = _attempt_detached_recovery(
+                state, winner.path, winner.label, target_branch=branch)
+            if recovered:
+                state.tasks.update(
+                    t, "ok",
+                    f"fast-forwarded {branch} to HEAD")
+                return True
+            state.tasks.update(
+                t, "warn",
+                f"{winner.label}: {msg}")
+            return False
         state.tasks.update(
             t, "warn",
             f"{winner.label}: detached HEAD has commits not on {branch} "
@@ -1325,16 +1615,18 @@ def _resolve_origin_head_branch(path: Path) -> str:
     return ""
 
 
-def _open_align_heads_prompt_and_wait(state: State, canonical_name: str,
+def _open_align_heads_prompt_and_wait(state: State,
                                       winner: SmartSyncCheckout) -> str:
     """Pop the AlignHeadsPrompt modal and block until the user resolves
     it. Returns the chosen branch (or empty string on cancel). Called
     from the smart-sync worker thread; the modal handler in the main
-    loop signals `result_event`."""
+    loop signals `result_event`. The modal receives FULL display names
+    (no `task_repo_label` pre-truncation) and lays them out itself."""
     branches, _ = list_branches(winner.path)
+    parent_name = winner.parent.display_name if winner.parent else ""
     prompt = AlignHeadsPrompt(
-        canonical_label=canonical_name,
-        winner_label=winner.label,
+        canonical_name=winner.canonical.display_name,
+        winner_parent_name=parent_name,
         winner_sha=winner.head,
         branches=branches,
         selected=0,
@@ -1420,7 +1712,7 @@ def _align_canonical(state: State, canonical: Repo) -> Tuple[int, int]:
                 f"{winner.label} detached — turn on align-heads to pick a branch")
             return 0, 1
         if state.prompt_for_branch:
-            chosen = _open_align_heads_prompt_and_wait(state, name, winner)
+            chosen = _open_align_heads_prompt_and_wait(state, winner)
             if not chosen:
                 t = state.tasks.add(f"  ↳ align {name}")
                 state.tasks.update(

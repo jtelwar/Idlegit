@@ -36,8 +36,10 @@ from ui import (
     draw_main,
     handle_action_menu_key,
     handle_align_heads_prompt_key,
+    handle_branch_name_prompt_key,
     handle_branch_picker_key,
     handle_confirm,
+    handle_detached_recovery_prompt_key,
     handle_main_key,
     handle_reset_prompt_key,
     handle_task_action_menu_key,
@@ -344,6 +346,12 @@ def run(stdscr, cfg, workspaces, initial_active_idx: int = 0) -> None:
             continue
         if state.branch_picker is not None:
             handle_branch_picker_key(state, key)
+            continue
+        if state.branch_name_prompt is not None:
+            handle_branch_name_prompt_key(state, key)
+            continue
+        if state.detached_recovery_prompt is not None:
+            handle_detached_recovery_prompt_key(state, key)
             continue
         if state.action_menu is not None:
             handle_action_menu_key(state, key)

@@ -7,6 +7,8 @@ from __future__ import annotations
 import shutil
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -24,6 +26,30 @@ from git_ops import (  # noqa: E402
     working_tree_signature,
 )
 from models import Repo, SubtreeSpec  # noqa: E402
+
+
+def _spawn_recovery_canceller(state, timeout: float = 5.0):
+    """Background daemon that watches `state.detached_recovery_prompt`
+    for the auto-recovery modal opening, then "presses Esc" by setting
+    `chosen_action="cancel"` and signalling `result_event`. Lets tests
+    that hit the smart-sync / commit-pipeline detached-HEAD guards
+    drive the worker through to its refusal path without a real UI.
+
+    Returns the watcher thread so the test can join it. Use only in
+    tests where the cancellation is the expected outcome."""
+    def watcher():
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            prompt = state.detached_recovery_prompt
+            if prompt is not None:
+                prompt.chosen_action = "cancel"
+                prompt.result_event.set()
+                state.detached_recovery_prompt = None
+                return
+            time.sleep(0.05)
+    t = threading.Thread(target=watcher, daemon=True)
+    t.start()
+    return t
 
 
 class _TempWorkspace(unittest.TestCase):
@@ -910,12 +936,13 @@ class TestNoOrphanedCommitsOnSwitch(_TempWorkspace):
         _run(repo, "git", "checkout", "-q", head)
         self.assertTrue(_head_is_ancestor_of(repo, "master"))
 
-    def test_stash_switch_pop_winner_refuses_when_head_has_unique_commit(self) -> None:
+    def test_stash_switch_pop_winner_refuses_when_user_cancels_recovery(self) -> None:
         """Worst case: detached HEAD has a unique commit + dirty WT,
         smart-sync would have orphaned the commit (and the unique
-        file in it) by switching to master. The guard refuses, the
-        file survives in HEAD's tree, and the user gets a clear
-        warn task pointing at the manual recovery path."""
+        file in it) by switching to master. The new auto-recovery
+        flow pops a modal asking permission to FF master to HEAD;
+        if the user cancels, the file survives in HEAD's tree just
+        like the pre-recovery refusal path used to guarantee."""
         from workers import _stash_switch_pop_winner
         from models import Repo, SmartSyncCheckout, State
 
@@ -928,17 +955,68 @@ class TestNoOrphanedCommitsOnSwitch(_TempWorkspace):
             parent=None, path=repo, branch="(detached)", label=repo.name,
             dirty=True)
         state = State(repos=[], workspace_name="test")
+        # Spawn the canceller BEFORE calling the function — the modal
+        # blocks on result_event and we need an actor on the other end.
+        canceller = _spawn_recovery_canceller(state)
         ok = _stash_switch_pop_winner(state, winner, "master", "ws")
+        canceller.join(timeout=1.0)
         self.assertFalse(ok)
         # The unique file is still on disk via HEAD's tree.
         self.assertTrue(
             (repo / "Upskill_Lightmap_Prefab_Baker.cs").exists(),
             "the file unique to the detached commit MUST survive a refused switch",
         )
-        # The task panel surfaces the orphan-risk warning.
+        # The task panel surfaces the cancellation as a warn — the
+        # cardinal-rule guarantee is preserved either way.
         labels = " ".join(t.label + " " + t.message
                           for t in state.tasks.snapshot())
-        self.assertIn("would orphan", labels)
+        self.assertIn("cancel", labels.lower())
+
+    def test_stash_switch_pop_winner_recovers_when_user_confirms(self) -> None:
+        """Cardinal-rule recovery happy path: same scenario as the
+        cancel test, but the user confirms the FF. Smart-sync should
+        complete the switch — HEAD ends up on master, master's ref
+        moved forward to capture the unique commit, and the unique
+        file is on disk via the now-tracked branch."""
+        from workers import _stash_switch_pop_winner
+        from models import Repo, SmartSyncCheckout, State
+
+        repo = self._detached_with_unique_commit()
+        head_before = _run(repo, "git", "rev-parse", "HEAD").stdout.strip()
+        winner = SmartSyncCheckout(
+            canonical=Repo(rel="ws", path=repo),
+            parent=None, path=repo, branch="(detached)", label=repo.name,
+            dirty=False)
+        state = State(repos=[], workspace_name="test")
+
+        # User confirms: simulate "Enter" on the modal.
+        def confirmer():
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                prompt = state.detached_recovery_prompt
+                if prompt is not None:
+                    prompt.chosen_action = "ff"
+                    prompt.result_event.set()
+                    state.detached_recovery_prompt = None
+                    return
+                time.sleep(0.05)
+        t = threading.Thread(target=confirmer, daemon=True)
+        t.start()
+
+        ok = _stash_switch_pop_winner(state, winner, "master", "ws")
+        t.join(timeout=1.0)
+        self.assertTrue(ok)
+        # master now points at HEAD's old commit.
+        master_head = _run(repo, "git", "rev-parse",
+                           "master").stdout.strip()
+        self.assertEqual(master_head, head_before)
+        # The unique file survives.
+        self.assertTrue(
+            (repo / "Upskill_Lightmap_Prefab_Baker.cs").exists())
+        # We're on master now, not detached.
+        self.assertEqual(
+            _run(repo, "git", "branch", "--show-current").stdout.strip(),
+            "master")
 
     def test_align_detached_loser_refuses_when_head_has_unique_commit(self) -> None:
         """Same risk on the loser side: a detached loser with unique
@@ -1326,7 +1404,9 @@ class TestCommitWorkerDetachedGuard(_TempWorkspace):
     detached HEAD → fail with a clear "switch to a branch first"
     message before any stage/commit/push runs."""
 
-    def test_commit_worker_refuses_on_detached_head(self) -> None:
+    def test_commit_worker_refuses_on_detached_head_when_user_cancels(self) -> None:
+        """When the auto-recovery modal pops and the user cancels, the
+        pipeline must NOT proceed — no stage/commit/push, work intact."""
         from workers import commit_worker
         from models import Repo, State
 
@@ -1340,30 +1420,160 @@ class TestCommitWorkerDetachedGuard(_TempWorkspace):
         _run(repo_path, "git", "checkout", "-q", head)
 
         repo = Repo(rel="r", path=repo_path)
-        # Skip refresh_repo — set the cached fields the worker reads
-        # explicitly so the test exercises the in-loop branch query.
         repo.merging = False
         repo.upstream = None
         repo.remote_url = None
         state = State(repos=[repo], workspace_name="test")
+
+        # Spawn the modal canceller, then call commit_worker. The
+        # worker pops the recovery prompt and blocks; canceller
+        # presses Esc; worker bails with the cannot-commit warning.
+        canceller = _spawn_recovery_canceller(state)
         commit_worker(state, repo, "msg", lfs_cands=[])
+        canceller.join(timeout=1.0)
 
         labels = [t.label + " " + t.message
                   for t in state.tasks.snapshot()]
-        # Exactly one task — the cannot-commit guard.
         self.assertTrue(
             any("cannot commit" in line and "detached" in line.lower()
                 for line in labels),
             f"expected detached-HEAD refusal, got: {labels}",
         )
-        # No stage, commit, or push ran.
         for forbidden in ("stage all", ": commit", ": push"):
             self.assertFalse(
                 any(forbidden in line for line in labels),
-                f"{forbidden!r} task fired despite detached HEAD: {labels}",
+                f"{forbidden!r} task fired despite cancelled recovery: {labels}",
             )
         # The pre-existing edit is still in the WT (untouched).
         self.assertEqual((repo_path / "edit.txt").read_text(), "hi\n")
+
+
+class TestBranchFromHeadAction(_TempWorkspace):
+    """Cardinal-rule recovery: `git checkout -b <name>` from a detached
+    HEAD only writes a new ref, so unique commits become reachable from
+    a named branch and the orphan-risk guards elsewhere stop refusing."""
+
+    def _detached_with_unique(self) -> Path:
+        repo = make_repo(self.tmp, "r")
+        head = _run(repo, "git", "rev-parse", "HEAD").stdout.strip()
+        _run(repo, "git", "checkout", "-q", head)
+        write_file(repo, "Upskill_Lightmap_Prefab_Baker.cs", "x\n")
+        _run(repo, "git", "add", "Upskill_Lightmap_Prefab_Baker.cs")
+        _run(repo, "git", "-c", "user.email=t@x", "-c", "user.name=t",
+             "commit", "-q", "-m", "add baker")
+        return repo
+
+    def test_branch_from_head_creates_branch_at_current_commit(self) -> None:
+        from workers import kick_off_action
+        from models import Repo, State
+        import threading
+
+        repo_path = self._detached_with_unique()
+        head = _run(repo_path, "git", "rev-parse", "HEAD").stdout.strip()
+        repo = Repo(rel="r", path=repo_path)
+        state = State(repos=[repo], workspace_name="test")
+
+        kick_off_action(
+            state, "branch_from_head",
+            target_label="r", target_path=repo_path,
+            target_repo=repo, target_parent=None,
+            branch_arg="idlegit/wip-test")
+
+        # kick_off_action spawns a daemon thread; join to make the
+        # outcome deterministic in test.
+        for t in threading.enumerate():
+            if t.daemon and t is not threading.current_thread():
+                t.join(timeout=5.0)
+
+        # Branch ref now points at the same commit HEAD was on.
+        rc, out, _ = _run(repo_path, "git", "rev-parse",
+                          "idlegit/wip-test", check=False).returncode, \
+            _run(repo_path, "git", "rev-parse", "idlegit/wip-test").stdout, ""
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.strip(), head)
+
+        # And HEAD is no longer detached — we're on the new branch.
+        cur = _run(repo_path, "git", "branch",
+                   "--show-current").stdout.strip()
+        self.assertEqual(cur, "idlegit/wip-test")
+        # The unique file is still there.
+        self.assertTrue(
+            (repo_path / "Upskill_Lightmap_Prefab_Baker.cs").exists())
+
+
+class TestFFMergeAction(_TempWorkspace):
+    """`merge --ff-only` succeeds when the target is a descendant of
+    HEAD; refuses (non-zero rc) on real divergence — never producing a
+    merge commit the user didn't ask for."""
+
+    def test_ff_merge_succeeds_when_descendant(self) -> None:
+        from workers import kick_off_action
+        from models import Repo, State
+        import threading
+
+        repo_path = make_repo(self.tmp, "r")
+        # Branch 'topic' has one extra commit beyond master.
+        _run(repo_path, "git", "checkout", "-q", "-b", "topic")
+        write_file(repo_path, "extra.txt", "y\n")
+        stage_and_commit(repo_path, "topic edit")
+        topic_head = _run(repo_path, "git", "rev-parse",
+                          "HEAD").stdout.strip()
+        # Back to master; topic is a strict descendant of master HEAD.
+        _run(repo_path, "git", "checkout", "-q", "main")
+
+        repo = Repo(rel="r", path=repo_path)
+        state = State(repos=[repo], workspace_name="test")
+        kick_off_action(
+            state, "ff_merge",
+            target_label="r", target_path=repo_path,
+            target_repo=repo, target_parent=None,
+            branch_arg="topic")
+
+        for t in threading.enumerate():
+            if t.daemon and t is not threading.current_thread():
+                t.join(timeout=5.0)
+
+        master_head = _run(repo_path, "git", "rev-parse",
+                           "HEAD").stdout.strip()
+        self.assertEqual(master_head, topic_head,
+                         "FF merge should advance master to topic's tip")
+
+    def test_ff_merge_refuses_on_divergence(self) -> None:
+        from workers import kick_off_action
+        from models import Repo, State
+        import threading
+
+        repo_path = make_repo(self.tmp, "r")
+        _run(repo_path, "git", "checkout", "-q", "-b", "topic")
+        write_file(repo_path, "topic.txt", "t\n")
+        stage_and_commit(repo_path, "topic edit")
+        _run(repo_path, "git", "checkout", "-q", "main")
+        write_file(repo_path, "main.txt", "m\n")
+        stage_and_commit(repo_path, "main edit")
+        master_head = _run(repo_path, "git", "rev-parse",
+                           "HEAD").stdout.strip()
+
+        repo = Repo(rel="r", path=repo_path)
+        state = State(repos=[repo], workspace_name="test")
+        kick_off_action(
+            state, "ff_merge",
+            target_label="r", target_path=repo_path,
+            target_repo=repo, target_parent=None,
+            branch_arg="topic")
+
+        for t in threading.enumerate():
+            if t.daemon and t is not threading.current_thread():
+                t.join(timeout=5.0)
+
+        # No merge commit was created — HEAD unchanged.
+        self.assertEqual(
+            _run(repo_path, "git", "rev-parse", "HEAD").stdout.strip(),
+            master_head,
+            "FF refusal must NOT advance HEAD")
+        # Task panel surfaces the failure.
+        labels = " ".join(t.label + " " + t.message
+                          for t in state.tasks.snapshot())
+        self.assertIn("ff_merge", labels.replace("--ff-only", "ff_merge"))
 
 
 if __name__ == "__main__":
