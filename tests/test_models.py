@@ -53,24 +53,21 @@ class TestRepoBasics(unittest.TestCase):
 
 
 class TestStateSelectableRows(unittest.TestCase):
-    def test_just_toggles_for_empty_repo_list(self) -> None:
+    def test_empty_repo_list_yields_no_body_rows(self) -> None:
+        # The 3 commit/sync toggles that used to live as body rows
+        # 0..2 moved into the workspace menu — selectable_rows() now
+        # contains body rows only.
         s = State(repos=[], workspace_name="ws")
         rows = s.selectable_rows()
-        # 3 toggles (auto-stage / auto-push / align-heads), no body rows.
-        self.assertEqual(len(rows), 3)
-        self.assertEqual(rows[0][0], "toggle")
-        self.assertEqual(rows[1][0], "toggle")
-        self.assertEqual(rows[2][0], "toggle")
-        self.assertEqual(s.total_rows, 3)
+        self.assertEqual(rows, [])
+        self.assertEqual(s.total_rows, 0)
 
     def test_repos_only(self) -> None:
         repos = [_make_repo("a"), _make_repo("b")]
         s = State(repos=repos, workspace_name="ws")
         rows = s.selectable_rows()
-        self.assertEqual(
-            [r[0] for r in rows],
-            ["toggle", "toggle", "toggle", "repo", "repo"])
-        self.assertEqual(s.total_rows, 5)
+        self.assertEqual([r[0] for r in rows], ["repo", "repo"])
+        self.assertEqual(s.total_rows, 2)
 
     def test_children_interleaved(self) -> None:
         a = _make_repo("a")
@@ -86,21 +83,18 @@ class TestStateSelectableRows(unittest.TestCase):
         s = State(repos=[a, b], workspace_name="ws")
         rows = s.selectable_rows()
         kinds = [r[0] for r in rows]
-        # 3 toggles, then a, child, b, child, child
-        self.assertEqual(
-            kinds,
-            ["toggle", "toggle", "toggle",
-             "repo", "child", "repo", "child", "child"])
-        self.assertEqual(s.total_rows, 8)
+        self.assertEqual(kinds,
+                         ["repo", "child", "repo", "child", "child"])
+        self.assertEqual(s.total_rows, 5)
 
     def test_current_repo_returns_focused(self) -> None:
         a = _make_repo("a")
         b = _make_repo("b")
-        s = State(repos=[a, b], workspace_name="ws", selected=3)
+        s = State(repos=[a, b], workspace_name="ws", selected=0)
         self.assertIs(s.current_repo, a)
-        s.selected = 4
+        s.selected = 1
         self.assertIs(s.current_repo, b)
-        s.selected = 0  # toggle
+        s.selected = -1  # workspace row
         self.assertIsNone(s.current_repo)
 
     def test_current_child_returns_parent_and_ref(self) -> None:
@@ -108,7 +102,7 @@ class TestStateSelectableRows(unittest.TestCase):
         c = _make_repo("c")
         ref = ChildRef(repo=c, nested_path=Path("/tmp/a/c"), kind="submodule")
         a.children = [ref]
-        s = State(repos=[a], workspace_name="ws", selected=4)
+        s = State(repos=[a], workspace_name="ws", selected=1)
         result = s.current_child
         self.assertIsNotNone(result)
         parent, child = result
@@ -117,7 +111,7 @@ class TestStateSelectableRows(unittest.TestCase):
 
     def test_current_child_none_on_repo_row(self) -> None:
         a = _make_repo("a")
-        s = State(repos=[a], workspace_name="ws", selected=3)
+        s = State(repos=[a], workspace_name="ws", selected=0)
         self.assertIsNone(s.current_child)
 
 
@@ -148,18 +142,15 @@ class TestStateHasMessages(unittest.TestCase):
         self.assertTrue(s.has_messages)
 
 
-class TestStateOnToggle(unittest.TestCase):
-    def test_first_three_rows_are_toggles(self) -> None:
-        # auto-stage / auto-push / align-heads occupy rows 0-2.
+class TestStateOnWorkspaceRow(unittest.TestCase):
+    def test_sentinel_minus_one_is_workspace_row(self) -> None:
+        # Body rows occupy 0..N-1 directly now (no toggle prelude).
+        # selected = -1 is the title-row workspace selector.
         s = State(repos=[_make_repo("a")], workspace_name="ws")
+        s.selected = -1
+        self.assertTrue(s.on_workspace_row)
         s.selected = 0
-        self.assertTrue(s.on_toggle)
-        s.selected = 1
-        self.assertTrue(s.on_toggle)
-        s.selected = 2
-        self.assertTrue(s.on_toggle)
-        s.selected = 3
-        self.assertFalse(s.on_toggle)
+        self.assertFalse(s.on_workspace_row)
 
 
 class TestSubtreeSpec(unittest.TestCase):

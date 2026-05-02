@@ -142,6 +142,30 @@ class SubtreeSpec:
     prefix: str  # path inside parent (e.g. "vendor/lib")
 
 
+@dataclass
+class Workspace:
+    """One [workspace.<name>] section from idlegit.workspaces — a named
+    bundle of folders to scan plus optional per-workspace overrides on
+    settings normally read from idlegit.conf.
+
+    `overrides` is keyed by Config-field name (e.g. "default_auto_stage",
+    "name_truncation", "suggest_added"). Values are already type-coerced
+    by the loader. Unrecognized keys are dropped on read so future schema
+    changes don't crash on stale files. `subtrees` are workspace-scoped;
+    when a workspace doesn't declare any its loader inherits the global
+    list from idlegit.conf so existing setups keep working.
+
+    `cached_repos` is the (refreshed) Repo list discovered for this
+    workspace. Populated at startup so workspace switching is instant
+    — switch_workspace just reassigns `state.repos` to this list and
+    skips re-discovery. NOT persisted to idlegit.workspaces."""
+    name: str
+    folders: List[Path]
+    overrides: dict = field(default_factory=dict)
+    subtrees: List[SubtreeSpec] = field(default_factory=list)
+    cached_repos: list = field(default_factory=list)
+
+
 # ---------- Background tasks ----------------------------------------------
 
 
@@ -461,6 +485,14 @@ class ActionMenu:
     commits_scroll: int = 0
     commits_loading: bool = False
     commits_exhausted: bool = False
+    # Loading flags for the three async populators kicked off when the
+    # modal opens. The keypress handler installs the menu instantly with
+    # cached values; these flags drive a spinner badge on the affected
+    # pane until the fresh `git` query lands. anim_running picks them up
+    # so the main loop ticks at 100ms while loading and the user sees
+    # the spinner animate.
+    state_loading: bool = False
+    tree_loading: bool = False
     # Set by the modal-close handler so any in-flight commits-page
     # worker can short-circuit before mutating a menu the user has
     # already moved on from.
@@ -601,6 +633,106 @@ class TargetState:
     recent_commits: List[str]
 
 
+@dataclass
+class WorkspacesPicker:
+    """Tab-on-workspace-row dialogue. Lists every configured workspace
+    plus a trailing "+ Create new workspace…" sentinel that opens the
+    creator. Enter on a workspace switches the active index; Enter on
+    the sentinel hands off to WorkspaceCreator and the picker auto-
+    closes once the new workspace lands.
+
+    `selected` indexes into `state.workspaces` (0..N-1) or equals N for
+    the create-new pseudo-row. `scroll` keeps the focused row visible
+    when there are more workspaces than fit in the modal."""
+    selected: int = 0
+    scroll: int = 0
+
+
+@dataclass
+class WorkspaceDraft:
+    """One row in the WorkspaceCreator modal — a path the user is
+    typing plus the latest async repo-discovery result for it.
+
+    The check is debounced + run on a worker thread; while in-flight
+    `last_checked` lags `path_text` and the row shows a spinner. Once
+    the worker finishes it stamps `repo_count` (>=0) or `error` (a
+    one-line "(no such directory)" / "(permission denied)" hint) and
+    sets `last_checked` to the text it actually checked, suppressing
+    re-runs until the user edits again."""
+    path_text: str = ""
+    last_checked: str = ""
+    repo_count: int = -1  # -1 = pending / unchecked; >= 0 = checked count
+    error: str = ""
+    checking: bool = False  # True while a discovery thread is in flight
+
+
+@dataclass
+class WorkspaceCreator:
+    """First-run / new-workspace dialogue. Lets the user list one or
+    more folder paths; each becomes a workspace named after the
+    folder's basename. Real-time repo counts surface a tick next to
+    every path that resolves to a folder containing tracked repos.
+
+    `drafts` always has at least one trailing empty row so the user
+    can add another path without first navigating to a "+ new" item;
+    the bottom-most "Done" pseudo-row finalises the dialogue and is
+    selected when `selected == len(drafts)`."""
+    drafts: List[WorkspaceDraft] = field(default_factory=list)
+    selected: int = 0  # 0..len(drafts) — last value selects the Done row
+    field_cursor: int = 0
+    title: str = ""
+    intro: str = ""
+    # Set when the modal commits and we want the main loop to swap the
+    # active workspace list. Carries the list of Workspaces produced
+    # from the non-empty drafts; remains None until commit.
+    result: Optional[List["Workspace"]] = None
+
+
+@dataclass
+class WorkspaceMenuRow:
+    """One row of the workspace-overrides modal. `kind` drives input
+    handling: "bool" toggles with Space, "trunc_mode" cycles through
+    (start, middle, end) with ←/→, "int" adjusts with ←/→ at `step`,
+    bounded by `min_value`/`max_value`. `label` is the human-readable
+    setting name shown on the left of the row; `attr_name` names the
+    State attribute the row drives (and indirectly the workspace
+    overrides key once persisted)."""
+    label: str
+    attr_name: str
+    kind: str  # "bool" | "trunc_mode" | "int"
+    min_value: int = 0
+    max_value: int = 999
+    step: int = 1
+
+
+@dataclass
+class WorkspaceMenu:
+    """Modal opened with Space/Enter on the workspace title-row selector.
+    Lets the user override per-workspace settings against the global
+    idlegit.conf defaults AND edit the workspace's folder list.
+
+    The rows are dynamically rebuilt on open so the modal reflects the
+    current `ws.folders` list — folder rows interleave with override
+    rows. Inline editing kicks in when the user presses Enter on a
+    folder / "+ add folder" row: `editing` flips True, `edit_buffer`
+    holds the in-flight text, and the next set of keystrokes drives
+    that buffer rather than navigating between rows. Esc cancels edit
+    mode without persisting; Enter commits the edited text back to the
+    workspace's folders list and persists via save_workspaces.
+
+    `path_drafts` mirrors the workspace's folder list with one
+    WorkspaceDraft per folder so the modal can run live discover_repos
+    checks against typed paths the same way the creator wizard does —
+    the tick / repo count appears next to each folder row."""
+    rows: List[WorkspaceMenuRow] = field(default_factory=list)
+    selected: int = 0
+    scroll: int = 0
+    editing: bool = False
+    edit_buffer: str = ""
+    edit_cursor: int = 0
+    path_drafts: List["WorkspaceDraft"] = field(default_factory=list)
+
+
 # ---------- Top-level UI state --------------------------------------------
 
 
@@ -611,6 +743,7 @@ _DEFAULT_SUGGEST = 3
 _DEFAULT_LFS_WARN_BYTES = 100 * 1024 * 1024
 _DEFAULT_BRANCH_DISPLAY_MAX = 12
 _DEFAULT_NAME_DISPLAY_MAX = 40
+_DEFAULT_CHILD_NAME_DISPLAY_MAX = -1  # -1 = inherit from name_display_max
 _DEFAULT_TASK_NAME_DISPLAY_MAX = 16
 _DEFAULT_TRUNCATION_MODE = "middle"
 _DEFAULT_MAX_VISIBLE_REPO_ROWS = 0
@@ -629,6 +762,11 @@ class State:
     lfs_warn_bytes: int = _DEFAULT_LFS_WARN_BYTES
     branch_display_max: int = _DEFAULT_BRANCH_DISPLAY_MAX
     name_display_max: int = _DEFAULT_NAME_DISPLAY_MAX
+    # Submodule + subtree child rows on the main screen. -1 means
+    # "use the same cap as parent rows (`name_display_max`)" — the
+    # historical behaviour. Set positive to truncate child names
+    # tighter without affecting parent rows.
+    child_name_display_max: int = _DEFAULT_CHILD_NAME_DISPLAY_MAX
     task_name_display_max: int = _DEFAULT_TASK_NAME_DISPLAY_MAX
     name_truncation: str = _DEFAULT_TRUNCATION_MODE
     branch_truncation: str = _DEFAULT_TRUNCATION_MODE
@@ -638,18 +776,44 @@ class State:
     track_actions_default: bool = _DEFAULT_TRACK_ACTIONS
     actions_poll_seconds: float = _DEFAULT_ACTIONS_POLL_SECONDS
     auto_remove_completed_after: float = _DEFAULT_AUTO_REMOVE_COMPLETED_AFTER
-    selected: int = 3  # 0,1,2 = toggles; 3..N+2 = repos
+    # Multi-workspace state. `workspaces` is the list loaded from
+    # idlegit.workspaces (or a single synthesized entry derived from
+    # idlegit.conf when the file doesn't exist); `active_workspace_index`
+    # picks which one is live. Both default to empty so plain
+    # `State(repos=[])` keeps working in tests that don't care about
+    # workspaces. The header row's left/right cycle mutates the index
+    # and triggers a workspace switch (re-discover + re-link siblings).
+    workspaces: List[Workspace] = field(default_factory=list)
+    active_workspace_index: int = 0
+    # Snapshot of the loaded base config, kept around so the workspace
+    # overrides modal can clear an override (revert to inherited) and
+    # know what value to restore. Optional because legacy callers (and
+    # most tests) instantiate State without going through load_config.
+    base_config: Optional[object] = None
+    # `selected = -1` is the title-row "workspace" pseudo-row; values
+    # 0..total_rows-1 index into the repos+children body. Up from 0
+    # lands on the workspace row; ←/→ there cycles `active_workspace_index`,
+    # Space/Enter opens the workspace-overrides modal. (Older builds
+    # had a 3-toggle row at indices 0..2; those moved into the workspace
+    # menu's COMMIT / SMART-SYNC sections, freeing the body to start
+    # at index 0.)
+    selected: int = 0
     body_scroll: int = 0  # how many body rows are scrolled past the top
+    # Commit-pipeline toggles. Configured exclusively via the workspace
+    # menu's COMMIT section now — the main panel no longer carries
+    # them as toggle rows.
     auto_stage: bool = True
     auto_push: bool = True
-    # Smart-sync: when align_heads is True, smart-sync also tries to pull
-    # detached-HEAD checkouts of the same canonical onto the winner's
-    # branch (after popping a modal that asks which branch to push the
-    # winner's commits to). When False, smart-sync only aligns checkouts
-    # already on the same branch as the winner — detached / divergent
-    # checkouts get warn-skipped. The non-destructive policies
-    # (`merge --ff-only`, refusal on conflict) apply in both modes.
+    # Smart-sync settings. align_heads: pull detached-HEAD checkouts of
+    # the same canonical onto the winner's branch (when False, detached
+    # checkouts warn-skip). auto_ff: automatically fast-forward losers
+    # (when False, loser alignment is skipped — winner still commits +
+    # pushes). prompt_for_branch: open a modal asking which branch the
+    # detached winner should push to (when False, we resolve
+    # origin/HEAD and use that branch unattended).
     align_heads: bool = True
+    auto_ff: bool = True
+    prompt_for_branch: bool = True
     tasks: Tasks = field(default_factory=Tasks)
     spinner_frame: int = 0
     field_cursor: int = 0
@@ -666,16 +830,42 @@ class State:
     workflow_picker: Optional[WorkflowPicker] = None
     align_heads_prompt: Optional[AlignHeadsPrompt] = None
     task_action_menu: Optional[TaskActionMenu] = None
+    workspace_menu: Optional["WorkspaceMenu"] = None
+    workspace_creator: Optional["WorkspaceCreator"] = None
+    workspaces_picker: Optional["WorkspacesPicker"] = None
+
+    @property
+    def active_workspace(self) -> Optional[Workspace]:
+        """The currently-active Workspace, or None if no workspaces are
+        configured (legacy single-workspace tests construct State without
+        going through load_workspaces)."""
+        if not self.workspaces:
+            return None
+        idx = max(0, min(self.active_workspace_index, len(self.workspaces) - 1))
+        return self.workspaces[idx]
+
+    @property
+    def active_folders(self) -> List[Path]:
+        """Folder list driving discovery for the active workspace. Empty
+        list means "fall back to legacy single-folder behaviour" (callers
+        like kick_off_inline_refresh can derive from state.repos[0])."""
+        ws = self.active_workspace
+        if ws is None:
+            return []
+        return list(ws.folders)
+
+    @property
+    def on_workspace_row(self) -> bool:
+        """True when the title-row workspace selector is focused. Up from
+        toggle 0 lands here; Down from here returns to toggle 0."""
+        return self.selected == -1
 
     def selectable_rows(self) -> List[Tuple]:
-        """Flat selectable list: ('toggle', 0|1|2, None), ('repo', repo, None),
-        ('child', parent_repo, child_ref). Toggles are first, then each repo
-        followed by its children (interleaved, in display order)."""
-        rows: List[Tuple] = [
-            ("toggle", 0, None),
-            ("toggle", 1, None),
-            ("toggle", 2, None),
-        ]
+        """Flat selectable body list: ('repo', repo, None) and
+        ('child', parent_repo, child_ref) entries, interleaved in
+        display order. The workspace title row (selected = -1) is
+        navigated separately and isn't part of this list."""
+        rows: List[Tuple] = []
         for repo in self.repos:
             rows.append(("repo", repo, None))
             for child in repo.children:
@@ -684,11 +874,7 @@ class State:
 
     @property
     def total_rows(self) -> int:
-        return 3 + sum(1 + len(r.children) for r in self.repos)
-
-    @property
-    def on_toggle(self) -> bool:
-        return self.selected < 3
+        return sum(1 + len(r.children) for r in self.repos)
 
     def task_repo_label(self, repo: Optional["Repo"]) -> str:
         """Repo display name truncated to fit comfortably inside a sidebar

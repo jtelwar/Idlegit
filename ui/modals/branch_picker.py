@@ -9,6 +9,27 @@ from workers import kick_off_action
 
 from ..colors import PAIR_SB_CYAN, PAIR_SB_FG
 from ..geometry import draw_modal_fill, modal_geometry, safe_addstr
+from ..hints import (
+    KEY_ENTER, KEY_ESC, KEY_UP_DOWN, Hint, render_hints,
+)
+
+
+def _hints(picker: BranchPicker) -> list:
+    """Footer hints in scope for the branch picker. Empty branch list
+    leaves only Esc — there's literally no row to navigate to or
+    check out."""
+    if not picker.branches:
+        return [Hint(KEY_ESC, "back")]
+    hints = [Hint(KEY_UP_DOWN, "select")]
+    selected_branch = picker.branches[picker.selected]
+    if selected_branch == picker.current:
+        # Enter on the row already-checked-out is a no-op; describe it
+        # accurately rather than promising a "checkout" that won't run.
+        hints.append(Hint(KEY_ENTER, "stay (already checked out)"))
+    else:
+        hints.append(Hint(KEY_ENTER, f"checkout {selected_branch}"))
+    hints.append(Hint(KEY_ESC, "back"))
+    return hints
 
 
 def open_branch_picker(state: State) -> None:
@@ -38,21 +59,23 @@ def draw_branch_picker(stdscr, state: State, sidebar_x: int) -> None:
     if picker is None:
         return
     body_h = max(3, min(15, len(picker.branches)))
-    content_h = 1 + 1 + body_h + 1 + 1
+    # +2 reserves a blank row above the title and below the footer
+    # hint so the modal doesn't feel pasted against its own edges.
+    content_h = 1 + 1 + body_h + 1 + 1 + 2
     x, y, w, h = modal_geometry(stdscr, sidebar_x, 50, content_h)
     sb = curses.color_pair(PAIR_SB_FG)
     draw_modal_fill(stdscr, x, y, w, h, sb)
 
     inner_x = x + 2
-    safe_addstr(stdscr, y, inner_x,
+    safe_addstr(stdscr, y + 1, inner_x,
                 f"Switch branch — {picker.target_label}"[: w - 4],
                 curses.A_BOLD | curses.color_pair(PAIR_SB_CYAN))
 
     if not picker.branches:
-        safe_addstr(stdscr, y + 2, inner_x,
+        safe_addstr(stdscr, y + 3, inner_x,
                     "(no branches found)", sb | curses.A_DIM)
-        safe_addstr(stdscr, y + h - 1, inner_x,
-                    "Esc back", sb | curses.A_DIM)
+        render_hints(stdscr, y + h - 2, inner_x, w - 4, _hints(picker),
+                     attr=sb | curses.A_DIM)
         return
 
     if picker.selected < picker.scroll:
@@ -75,19 +98,18 @@ def draw_branch_picker(stdscr, state: State, sidebar_x: int) -> None:
         attr = sb | curses.A_REVERSE if focused else sb
         if is_current and not focused:
             attr |= curses.A_BOLD
-        safe_addstr(stdscr, y + 2 + i, inner_x, text, attr)
+        safe_addstr(stdscr, y + 3 + i, inner_x, text, attr)
 
     if picker.scroll > 0:
-        safe_addstr(stdscr, y + 1, inner_x,
+        safe_addstr(stdscr, y + 2, inner_x,
                     f"↑ {picker.scroll} more above", sb | curses.A_DIM)
     if picker.scroll + body_h < len(picker.branches):
         below = len(picker.branches) - (picker.scroll + body_h)
-        safe_addstr(stdscr, y + 2 + body_h, inner_x,
+        safe_addstr(stdscr, y + 3 + body_h, inner_x,
                     f"↓ {below} more below", sb | curses.A_DIM)
 
-    safe_addstr(stdscr, y + h - 1, inner_x,
-                "↑/↓ select · Enter checkout · Esc back",
-                sb | curses.A_DIM)
+    render_hints(stdscr, y + h - 2, inner_x, w - 4, _hints(picker),
+                 attr=sb | curses.A_DIM)
 
 
 def handle_branch_picker_key(state: State, key: int) -> None:

@@ -1,0 +1,20 @@
+# idlegit workspaces. Each [workspace.<name>] section defines a workspace.
+# `folders` is required (one path per line, ~/-expansion supported).
+# Other keys override the matching idlegit.conf default. Subtree relationships go in
+# nested [workspace.<name>.subtree.<sub>] sections.
+
+[idlegit]
+active_workspace = idlegit
+
+[workspace.Elwaudio]
+folders = /Users/joel/Workspace/Elwaudio
+
+[workspace.4low]
+folders = /Users/joel/Workspace/4low
+
+[workspace.Upskill.Health]
+folders = /Users/joel/Workspace/Upskill.Health
+
+[workspace.idlegit]
+folders = /Users/joel/Workspace/idlegit
+

@@ -9,6 +9,26 @@ from workers import kick_off_manual_dispatch
 
 from ..colors import PAIR_SB_CYAN, PAIR_SB_FG
 from ..geometry import draw_modal_fill, modal_geometry, safe_addstr
+from ..hints import (
+    KEY_ENTER, KEY_ESC, KEY_UP_DOWN, Hint, render_hints,
+)
+
+
+def _hints(picker) -> list:
+    """Footer hints for the workflow_dispatch picker. Enter is gated
+    on the focused workflow being runnable — disabled / non-
+    dispatchable rows show why instead of pretending Enter will fire."""
+    if not picker.workflows:
+        return [Hint(KEY_ESC, "back")]
+    hints = [Hint(KEY_UP_DOWN, "select")]
+    wf = picker.workflows[picker.selected]
+    runnable, reason = _workflow_row_status(wf)
+    if runnable:
+        hints.append(Hint(KEY_ENTER, f"run on {picker.branch}"))
+    else:
+        hints.append(Hint(KEY_ENTER, f"unavailable {reason}".rstrip()))
+    hints.append(Hint(KEY_ESC, "back"))
+    return hints
 
 
 def _workflow_row_status(wf) -> Tuple[bool, str]:
@@ -63,21 +83,23 @@ def draw_workflow_picker(stdscr, state: State, sidebar_x: int) -> None:
     if picker is None:
         return
     body_h = max(3, min(15, len(picker.workflows)))
-    content_h = 1 + 1 + body_h + 1 + 1
+    # +2 reserves a blank row above the title and below the footer
+    # hint so the modal doesn't feel pasted against its own edges.
+    content_h = 1 + 1 + body_h + 1 + 1 + 2
     x, y, w, h = modal_geometry(stdscr, sidebar_x, 70, content_h)
     sb = curses.color_pair(PAIR_SB_FG)
     draw_modal_fill(stdscr, x, y, w, h, sb)
 
     inner_x = x + 2
-    safe_addstr(stdscr, y, inner_x,
+    safe_addstr(stdscr, y + 1, inner_x,
                 f"Run workflow on {picker.branch} — {picker.target_label}"
                 [: w - 4],
                 curses.A_BOLD | curses.color_pair(PAIR_SB_CYAN))
 
     if not picker.workflows:
-        safe_addstr(stdscr, y + 2, inner_x,
+        safe_addstr(stdscr, y + 3, inner_x,
                     "(no workflows in this repo)", sb | curses.A_DIM)
-        safe_addstr(stdscr, y + h - 1, inner_x,
+        safe_addstr(stdscr, y + h - 2, inner_x,
                     "Esc back", sb | curses.A_DIM)
         return
 
@@ -106,19 +128,18 @@ def draw_workflow_picker(stdscr, state: State, sidebar_x: int) -> None:
             attr = sb | curses.A_DIM
         else:
             attr = sb
-        safe_addstr(stdscr, y + 2 + i, inner_x, text, attr)
+        safe_addstr(stdscr, y + 3 + i, inner_x, text, attr)
 
     if picker.scroll > 0:
-        safe_addstr(stdscr, y + 1, inner_x,
+        safe_addstr(stdscr, y + 2, inner_x,
                     f"↑ {picker.scroll} more above", sb | curses.A_DIM)
     if picker.scroll + body_h < len(picker.workflows):
         below = len(picker.workflows) - (picker.scroll + body_h)
-        safe_addstr(stdscr, y + 2 + body_h, inner_x,
+        safe_addstr(stdscr, y + 3 + body_h, inner_x,
                     f"↓ {below} more below", sb | curses.A_DIM)
 
-    safe_addstr(stdscr, y + h - 1, inner_x,
-                "↑/↓ select · Enter run · Esc back",
-                sb | curses.A_DIM)
+    render_hints(stdscr, y + h - 2, inner_x, w - 4, _hints(picker),
+                 attr=sb | curses.A_DIM)
 
 
 def handle_workflow_picker_key(state: State, key: int) -> None:

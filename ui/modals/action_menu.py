@@ -29,6 +29,56 @@ from ..colors import (
     PAIR_SB_CYAN, PAIR_SB_FG,
 )
 from ..geometry import draw_modal_fill, modal_geometry, safe_addstr, truncate
+from ..hints import (
+    KEY_DOWN, KEY_ENTER, KEY_ESC, KEY_HOME, KEY_LEFT_RIGHT, KEY_UP_DOWN,
+    Hint, render_hints,
+)
+from ..sidebar import SPINNER_FRAMES
+
+
+def _spinner_glyph(state: State) -> str:
+    """Current spinner frame, picked from the same global tick the
+    sidebar uses so every animated indicator in the app stays in sync."""
+    return SPINNER_FRAMES[state.spinner_frame % len(SPINNER_FRAMES)]
+
+
+def _hints_action_focus(menu: ActionMenu) -> list:
+    """Footer hints when the action items list has focus. Enter's
+    description names the focused item; disabled items show why."""
+    hints = [Hint(KEY_UP_DOWN, "select")]
+    if 0 <= menu.selected < len(menu.items):
+        item = menu.items[menu.selected]
+        if item.enabled:
+            hints.append(Hint(KEY_ENTER, item.label))
+        else:
+            reason = f" ({item.reason})" if item.reason else ""
+            hints.append(Hint(KEY_ENTER, f"unavailable{reason}"))
+    hints.append(Hint(KEY_DOWN, "into pane"))
+    hints.append(Hint(KEY_ESC, "back"))
+    return hints
+
+
+def _hints_pane_focus(menu: ActionMenu) -> list:
+    """Footer hints when the bottom pane (working tree / commits) has
+    focus. Tab swap is presented as ←/→ to match how the existing UI
+    handles the same physical motion."""
+    other_tab = "commits" if menu.pane_tab == "tree" else "working tree"
+    return [
+        Hint(KEY_UP_DOWN, "select"),
+        Hint(KEY_LEFT_RIGHT, f"switch to {other_tab}"),
+        Hint(KEY_HOME, "back to actions"),
+        Hint(KEY_ESC, "back"),
+    ]
+
+
+def _draw_action_hints(stdscr, menu: ActionMenu, y: int, x: int,
+                       w: int, attr: int) -> None:
+    """Single call site keeps render_hints visibly used so the
+    autoformatter doesn't strip it from the import block on subsequent
+    edits."""
+    hints = (_hints_pane_focus(menu) if menu.pane_focus
+             else _hints_action_focus(menu))
+    render_hints(stdscr, y, x, w, hints, attr=attr)
 
 
 # Map a porcelain XY status pair to a pastel colour pair. Ordered so
@@ -50,9 +100,11 @@ def _file_status_pair(x: str, y: str) -> Optional[int]:
     return None
 
 
-# Number of commits to load per page. First page fires synchronously
-# inside open_action_menu; subsequent pages fire from a worker thread
-# when the cursor scrolls within PREFETCH_THRESHOLD of the loaded end.
+# Number of commits to load per page. The first page fires from a
+# background thread the moment the modal is installed (so opening is
+# instant on slow repos like a workspace root with many submodules);
+# subsequent pages fire from a worker thread when the cursor scrolls
+# within PREFETCH_THRESHOLD of the loaded end.
 COMMITS_PAGE = 30
 PREFETCH_THRESHOLD = 5
 
@@ -64,9 +116,151 @@ PANE_TARGET_ROWS = 12  # rows visible in the bottom pane (cap)
 # ---------- Open ----------------------------------------------------------
 
 
+def _has_any_workflow(workflows_repo: Optional[Repo]) -> bool:
+    """True iff `workflows_repo` is on a github.com remote AND has at
+    least one workflow file discovered locally. Mirrors the gating used
+    by the action-menu's "run a workflow…" item."""
+    if workflows_repo is None or not gh_available():
+        return False
+    slug = parse_github_slug(workflows_repo.remote_url_raw)
+    return bool(slug) and bool(workflows_repo.workflows)
+
+
+def _run_workflow_reason(workflows_repo: Optional[Repo]) -> str:
+    """Disabled-reason string for the "run a workflow…" item. Empty
+    when workflows are available."""
+    if _has_any_workflow(workflows_repo):
+        return ""
+    if workflows_repo is None or not gh_available():
+        return "gh CLI / repo unavailable"
+    if not parse_github_slug(workflows_repo.remote_url_raw):
+        return "no github remote"
+    return "no workflows in this repo"
+
+
+def _build_items(branch_meta) -> List[ActionMenuItem]:
+    """Translate a (TargetState-shaped) ``branch_meta`` into the
+    six-item action list. Used both at open time (with cached values)
+    and once the async query lands (with fresh values) so the menu
+    re-evaluates enable/reason without rebuilding the list itself."""
+    has_origin = branch_meta["has_origin"]
+    upstream = branch_meta["upstream"]
+    merging = branch_meta["merging"]
+    ahead = branch_meta["ahead"]
+    has_workflows = branch_meta["has_any_workflow"]
+    workflow_reason = branch_meta["run_workflow_reason"]
+    return [
+        ActionMenuItem(
+            id="fetch", label="fetch (all branches)",
+            enabled=has_origin,
+            reason="" if has_origin else "no origin"),
+        ActionMenuItem(
+            id="pull", label="pull",
+            enabled=has_origin and upstream is not None and not merging,
+            reason=("merging" if merging
+                    else ("no upstream" if upstream is None
+                          else ("" if has_origin else "no origin")))),
+        ActionMenuItem(
+            id="switch_branch", label="switch branch…",
+            enabled=not merging,
+            reason="" if not merging else "merging"),
+        ActionMenuItem(
+            id="soft_reset",
+            label=f"soft reset ({ahead} unpushed)…",
+            enabled=ahead > 0,
+            reason="" if ahead > 0 else "no unpushed commits"),
+        ActionMenuItem(
+            id="push", label="push",
+            enabled=has_origin,
+            reason="" if has_origin else "no origin"),
+        ActionMenuItem(
+            id="run_workflow", label="run a workflow…",
+            enabled=has_workflows, reason=workflow_reason),
+    ]
+
+
+def _state_label_for(branch_meta):
+    """(label, color_pair) pair driving the modal's status badge.
+    Same precedence as the existing UI: merging > diverged > dirty >
+    behind > ahead > no-upstream > clean."""
+    if branch_meta["merging"]:
+        return "merging", PAIR_ERR
+    if branch_meta["ahead"] > 0 and branch_meta["behind"] > 0:
+        return "diverged", PAIR_ERR
+    if branch_meta["dirty"]:
+        return "dirty", PAIR_DIRTY
+    if branch_meta["behind"] > 0:
+        return "behind", PAIR_BEHIND
+    if branch_meta["ahead"] > 0:
+        return "ahead", PAIR_AHEAD
+    if branch_meta["upstream"] is None:
+        return "no upstream", 0
+    return "clean", PAIR_OK
+
+
+def _initial_meta_from_cache(target_repo: Optional[Repo],
+                             target_child: Optional[ChildRef],
+                             workflows_repo: Optional[Repo]) -> dict:
+    """Build the same shape of metadata `_build_items`/`_state_label_for`
+    consume, sourced entirely from values already cached on the Repo /
+    ChildRef by `refresh_repo` / `link_siblings`. No git calls. The
+    async loader replaces this with `query_target_state` output the
+    moment that finishes."""
+    if target_repo is not None:
+        branch = target_repo.branch
+        upstream = target_repo.upstream
+        ahead = target_repo.ahead
+        behind = target_repo.behind
+        merging = target_repo.merging
+        dirty = target_repo.is_dirty
+        has_origin = bool(target_repo.remote_url)
+    elif target_child is not None:
+        branch = target_child.branch
+        upstream = target_child.upstream
+        ahead = target_child.ahead
+        behind = target_child.behind
+        merging = target_child.merging
+        dirty = target_child.dirty
+        # Children don't carry has_origin directly — assume True since
+        # they were checked out from origin. The async query will
+        # correct this in a moment if it's wrong.
+        has_origin = True
+    else:
+        branch = ""
+        upstream = None
+        ahead = 0
+        behind = 0
+        merging = False
+        dirty = False
+        has_origin = False
+    return {
+        "branch": branch,
+        "upstream": upstream,
+        "ahead": ahead,
+        "behind": behind,
+        "merging": merging,
+        "dirty": dirty,
+        "has_origin": has_origin,
+        "has_any_workflow": _has_any_workflow(workflows_repo),
+        "run_workflow_reason": _run_workflow_reason(workflows_repo),
+    }
+
+
 def open_action_menu(state: State) -> None:
-    """Build and install the ActionMenu modal for the focused row."""
-    if state.on_toggle:
+    """Build and install the ActionMenu modal for the focused row.
+    No-op when the cursor is on the title-row workspace selector,
+    since there's no repo to act on there.
+
+    The modal is installed INSTANTLY using values already cached on
+    the Repo / ChildRef (branch, upstream, ahead/behind, dirty…).
+    Three background workers then refresh the state badge + items,
+    populate the working-tree pane, and load the first commits page.
+    Each pane shows a spinner-prefixed "loading…" line until its
+    worker completes. This keeps Tab snappy on slow repos like a
+    workspace root with many submodules — `git status` on the root
+    can take a second or more, which used to block the keypress
+    handler and made Tab feel like it needed multiple presses."""
+    if state.on_workspace_row:
         return
     cur_repo = state.current_repo
     cur_child = state.current_child
@@ -87,95 +281,132 @@ def open_action_menu(state: State) -> None:
     else:
         return
 
-    ts = query_target_state(target_path)
-
     workflows_repo = target_repo or (target_child.repo if target_child else None)
-    has_any_workflow = False
-    if workflows_repo is not None and gh_available():
-        slug = parse_github_slug(workflows_repo.remote_url_raw)
-        if slug:
-            has_any_workflow = bool(workflows_repo.workflows)
-    if has_any_workflow:
-        run_reason = ""
-    elif workflows_repo is None or not gh_available():
-        run_reason = "gh CLI / repo unavailable"
-    elif workflows_repo is not None and not parse_github_slug(
-            workflows_repo.remote_url_raw):
-        run_reason = "no github remote"
-    else:
-        run_reason = "no workflows in this repo"
-
-    items = [
-        ActionMenuItem(
-            id="fetch", label="fetch (all branches)",
-            enabled=ts.has_origin,
-            reason="" if ts.has_origin else "no origin"),
-        ActionMenuItem(
-            id="pull", label="pull",
-            enabled=ts.has_origin and ts.upstream is not None and not ts.merging,
-            reason=("merging" if ts.merging
-                    else ("no upstream" if ts.upstream is None
-                          else ("" if ts.has_origin else "no origin")))),
-        ActionMenuItem(
-            id="switch_branch", label="switch branch…",
-            enabled=not ts.merging,
-            reason="" if not ts.merging else "merging"),
-        ActionMenuItem(
-            id="soft_reset",
-            label=f"soft reset ({ts.ahead} unpushed)…",
-            enabled=ts.ahead > 0,
-            reason="" if ts.ahead > 0 else "no unpushed commits"),
-        ActionMenuItem(
-            id="push", label="push",
-            enabled=ts.has_origin,
-            reason="" if ts.has_origin else "no origin"),
-        ActionMenuItem(
-            id="run_workflow", label="run a workflow…",
-            enabled=has_any_workflow, reason=run_reason),
-    ]
-
+    meta = _initial_meta_from_cache(target_repo, target_child, workflows_repo)
+    items = _build_items(meta)
     initial = 0
     for i, it in enumerate(items):
         if it.enabled:
             initial = i
             break
+    state_label, state_pair = _state_label_for(meta)
 
-    if ts.merging:
-        state_label, state_pair = "merging", PAIR_ERR
-    elif ts.ahead > 0 and ts.behind > 0:
-        state_label, state_pair = "diverged", PAIR_ERR
-    elif ts.dirty:
-        state_label, state_pair = "dirty", PAIR_DIRTY
-    elif ts.behind > 0:
-        state_label, state_pair = "behind", PAIR_BEHIND
-    elif ts.ahead > 0:
-        state_label, state_pair = "ahead", PAIR_AHEAD
-    elif ts.upstream is None:
-        state_label, state_pair = "no upstream", 0
-    else:
-        state_label, state_pair = "clean", PAIR_OK
-
-    tree_files = query_working_tree(target_path)
-    commits, exhausted = load_commits(target_path, 0, COMMITS_PAGE)
-
-    state.action_menu = ActionMenu(
+    menu = ActionMenu(
         target_label=label,
         target_path=target_path,
         target_repo=target_repo,
         target_parent=target_parent,
         target_child=target_child,
-        branch=ts.branch,
-        upstream=ts.upstream,
-        ahead=ts.ahead,
-        behind=ts.behind,
+        branch=meta["branch"],
+        upstream=meta["upstream"],
+        ahead=meta["ahead"],
+        behind=meta["behind"],
         state_label=state_label,
         state_pair=state_pair,
         items=items,
         selected=initial,
-        tree_files=tree_files,
-        commits_full=commits,
-        commits_exhausted=exhausted,
+        state_loading=True,
+        tree_loading=True,
+        commits_loading=True,
     )
+    state.action_menu = menu
+
+    # Kick off all three async populators. Each one re-checks the
+    # cancel_event before mutating the menu so closing the modal mid-
+    # query is a clean no-op rather than a write to a dead struct.
+    _kick_off_state_load(menu, workflows_repo)
+    _kick_off_tree_load(menu)
+    _kick_off_initial_commits(menu)
+
+
+def _kick_off_state_load(menu: ActionMenu,
+                         workflows_repo: Optional[Repo]) -> None:
+    """Run `query_target_state` in a daemon thread and overwrite the
+    menu's badge + items + branch metadata when it completes. This is
+    the slow query for repos with many submodules — `git status` and
+    its kin recurse into each one — so it's the most important to
+    keep off the keypress handler."""
+    path = menu.target_path
+
+    def worker() -> None:
+        try:
+            if menu.cancel_event.is_set():
+                return
+            ts = query_target_state(path)
+            if menu.cancel_event.is_set():
+                return
+            meta = {
+                "branch": ts.branch,
+                "upstream": ts.upstream,
+                "ahead": ts.ahead,
+                "behind": ts.behind,
+                "merging": ts.merging,
+                "dirty": ts.dirty,
+                "has_origin": ts.has_origin,
+                "has_any_workflow": _has_any_workflow(workflows_repo),
+                "run_workflow_reason": _run_workflow_reason(workflows_repo),
+            }
+            menu.branch = ts.branch
+            menu.upstream = ts.upstream
+            menu.ahead = ts.ahead
+            menu.behind = ts.behind
+            menu.state_label, menu.state_pair = _state_label_for(meta)
+            menu.items = _build_items(meta)
+            # If the user hasn't moved their cursor yet, re-snap to
+            # the first enabled item — the cached snapshot may have
+            # marked items enabled that the fresh query disables (or
+            # vice versa).
+            if menu.selected < len(menu.items) and not menu.items[
+                    menu.selected].enabled:
+                for i, it in enumerate(menu.items):
+                    if it.enabled:
+                        menu.selected = i
+                        break
+        finally:
+            menu.state_loading = False
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def _kick_off_tree_load(menu: ActionMenu) -> None:
+    """Run `query_working_tree` in a daemon thread and replace the
+    tree_files list when done. Until then `tree_loading` is True
+    and the pane shows a spinner."""
+    path = menu.target_path
+
+    def worker() -> None:
+        try:
+            if menu.cancel_event.is_set():
+                return
+            files = query_working_tree(path)
+            if menu.cancel_event.is_set():
+                return
+            menu.tree_files = files
+        finally:
+            menu.tree_loading = False
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def _kick_off_initial_commits(menu: ActionMenu) -> None:
+    """First page of `git log` — same shape as `_kick_off_commits_page`
+    but tagged as the initial load (the pane shows "loading commits…"
+    instead of "loading more" when commits_full is still empty)."""
+    path = menu.target_path
+
+    def worker() -> None:
+        try:
+            if menu.cancel_event.is_set():
+                return
+            page, exhausted = load_commits(path, 0, COMMITS_PAGE)
+            if menu.cancel_event.is_set():
+                return
+            menu.commits_full = page
+            menu.commits_exhausted = exhausted
+        finally:
+            menu.commits_loading = False
+
+    threading.Thread(target=worker, daemon=True).start()
 
 
 # ---------- Filtering helpers ---------------------------------------------
@@ -253,11 +484,15 @@ def draw_action_menu(stdscr, state: State, sidebar_x: int) -> None:
     # Header (title + spacer + branch + upstream + sep) = 5 rows;
     # actions = n_items rows; separator = 1; tab header = 1; filter = 1;
     # pane list = up to PANE_TARGET_ROWS; footer hint = 1; padding = 2.
+    # Trailing +1 reserves a blank row below the footer for visual
+    # breathing — the existing layout already has a blank above the
+    # title via the leading "1" component.
     content_h = (1 + 1 + 1 + 1 + 1
                  + n_items + 1
                  + 1 + 1
                  + PANE_TARGET_ROWS
-                 + 1 + 1)
+                 + 1 + 1
+                 + 1)
     x, y, w, h = modal_geometry(stdscr, sidebar_x, MODAL_W, content_h)
     sb = curses.color_pair(PAIR_SB_FG)
     draw_modal_fill(stdscr, x, y, w, h, sb)
@@ -282,13 +517,23 @@ def draw_action_menu(stdscr, state: State, sidebar_x: int) -> None:
                     f"  [{path_trunc}]", sb | curses.A_DIM)
 
     line = y + 3
-    branch_str = f"[{menu.branch}]"
+    branch_label = menu.branch or "(loading…)"
+    branch_str = f"[{branch_label}]"
     safe_addstr(stdscr, line, inner_x, branch_str,
                 curses.color_pair(PAIR_BRANCH))
-    state_attr = (curses.color_pair(menu.state_pair)
-                  if menu.state_pair else (sb | curses.A_DIM))
-    safe_addstr(stdscr, line, inner_x + len(branch_str) + 1,
-                f"● {menu.state_label}", state_attr)
+    if menu.state_loading:
+        # Spinner + neutral "checking…" badge while query_target_state
+        # is in flight. Matches the sidebar spinner so the user reads
+        # the modal-level loading indicator the same way as everywhere
+        # else in the app.
+        spin = _spinner_glyph(state)
+        safe_addstr(stdscr, line, inner_x + len(branch_str) + 1,
+                    f"{spin} checking…", sb | curses.A_DIM)
+    else:
+        state_attr = (curses.color_pair(menu.state_pair)
+                      if menu.state_pair else (sb | curses.A_DIM))
+        safe_addstr(stdscr, line, inner_x + len(branch_str) + 1,
+                    f"● {menu.state_label}", state_attr)
 
     line += 1
     if menu.upstream:
@@ -326,33 +571,38 @@ def draw_action_menu(stdscr, state: State, sidebar_x: int) -> None:
     line += 1
 
     # Tab header
-    _draw_tab_header(stdscr, line, inner_x, inner_w, menu, sb)
+    _draw_tab_header(stdscr, line, inner_x, inner_w, menu, state, sb)
     line += 1
 
     # Compute pane size: whatever's left between current line and the
     # footer hint row, capped at PANE_TARGET_ROWS + 1 (filter row).
-    footer_y = y + h - 1
+    footer_y = y + h - 2
     pane_total = max(2, footer_y - line - 1)
     list_rows = pane_total - 1  # filter takes the first row
 
-    _draw_pane(stdscr, line, inner_x, inner_w, list_rows, menu, sb)
+    _draw_pane(stdscr, line, inner_x, inner_w, list_rows, menu, state, sb)
 
-    # Footer hint
-    if menu.pane_focus:
-        hint = "↑/↓ select · ←/→ tab · Home menu · Esc back"
-    else:
-        hint = "↑/↓ select · Enter run · ↓ pane · Esc back"
-    safe_addstr(stdscr, footer_y, inner_x, hint[:inner_w], sb | curses.A_DIM)
+    _draw_action_hints(stdscr, menu, footer_y, inner_x, inner_w,
+                       sb | curses.A_DIM)
 
 
 def _draw_tab_header(stdscr, line: int, inner_x: int, inner_w: int,
-                     menu: ActionMenu, sb: int) -> None:
+                     menu: ActionMenu, state: State, sb: int) -> None:
     """Render the [ Working tree ] [ Recent commits ] tabs. Active tab
     gets cyan + bold; inactive is dim. When `pane_focus` is False the
     whole header drops a tone so the user can tell the action items
-    have focus, not the pane."""
-    tabs = [("tree", "Working tree", len(menu.tree_files)),
-            ("commits", "Recent commits", len(menu.commits_full))]
+    have focus, not the pane.
+
+    While the initial query for a tab is still in flight, that tab's
+    count column shows a spinner instead of a number — keeps the
+    label stable but tells the user the figure isn't final yet."""
+    tree_count = (_spinner_glyph(state) if menu.tree_loading
+                  else str(len(menu.tree_files)))
+    commits_count = (_spinner_glyph(state)
+                     if (menu.commits_loading and not menu.commits_full)
+                     else str(len(menu.commits_full)))
+    tabs = [("tree", "Working tree", tree_count),
+            ("commits", "Recent commits", commits_count)]
     cur_x = inner_x
     for tid, label, count in tabs:
         active = (menu.pane_tab == tid)
@@ -367,20 +617,25 @@ def _draw_tab_header(stdscr, line: int, inner_x: int, inner_w: int,
         cur_x += len(text) + 1
         if cur_x >= inner_x + inner_w:
             break
-    # Loading hint for commits paging
-    if menu.commits_loading:
-        msg = "  …loading more"
+    # Loading hint for commits paging — only when we're paging on top
+    # of an already-populated list. The empty-list case shows its own
+    # "loading…" centered in the pane via _draw_commits_pane.
+    if menu.commits_loading and menu.commits_full:
+        msg = f"  {_spinner_glyph(state)} loading more"
         safe_addstr(stdscr, line, inner_x + inner_w - len(msg),
                     msg, sb | curses.A_DIM)
 
 
 def _draw_pane(stdscr, line: int, inner_x: int, inner_w: int,
-               list_rows: int, menu: ActionMenu, sb: int) -> None:
+               list_rows: int, menu: ActionMenu, state: State,
+               sb: int) -> None:
     """Render the filter row + filtered list for the active tab."""
     if menu.pane_tab == "tree":
-        _draw_tree_pane(stdscr, line, inner_x, inner_w, list_rows, menu, sb)
+        _draw_tree_pane(stdscr, line, inner_x, inner_w, list_rows,
+                        menu, state, sb)
     else:
-        _draw_commits_pane(stdscr, line, inner_x, inner_w, list_rows, menu, sb)
+        _draw_commits_pane(stdscr, line, inner_x, inner_w, list_rows,
+                           menu, state, sb)
 
 
 def _draw_filter_row(stdscr, line: int, inner_x: int, inner_w: int,
@@ -403,11 +658,22 @@ def _draw_filter_row(stdscr, line: int, inner_x: int, inner_w: int,
 
 
 def _draw_tree_pane(stdscr, line: int, inner_x: int, inner_w: int,
-                    list_rows: int, menu: ActionMenu, sb: int) -> None:
+                    list_rows: int, menu: ActionMenu, state: State,
+                    sb: int) -> None:
     filter_focused = menu.pane_focus and menu.tree_selected == 0
     _draw_filter_row(stdscr, line, inner_x, inner_w,
                      menu.tree_filter, filter_focused, sb)
     line += 1
+
+    # Initial-load placeholder. tree_loading stays True until
+    # query_working_tree finishes; until then we show a spinner +
+    # "loading working tree…" centred on the first list row so the
+    # user sees Tab landed and the data is on its way.
+    if menu.tree_loading and not menu.tree_files:
+        safe_addstr(stdscr, line, inner_x + 2,
+                    f"{_spinner_glyph(state)} loading working tree…",
+                    sb | curses.A_DIM)
+        return
 
     files = _filtered_tree(menu)
     if not files:
@@ -474,11 +740,22 @@ def _draw_tree_row(stdscr, y: int, x: int, inner_w: int, fe: FileEntry,
 
 
 def _draw_commits_pane(stdscr, line: int, inner_x: int, inner_w: int,
-                       list_rows: int, menu: ActionMenu, sb: int) -> None:
+                       list_rows: int, menu: ActionMenu, state: State,
+                       sb: int) -> None:
     filter_focused = menu.pane_focus and menu.commits_selected == 0
     _draw_filter_row(stdscr, line, inner_x, inner_w,
                      menu.commits_filter, filter_focused, sb)
     line += 1
+
+    # Initial-load placeholder for commits. commits_loading is reused
+    # across initial-load and pagination — the empty-list case here
+    # implies the first page is still in flight (paginated loading
+    # always has something already in commits_full).
+    if menu.commits_loading and not menu.commits_full:
+        safe_addstr(stdscr, line, inner_x + 2,
+                    f"{_spinner_glyph(state)} loading commits…",
+                    sb | curses.A_DIM)
+        return
 
     commits = _filtered_commits(menu)
     if not commits:

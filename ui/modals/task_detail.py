@@ -19,6 +19,52 @@ from ..colors import (
     PAIR_SB_FG, PAIR_SB_OK, PAIR_SB_WARN,
 )
 from ..geometry import draw_modal_fill, modal_geometry, safe_addstr
+from ..hints import (
+    KEY_ENTER, KEY_ESC, KEY_UP_DOWN, Hint, render_hints,
+)
+
+
+def _hints_main(menu: TaskActionMenu) -> list:
+    """Footer hints for the task-detail modal's action list. Enter
+    adopts the focused item's own label so the user sees exactly which
+    action is about to fire — and switches to a dim "(unavailable)"
+    description for disabled rows."""
+    hints = [Hint(KEY_UP_DOWN, "select")]
+    if 0 <= menu.selected < len(menu.items):
+        item = menu.items[menu.selected]
+        if item.enabled:
+            hints.append(Hint(KEY_ENTER, item.label))
+        else:
+            reason = f" ({item.reason})" if item.reason else ""
+            hints.append(Hint(KEY_ENTER, f"unavailable{reason}"))
+    hints.append(Hint(KEY_ESC, "close"))
+    return hints
+
+
+def _hints_sub_picker(menu: TaskActionMenu) -> list:
+    """Footer hints for the inline workflow picker that surfaces inside
+    the task-detail modal when the user runs `change_then_run`."""
+    if not menu.sub_picker_options:
+        return [Hint(KEY_ESC, "back")]
+    name = menu.sub_picker_options[menu.sub_picker_selected]
+    return [
+        Hint(KEY_UP_DOWN, "select"),
+        Hint(KEY_ENTER, f"chain to {name}"),
+        Hint(KEY_ESC, "back"),
+    ]
+
+
+def _draw_main_hints(stdscr, menu: TaskActionMenu, y: int, x: int,
+                     w: int, attr: int) -> None:
+    """Single call site keeps render_hints visibly used — sidesteps the
+    autoformatter pruning the import on intermediate edits."""
+    render_hints(stdscr, y, x, w, _hints_main(menu), attr=attr)
+
+
+def _draw_sub_picker_hints(stdscr, menu: TaskActionMenu, y: int, x: int,
+                           w: int, attr: int) -> None:
+    """Counterpart for the sub-picker's footer."""
+    render_hints(stdscr, y, x, w, _hints_sub_picker(menu), attr=attr)
 
 
 # ---------- Helpers --------------------------------------------------------
@@ -187,6 +233,7 @@ def draw_task_action_menu(stdscr, state: State, sidebar_x: int) -> None:
         + n_actions
         + 1              # blank above hint
         + 1              # hint
+        + 1              # blank bottom
     )
     x, y, w, h = modal_geometry(stdscr, sidebar_x, 80, content_h)
     draw_modal_fill(stdscr, x, y, w, h, sb)
@@ -290,9 +337,8 @@ def draw_task_action_menu(stdscr, state: State, sidebar_x: int) -> None:
                     (prefix + label).ljust(w - 4), attr)
         line += 1
 
-    safe_addstr(stdscr, y + h - 1, inner_x,
-                "↑/↓ select · Enter run · Esc back",
-                sb | curses.A_DIM)
+    _draw_main_hints(stdscr, menu, y + h - 2, inner_x, w - 4,
+                     sb | curses.A_DIM)
 
     # Optional embedded sub-picker (used by `change_then_run`).
     if menu.sub_picker_open and menu.sub_picker_options:
@@ -307,23 +353,23 @@ def _draw_sub_picker(stdscr, state: State, sidebar_x: int) -> None:
     if menu is None:
         return
     body_h = max(3, min(10, len(menu.sub_picker_options)))
-    content_h = 1 + 1 + body_h + 1 + 1
+    # +2 for blank rows above title and below the footer hint.
+    content_h = 1 + 1 + body_h + 1 + 1 + 2
     x, y, w, h = modal_geometry(stdscr, sidebar_x, 60, content_h)
     sb = curses.color_pair(PAIR_SB_FG)
     draw_modal_fill(stdscr, x, y, w, h, sb)
     inner_x = x + 2
 
-    safe_addstr(stdscr, y, inner_x, "Pick then-run target",
+    safe_addstr(stdscr, y + 1, inner_x, "Pick then-run target",
                 curses.A_BOLD | curses.color_pair(PAIR_SB_CYAN))
     for i, name in enumerate(menu.sub_picker_options):
         focused = i == menu.sub_picker_selected
         prefix = "→ " if focused else "  "
         attr = sb | curses.A_REVERSE if focused else sb
-        safe_addstr(stdscr, y + 2 + i, inner_x,
+        safe_addstr(stdscr, y + 3 + i, inner_x,
                     (prefix + name).ljust(w - 4), attr)
-    safe_addstr(stdscr, y + h - 1, inner_x,
-                "↑/↓ select · Enter pick · Esc back",
-                sb | curses.A_DIM)
+    _draw_sub_picker_hints(stdscr, menu, y + h - 2, inner_x, w - 4,
+                           sb | curses.A_DIM)
 
 
 # ---------- Handle ---------------------------------------------------------

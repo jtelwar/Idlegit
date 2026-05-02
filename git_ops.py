@@ -4,7 +4,9 @@ imports here — these functions all run on background threads (or
 synchronously at startup) and never touch the screen."""
 from __future__ import annotations
 
+import os
 import subprocess
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -13,6 +15,29 @@ from models import (
     ChildRef, CommitEntry, FileChange, FileEntry, LFSCandidate, Repo,
     SubtreeSpec, TargetState,
 )
+
+
+def _find_embedded_gitlinks(base: Path,
+                            repo_path: Path) -> List[str]:
+    """Walk `base` looking for directories that contain a `.git` (dir
+    or file — submodule gitfiles count). Returns each finding's path
+    relative to `repo_path`, with forward slashes and no trailing
+    slash. Does NOT recurse into found nested repos.
+
+    Used by `safe_stage_all` to find embedded gitlinks under untracked
+    directories (where `git status --porcelain` reports the *parent*
+    untracked dir, not the deeper path containing the `.git`)."""
+    found: List[str] = []
+    if not base.is_dir():
+        return found
+    for root, dirs, files in os.walk(base):
+        if ".git" in dirs or ".git" in files:
+            rel = Path(root).relative_to(repo_path).as_posix()
+            found.append(rel)
+            # Don't recurse into the embedded repo's contents.
+            dirs[:] = [d for d in dirs if d != ".git"]
+            continue
+    return found
 
 # git status XY codes that indicate an unmerged path.
 CONFLICT_CODES = frozenset({"DD", "AU", "UD", "UA", "DU", "AA", "UU"})
@@ -213,6 +238,18 @@ def discover_repos(workspace: Path) -> List[Repo]:
     return repos
 
 
+# Serializes link_siblings calls so two supervisors finishing at the
+# same time can't interleave. Without this, both calls would clear
+# `r.children` and `r.siblings` at the start, then race-append the same
+# ChildRefs into the same lists — producing duplicated submodule rows
+# under the affected parents (the symptom: pushing on a canonical sub
+# kicked off auto-sync, manual smart-sync ran on top of it, the row
+# list now showed each child twice). Even with the atomic-swap pattern
+# below, the lock is cheap insurance against two callers wasting the
+# same `git` queries to compute the same answer.
+_link_siblings_lock = threading.Lock()
+
+
 def link_siblings(repos: List[Repo],
                   subtrees: Optional[List[SubtreeSpec]] = None) -> None:
     """For each tracked repo X, find every other tracked repo Y that
@@ -222,12 +259,31 @@ def link_siblings(repos: List[Repo],
         - Y.children — ChildRef entries (kind="submodule"/"subtree") for the
           indented rows below Y on the main screen
     The workspace root is skipped for submodule auto-discovery (its
-    submodules are already top-level rows); subtrees are honored regardless."""
+    submodules are already top-level rows); subtrees are honored regardless.
+
+    Concurrency: the function takes `_link_siblings_lock` so calls from
+    different supervisor threads serialize. It also builds `children`
+    and `siblings` in local dicts and atomically assigns them at the
+    very end — the older "reset r.children = [], then append" pattern
+    was race-prone (a second caller mid-flight could clear what the
+    first had just appended, then both would interleave-append the same
+    refs, producing duplicates)."""
+    with _link_siblings_lock:
+        _link_siblings_locked(repos, subtrees)
+
+
+def _link_siblings_locked(repos: List[Repo],
+                          subtrees: Optional[List[SubtreeSpec]]) -> None:
     url_to_repo = {r.remote_url: r for r in repos if r.remote_url}
     rel_to_repo = {r.rel: r for r in repos}
-    for r in repos:
-        r.siblings = []
-        r.children = []
+
+    # Build into local dicts; assign onto each Repo only at the end so
+    # that another thread reading r.children mid-execution (during a
+    # render, say) sees either the old snapshot or the new one — never
+    # a partially-cleared list. Keyed by `id(repo)` because the Repo
+    # dataclass has value-based `__eq__` and is therefore unhashable.
+    new_children: Dict[int, List[ChildRef]] = {id(r): [] for r in repos}
+    new_siblings: Dict[int, List[Tuple[Repo, Path]]] = {id(r): [] for r in repos}
 
     # Synthetic canonicals for submodule URLs that don't match any
     # tracked top-level repo (e.g. a submodule used by parents only,
@@ -248,14 +304,29 @@ def link_siblings(repos: List[Repo],
                 name = m.group(1)
         if not name:
             name = "submodule"
-        return Repo(rel=name, path=sub_path, synthetic=True)
+        synth = Repo(rel=name, path=sub_path, synthetic=True)
+        # Synthetic Repos are created here, so they need their own
+        # children/siblings buckets in the local dicts too — anything
+        # treating them as a real Repo (sibling lookups, drift detect)
+        # expects these to exist.
+        new_children[id(synth)] = []
+        new_siblings[id(synth)] = []
+        return synth
 
     # Submodule references — discovered from each parent's .gitmodules.
+    # Dedup at this stage too (paranoia + belt-and-braces): if a stale
+    # `.gitmodules` somehow has the same submodule listed twice (same
+    # URL + same path), only one ChildRef is produced.
     submodule_refs: List[ChildRef] = []
     for parent in repos:
         if parent.rel == ".":
             continue
+        seen_for_parent: set = set()
         for url, sub_path in parent.nested_subs:
+            key = (url, sub_path)
+            if key in seen_for_parent:
+                continue
+            seen_for_parent.add(key)
             target = url_to_repo.get(url)
             if target is None:
                 if url:
@@ -267,9 +338,9 @@ def link_siblings(repos: List[Repo],
                     target = _make_synthetic("", sub_path)
             if target is parent:
                 continue
-            target.siblings.append((parent, sub_path))
+            new_siblings[id(target)].append((parent, sub_path))
             ref = ChildRef(repo=target, nested_path=sub_path, kind="submodule")
-            parent.children.append(ref)
+            new_children[id(parent)].append(ref)
             submodule_refs.append(ref)
 
     # Populate per-child state (HEAD, branch, dirty + the same
@@ -339,8 +410,11 @@ def link_siblings(repos: List[Repo],
     # parents reference the same untracked submodule URL, treat the
     # most-common HEAD across their checkouts as the "canonical" and
     # flag laggards as out-of-sync (so they show a behind-coloured dot).
+    # Reads from the LOCAL `new_children` so it sees the in-progress
+    # state, not whatever was on `parent.children` from a previous call.
     for synthetic in synthetic_by_url.values():
-        sib_refs = [ref for parent in repos for ref in parent.children
+        sib_refs = [ref for parent in repos
+                    for ref in new_children[id(parent)]
                     if ref.repo is synthetic]
         if len(sib_refs) < 2:
             continue
@@ -364,10 +438,22 @@ def link_siblings(repos: List[Repo],
         nested_path = (parent.path / spec.prefix).resolve()
         ref = ChildRef(repo=source, nested_path=nested_path, kind="subtree")
         # No cheap drift signal for subtrees; leave in_sync at default True.
-        parent.children.append(ref)
+        new_children[id(parent)].append(ref)
 
+    for child_list in new_children.values():
+        child_list.sort(
+            key=lambda c: (c.kind, c.repo.display_name.lower()))
+
+    # Atomic swap. After this point any reader of `r.children` /
+    # `r.siblings` sees the new snapshot in full. Synthetic Repos
+    # have entries in the dicts too but aren't in `repos`, so they
+    # only get touched if some caller has a direct reference.
     for r in repos:
-        r.children.sort(key=lambda c: (c.kind, c.repo.display_name.lower()))
+        r.children = new_children[id(r)]
+        r.siblings = new_siblings[id(r)]
+    for synth in synthetic_by_url.values():
+        synth.siblings = new_siblings[id(synth)]
+        # children stays empty for a synthetic — they're leaf nodes.
 
 
 # ---------- Sync helpers ---------------------------------------------------
@@ -431,14 +517,144 @@ def signature_mtime(repo_path: Path,
 
 def sync_sibling(sibling_path: Path, branch: str) -> Tuple[bool, str]:
     """Fetch + checkout origin/<branch> in a sibling's nested submodule
-    checkout so it lines up with what we just pushed."""
+    checkout so it lines up with what we just pushed.
+
+    SAFETY (cardinal rule): refuses if the sibling's HEAD has commits
+    that aren't already on origin/<branch>. Plain `git checkout
+    origin/<branch>` from a detached HEAD with unique commits prints a
+    stderr warning + returns 0, which means the unique commits get
+    orphaned and any files unique to those commits vanish from the
+    working tree. The user resolves manually (e.g. by branching from
+    HEAD before re-running the sync)."""
     rc, _, err = git(sibling_path, ["fetch", "origin"])
     if rc != 0:
         return False, f"fetch failed: {first_line(err)}"
-    rc, _, err = git(sibling_path, ["checkout", f"origin/{branch}"])
+    target_ref = f"origin/{branch}"
+    rc, _, _ = git(sibling_path, [
+        "merge-base", "--is-ancestor", "HEAD", target_ref,
+    ])
+    if rc != 0:
+        return False, (f"HEAD has commits not on {target_ref} "
+                       "— would orphan them; manual: `git checkout -b "
+                       "<name>` to keep them, then re-run sync")
+    rc, _, err = git(sibling_path, ["checkout", target_ref])
     if rc != 0:
         return False, f"checkout failed: {first_line(err)}"
     return True, "synced"
+
+
+# ---------- Safe staging (replacement for `git add -A`) -------------------
+
+
+def list_registered_submodule_paths(repo_path: Path) -> "set[str]":
+    """Set of paths that are registered submodules in `repo_path`'s
+    `.gitmodules`. Empty when there's no `.gitmodules` or the file can't
+    be parsed. Used by `safe_stage_all` to refuse staging changes that
+    would destroy a submodule pointer."""
+    if not (repo_path / ".gitmodules").exists():
+        return set()
+    rc, out, _ = git(repo_path, [
+        "config", "-f", ".gitmodules",
+        "--get-regexp", r"submodule\..+\.path",
+    ])
+    if rc != 0:
+        return set()
+    paths: set = set()
+    for line in out.strip().splitlines():
+        parts = line.split(maxsplit=1)
+        if len(parts) == 2:
+            paths.add(parts[1].strip())
+    return paths
+
+
+def safe_stage_all(repo_path: Path) -> Tuple[bool, str]:
+    """Stage every change in `repo_path` the way `git add -A` would,
+    except REFUSE outright when doing so would commit one of these two
+    classes of damage (the cardinal-rule failure modes that have already
+    cost this user real files):
+
+      1. **Submodule-pointer deletion.** A `D` entry on a path
+         registered in `.gitmodules` — happens when the submodule's
+         working directory is empty (e.g. after `git submodule deinit`)
+         and `git add -A` then stages the gitlink's removal as a real
+         deletion in the parent. Committing this destroys the link.
+
+      2. **Stray gitlink.** An `??` or `A` entry on a directory that
+         contains a `.git` AND is not registered in `.gitmodules`.
+         Some other tool may have placed a nested checkout at an
+         unintended path (e.g. via a buggy script that doubled a
+         relative+absolute prefix); `git add -A` would happily commit
+         a gitlink at that bogus location.
+
+    On detection, returns (False, msg) and stages NOTHING — the user
+    investigates manually (re-init the submodule, remove the stray
+    `.git`, etc.) and re-runs. Only when no risky entries are present
+    does the actual `git add -A` run.
+
+    Returns (ok, error_msg). Empty msg on success."""
+    submodule_paths = list_registered_submodule_paths(repo_path)
+
+    rc, out, err = git(repo_path, ["status", "--porcelain=v1", "-z"])
+    if rc != 0:
+        return False, first_line(err) or "git status failed"
+
+    refused: List[str] = []
+    parts = out.split("\x00")
+    i = 0
+    while i < len(parts):
+        entry = parts[i]
+        i += 1
+        if len(entry) < 3:
+            continue
+        xy = entry[:2]
+        path_str = entry[3:]
+        # Renames/copies emit an extra NUL-separated old-name chunk
+        # under `-z`; skip it so we don't reparse it as a status row.
+        if xy[0] in ("R", "C") or xy[1] in ("R", "C"):
+            i += 1
+
+        x, y = xy[0], xy[1]
+
+        # 1. Refuse to stage submodule-pointer deletions.
+        if (x == "D" or y == "D") and path_str in submodule_paths:
+            refused.append(
+                f"{path_str} (submodule pointer deletion — re-init the "
+                "submodule or `git rm` it explicitly)")
+            continue
+
+        # 2. Refuse to stage stray gitlinks at unregistered paths.
+        # Two flavours to catch: the entry itself IS a gitlink path,
+        # OR the entry is an untracked DIRECTORY that contains an
+        # embedded `.git` somewhere below. The second case is the
+        # path-doubling failure mode — porcelain only reports the
+        # top-level untracked dir, not the deeper embedded repo.
+        if xy == "??" or x == "A" or y == "A":
+            full = repo_path / path_str.rstrip("/")
+            if (full / ".git").exists():
+                normalized = path_str.rstrip("/")
+                if normalized not in submodule_paths:
+                    refused.append(
+                        f"{normalized} (stray gitlink at unregistered "
+                        "path — remove the nested .git or register it "
+                        "in .gitmodules)")
+                    continue
+            elif xy == "??" and path_str.endswith("/"):
+                for embedded in _find_embedded_gitlinks(full, repo_path):
+                    if embedded not in submodule_paths:
+                        refused.append(
+                            f"{embedded} (stray gitlink at unregistered "
+                            "path — remove the nested .git or register "
+                            "it in .gitmodules)")
+                if any(e for e in refused if e.startswith(path_str.rstrip("/"))):
+                    continue
+
+    if refused:
+        return False, "refusing to stage: " + "; ".join(refused)
+
+    rc, _, err = git(repo_path, ["add", "-A"])
+    if rc != 0:
+        return False, first_line(err) or "git add failed"
+    return True, ""
 
 
 def sync_subtree(parent_path: Path, prefix: str,

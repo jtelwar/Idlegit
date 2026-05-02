@@ -571,5 +571,800 @@ class TestWorkingTreeSignatureSafetyInvariant(_TempWorkspace):
         self.assertEqual(sig_a, sig_b)
 
 
+class TestRedundantDirtyFF(_TempWorkspace):
+    """The narrow case smart-sync now handles: a 'loser' checkout has
+    dirty WT changes that are bit-identical to what a fast-forward
+    merge from origin/<branch> is about to install. `_try_ff_through_
+    redundant_dirty` should stash, FF, and drop the stash — leaving
+    HEAD updated and the file's content identical to what the user
+    typed."""
+
+    def _setup_fork(self, branch: str = "main") -> "tuple[Path, Path, Path]":
+        """Create an upstream bare repo plus two clones (winner, loser)
+        on `branch`. Returns (upstream, winner, loser)."""
+        upstream = self.tmp / "upstream.git"
+        upstream.mkdir()
+        _run(upstream, "git", "init", "--bare", "-q", "-b", branch)
+        winner = self.tmp / "winner"
+        _run(self.tmp, "git", "clone", "-q", str(upstream), "winner")
+        # Seed an initial commit so HEAD exists on both ends.
+        write_file(winner, "README.md", "# repo\n")
+        stage_and_commit(winner, "init")
+        _run(winner, "git", "push", "-q", "-u", "origin", branch)
+        loser = self.tmp / "loser"
+        _run(self.tmp, "git", "clone", "-q", str(upstream), "loser")
+        return upstream, winner, loser
+
+    def _make_checkout(self, path: Path, branch: str) -> "object":
+        """Build the SmartSyncCheckout shape the helper takes — only the
+        fields the helper actually reads matter (path, branch). The full
+        dataclass is overkill here, so a minimal stand-in keeps the test
+        focused on behavior."""
+        from models import SmartSyncCheckout, Repo
+        return SmartSyncCheckout(
+            canonical=Repo(rel="ws", path=path),
+            parent=None, path=path, branch=branch, label=path.name,
+        )
+
+    def _make_state(self) -> "object":
+        """Minimal State for the helpers' new state+name signature.
+        The helpers only touch state.tasks for the leftover-stash
+        warning path; an empty repos list is enough for the rest."""
+        from models import State
+        return State(repos=[], workspace_name="test")
+
+    def test_returns_true_when_dirty_matches_origin_bit_for_bit(self) -> None:
+        from workers import _try_ff_through_redundant_dirty
+
+        upstream, winner, loser = self._setup_fork()
+        # Winner makes a change, commits, pushes. Loser independently
+        # types the EXACT SAME content into the same file but doesn't
+        # commit it — that's the situation the user described.
+        write_file(winner, "shared.py", "def x(): return 1\n")
+        stage_and_commit(winner, "add shared")
+        _run(winner, "git", "push", "-q")
+        write_file(loser, "shared.py", "def x(): return 1\n")
+        _run(loser, "git", "fetch", "-q", "origin", "main")
+
+        # Sanity: a vanilla FF would refuse here because the file is
+        # untracked locally but exists at origin/main — git treats it
+        # as a "would be overwritten" conflict even though the content
+        # is bit-identical. That's the exact case the helper resolves.
+        sanity = _run(loser, "git", "merge", "--ff-only", "origin/main",
+                      check=False)
+        self.assertNotEqual(sanity.returncode, 0)
+
+        result = _try_ff_through_redundant_dirty(
+            self._make_state(), self._make_checkout(loser, "main"),
+            "main", "loser")
+        self.assertTrue(result)
+        # HEAD has advanced to the winner's commit and shared.py is on
+        # disk with the exact content the user typed.
+        rc = _run(loser, "git", "rev-parse", "HEAD").stdout.strip()
+        winner_head = _run(winner, "git", "rev-parse", "HEAD").stdout.strip()
+        self.assertEqual(rc, winner_head)
+        self.assertEqual(
+            (loser / "shared.py").read_text(), "def x(): return 1\n")
+
+    def test_staged_redundant_changes_also_take_the_fast_path(self) -> None:
+        """Regression: when the loser has staged redundant changes
+        (e.g. after a `git add -A`) the helper used to refuse the
+        fast path because its status filter only allowed ' M' / '??'
+        — leaving the loser dirty and 1 behind even though origin
+        already had the exact same content."""
+        from workers import _try_ff_through_redundant_dirty
+
+        upstream, winner, loser = self._setup_fork()
+        write_file(winner, "shared.py", "def x(): return 7\n")
+        stage_and_commit(winner, "add shared")
+        _run(winner, "git", "push", "-q")
+        # Loser writes the SAME content AND stages it (auto-stage / a
+        # manual `git add` would leave it like this).
+        write_file(loser, "shared.py", "def x(): return 7\n")
+        _run(loser, "git", "add", "shared.py")
+        _run(loser, "git", "fetch", "-q", "origin", "main")
+
+        # Sanity: status reports the path as 'A ' (added in index).
+        st = _run(loser, "git", "status", "--porcelain=v1").stdout
+        self.assertTrue(st.startswith("A "))
+
+        result = _try_ff_through_redundant_dirty(
+            self._make_state(), self._make_checkout(loser, "main"),
+            "main", "loser")
+        self.assertTrue(result)
+        head = _run(loser, "git", "rev-parse", "HEAD").stdout.strip()
+        winner_head = _run(winner, "git", "rev-parse", "HEAD").stdout.strip()
+        self.assertEqual(head, winner_head)
+        self.assertEqual(
+            (loser / "shared.py").read_text(),
+            "def x(): return 7\n")
+
+    def test_returns_false_when_dirty_diverges_from_origin(self) -> None:
+        from workers import _try_ff_through_redundant_dirty
+
+        upstream, winner, loser = self._setup_fork()
+        write_file(winner, "shared.py", "def x(): return 1\n")
+        stage_and_commit(winner, "add shared")
+        _run(winner, "git", "push", "-q")
+        # Loser has a DIFFERENT pending edit to the same path — a real
+        # conflict the helper must refuse to auto-resolve.
+        write_file(loser, "shared.py", "def x(): return 999  # mine\n")
+        _run(loser, "git", "fetch", "-q", "origin", "main")
+
+        result = _try_ff_through_redundant_dirty(
+            self._make_state(), self._make_checkout(loser, "main"),
+            "main", "loser")
+        self.assertFalse(result)
+        # The loser's content is preserved exactly as the user typed it.
+        self.assertEqual(
+            (loser / "shared.py").read_text(),
+            "def x(): return 999  # mine\n")
+        # HEAD didn't move.
+        loser_head = _run(loser, "git", "rev-parse", "HEAD").stdout.strip()
+        upstream_head = _run(upstream, "git", "rev-parse", "main").stdout.strip()
+        self.assertNotEqual(loser_head, upstream_head)
+
+
+class TestDetachedWinnerSwitch(_TempWorkspace):
+    """Regression: a dirty, detached-HEAD winner used to be committed
+    BEFORE the branch switch, leaving the new commit orphaned and the
+    push empty. The fix switches first (via stash → checkout → pop
+    when needed), then commits on the chosen branch so the change
+    actually propagates to remote."""
+
+    def test_clean_detached_winner_switches_with_plain_checkout(self) -> None:
+        from workers import _stash_switch_pop_winner
+        from models import Repo, SmartSyncCheckout
+        # Set up a repo with a master branch and a dangling commit.
+        repo = self.tmp / "winner"
+        repo.mkdir()
+        _run(repo, "git", "init", "-q", "-b", "master")
+        write_file(repo, "README.md", "# repo\n")
+        stage_and_commit(repo, "init")
+        master_head = _run(repo, "git", "rev-parse", "HEAD").stdout.strip()
+        # Detach: checkout HEAD by SHA so we're not on any branch.
+        _run(repo, "git", "checkout", "-q", master_head)
+        winner = SmartSyncCheckout(
+            canonical=Repo(rel="ws", path=repo),
+            parent=None, path=repo, branch="(detached)", label=repo.name)
+
+        class _NoopState:
+            class tasks:
+                @staticmethod
+                def add(label):
+                    return object()
+
+                @staticmethod
+                def update(*a, **kw):
+                    pass
+
+        ok = _stash_switch_pop_winner(_NoopState, winner, "master", "ws")
+        self.assertTrue(ok)
+        cur = _run(repo, "git", "branch", "--show-current").stdout.strip()
+        self.assertEqual(cur, "master")
+
+    def test_dirty_detached_winner_carries_changes_onto_branch(self) -> None:
+        """The user's actual scenario: a detached HEAD with uncommitted
+        edits, asked to align with master. Plain checkout would refuse
+        if master differs from detached HEAD on those paths, so the
+        helper falls back to stash → checkout → pop. After the dance
+        completes, the WT carries the user's edits ON the new branch
+        and a subsequent `git commit` lands them on master."""
+        from workers import _stash_switch_pop_winner
+        from models import Repo, SmartSyncCheckout
+        repo = self.tmp / "winner"
+        repo.mkdir()
+        _run(repo, "git", "init", "-q", "-b", "master")
+        write_file(repo, "shared.py", "def x(): return 0\n")
+        stage_and_commit(repo, "init")
+        master_head = _run(repo, "git", "rev-parse", "HEAD").stdout.strip()
+        _run(repo, "git", "checkout", "-q", master_head)  # detach
+        # User edits the file uncommitted.
+        write_file(repo, "shared.py", "def x(): return 42\n")
+        winner = SmartSyncCheckout(
+            canonical=Repo(rel="ws", path=repo),
+            parent=None, path=repo, branch="(detached)", label=repo.name,
+            dirty=True)
+
+        class _NoopState:
+            class tasks:
+                @staticmethod
+                def add(label):
+                    return object()
+
+                @staticmethod
+                def update(*a, **kw):
+                    pass
+
+        ok = _stash_switch_pop_winner(_NoopState, winner, "master", "ws")
+        self.assertTrue(ok)
+        # On master now, with the user's edit present in WT.
+        self.assertEqual(
+            _run(repo, "git", "branch", "--show-current").stdout.strip(),
+            "master")
+        self.assertEqual(
+            (repo / "shared.py").read_text(),
+            "def x(): return 42\n")
+        # And the change is uncommitted (so the caller's commit step
+        # will produce a fresh commit on master, not an orphan).
+        status = _run(repo, "git", "status", "--porcelain").stdout
+        self.assertIn("shared.py", status)
+
+
+class TestDetachedLoserCheckout(_TempWorkspace):
+    """The mirror case: after a winner pushes, detached losers run
+    `git checkout origin/<branch>`. If their dirty WT matches origin's
+    new content, the checkout would otherwise refuse — `_try_detached_
+    checkout_through_redundant_dirty` handles it via stash → checkout
+    → drop, same as the FF path does for same-branch losers."""
+
+    def _setup_with_pushed_change(self) -> "tuple[Path, Path]":
+        upstream = self.tmp / "upstream.git"
+        upstream.mkdir()
+        _run(upstream, "git", "init", "--bare", "-q", "-b", "master")
+        winner = self.tmp / "winner"
+        _run(self.tmp, "git", "clone", "-q", str(upstream), "winner")
+        write_file(winner, "shared.py", "def x(): return 1\n")
+        stage_and_commit(winner, "add shared")
+        _run(winner, "git", "push", "-q", "-u", "origin", "master")
+        loser = self.tmp / "loser"
+        _run(self.tmp, "git", "clone", "-q", str(upstream), "loser")
+        # Detach the loser at the upstream HEAD.
+        head = _run(loser, "git", "rev-parse", "HEAD").stdout.strip()
+        _run(loser, "git", "checkout", "-q", head)
+        return winner, loser
+
+    def test_dirty_detached_loser_with_redundant_changes_lands_on_origin(self) -> None:
+        from workers import _try_detached_checkout_through_redundant_dirty
+        from models import Repo, SmartSyncCheckout
+        winner, loser = self._setup_with_pushed_change()
+        # Winner publishes a new edit.
+        write_file(winner, "shared.py", "def x(): return 99\n")
+        stage_and_commit(winner, "bump")
+        _run(winner, "git", "push", "-q")
+        # Loser independently types the SAME edit but doesn't commit.
+        write_file(loser, "shared.py", "def x(): return 99\n")
+        _run(loser, "git", "fetch", "-q", "origin", "master")
+
+        c = SmartSyncCheckout(
+            canonical=Repo(rel="ws", path=loser),
+            parent=None, path=loser, branch="(detached)", label="loser",
+            dirty=True)
+        from models import State
+        state = State(repos=[], workspace_name="test")
+        result = _try_detached_checkout_through_redundant_dirty(
+            state, c, "master", "loser")
+        self.assertTrue(result)
+        # Loser is now at origin/master with the redundant change folded
+        # into the checkout — file content matches what the user typed.
+        self.assertEqual(
+            (loser / "shared.py").read_text(),
+            "def x(): return 99\n")
+
+    def test_genuinely_diverging_dirty_loser_refuses(self) -> None:
+        from workers import _try_detached_checkout_through_redundant_dirty
+        from models import Repo, SmartSyncCheckout
+        winner, loser = self._setup_with_pushed_change()
+        write_file(winner, "shared.py", "def x(): return 99\n")
+        stage_and_commit(winner, "bump")
+        _run(winner, "git", "push", "-q")
+        # Loser has a DIFFERENT pending edit — real conflict.
+        write_file(loser, "shared.py", "def x(): return 1234  # mine\n")
+        _run(loser, "git", "fetch", "-q", "origin", "master")
+
+        c = SmartSyncCheckout(
+            canonical=Repo(rel="ws", path=loser),
+            parent=None, path=loser, branch="(detached)", label="loser",
+            dirty=True)
+        from models import State
+        state = State(repos=[], workspace_name="test")
+        result = _try_detached_checkout_through_redundant_dirty(
+            state, c, "master", "loser")
+        self.assertFalse(result)
+        # The loser's WT is preserved exactly as the user typed it.
+        self.assertEqual(
+            (loser / "shared.py").read_text(),
+            "def x(): return 1234  # mine\n")
+
+
+class TestNoOrphanedCommitsOnSwitch(_TempWorkspace):
+    """Regression: a user lost a file because the helper plain-
+    checked-out a branch from a detached HEAD that had a unique
+    commit on it (the file was added in that commit). Git's own
+    "Warning: leaving N commit(s) behind" only goes to stderr with
+    rc=0, so smart-sync used to march on and orphan the commit. The
+    `_head_is_ancestor_of` guard refuses any switch where HEAD has
+    work the target ref doesn't already contain."""
+
+    def _detached_with_unique_commit(self, branch: str = "master") -> Path:
+        """Set up a checkout on a detached HEAD that has one commit
+        not present on `branch`. Returns the checkout path."""
+        repo = self.tmp / "repo"
+        repo.mkdir()
+        _run(repo, "git", "init", "-q", "-b", branch)
+        write_file(repo, "README.md", "# r\n")
+        stage_and_commit(repo, "init")
+        # Detach at HEAD, then add a new file on the detached HEAD.
+        head = _run(repo, "git", "rev-parse", "HEAD").stdout.strip()
+        _run(repo, "git", "checkout", "-q", head)
+        write_file(repo, "Upskill_Lightmap_Prefab_Baker.cs", "class Foo {}\n")
+        _run(repo, "git", "add", "Upskill_Lightmap_Prefab_Baker.cs")
+        _run(repo, "git", "-c", "user.email=t@x", "-c", "user.name=t",
+             "commit", "-q", "-m", "add baker")
+        return repo
+
+    def test_head_is_ancestor_of_returns_false_when_head_has_unique_commit(self) -> None:
+        from workers import _head_is_ancestor_of
+        repo = self._detached_with_unique_commit()
+        self.assertFalse(_head_is_ancestor_of(repo, "master"))
+
+    def test_head_is_ancestor_of_returns_true_when_clean_descendant(self) -> None:
+        from workers import _head_is_ancestor_of
+        repo = self.tmp / "clean"
+        repo.mkdir()
+        _run(repo, "git", "init", "-q", "-b", "master")
+        write_file(repo, "README.md", "# r\n")
+        stage_and_commit(repo, "init")
+        # Detach at HEAD without adding any extra commit.
+        head = _run(repo, "git", "rev-parse", "HEAD").stdout.strip()
+        _run(repo, "git", "checkout", "-q", head)
+        self.assertTrue(_head_is_ancestor_of(repo, "master"))
+
+    def test_stash_switch_pop_winner_refuses_when_head_has_unique_commit(self) -> None:
+        """Worst case: detached HEAD has a unique commit + dirty WT,
+        smart-sync would have orphaned the commit (and the unique
+        file in it) by switching to master. The guard refuses, the
+        file survives in HEAD's tree, and the user gets a clear
+        warn task pointing at the manual recovery path."""
+        from workers import _stash_switch_pop_winner
+        from models import Repo, SmartSyncCheckout, State
+
+        repo = self._detached_with_unique_commit()
+        # Add a dirty edit on top so the would-be flow includes the
+        # stash dance — the guard must run BEFORE that.
+        write_file(repo, "README.md", "# r2\n")
+        winner = SmartSyncCheckout(
+            canonical=Repo(rel="ws", path=repo),
+            parent=None, path=repo, branch="(detached)", label=repo.name,
+            dirty=True)
+        state = State(repos=[], workspace_name="test")
+        ok = _stash_switch_pop_winner(state, winner, "master", "ws")
+        self.assertFalse(ok)
+        # The unique file is still on disk via HEAD's tree.
+        self.assertTrue(
+            (repo / "Upskill_Lightmap_Prefab_Baker.cs").exists(),
+            "the file unique to the detached commit MUST survive a refused switch",
+        )
+        # The task panel surfaces the orphan-risk warning.
+        labels = " ".join(t.label + " " + t.message
+                          for t in state.tasks.snapshot())
+        self.assertIn("would orphan", labels)
+
+    def test_align_detached_loser_refuses_when_head_has_unique_commit(self) -> None:
+        """Same risk on the loser side: a detached loser with unique
+        commits would lose them on `git checkout origin/<branch>`.
+        `_align_detached_loser`'s guard refuses; file survives."""
+        from workers import _align_detached_loser
+        from models import Repo, SmartSyncCheckout, State
+
+        # Build an upstream + clone. Loser detaches and commits
+        # a unique file that origin doesn't have.
+        upstream = self.tmp / "u.git"
+        upstream.mkdir()
+        _run(upstream, "git", "init", "--bare", "-q", "-b", "master")
+        loser = self.tmp / "loser"
+        _run(self.tmp, "git", "clone", "-q", str(upstream), "loser")
+        write_file(loser, "README.md", "# r\n")
+        stage_and_commit(loser, "init")
+        _run(loser, "git", "push", "-q", "-u", "origin", "master")
+        head = _run(loser, "git", "rev-parse", "HEAD").stdout.strip()
+        _run(loser, "git", "checkout", "-q", head)
+        write_file(loser, "Upskill_Lightmap_Prefab_Baker.cs", "class Foo {}\n")
+        _run(loser, "git", "add", "Upskill_Lightmap_Prefab_Baker.cs")
+        _run(loser, "git", "-c", "user.email=t@x", "-c", "user.name=t",
+             "commit", "-q", "-m", "add baker")
+
+        c = SmartSyncCheckout(
+            canonical=Repo(rel="ws", path=loser),
+            parent=None, path=loser, branch="(detached)", label="loser")
+        state = State(repos=[], workspace_name="test")
+        ok = _align_detached_loser(state, c, "master", "ws")
+        self.assertFalse(ok)
+        self.assertTrue(
+            (loser / "Upskill_Lightmap_Prefab_Baker.cs").exists())
+        labels = " ".join(t.label + " " + t.message
+                          for t in state.tasks.snapshot())
+        self.assertIn("would orphan", labels)
+
+
+class TestPostMergeCleanGuard(_TempWorkspace):
+    """The redundant-dirty fast path drops a stash only if the post-
+    merge `git status --porcelain=v1` is fully clean. If it's not —
+    because something raced or an edge case left content unaccounted
+    for — the stash stays on the list so the user can recover."""
+
+    def test_post_merge_clean_true_on_clean_tree(self) -> None:
+        from workers import _post_merge_clean
+        repo = self.tmp / "clean"
+        repo.mkdir()
+        _run(repo, "git", "init", "-q", "-b", "master")
+        write_file(repo, "README.md", "# r\n")
+        stage_and_commit(repo, "init")
+        self.assertTrue(_post_merge_clean(repo))
+
+    def test_post_merge_clean_false_when_anything_dirty(self) -> None:
+        from workers import _post_merge_clean
+        repo = self.tmp / "dirty"
+        repo.mkdir()
+        _run(repo, "git", "init", "-q", "-b", "master")
+        write_file(repo, "README.md", "# r\n")
+        stage_and_commit(repo, "init")
+        write_file(repo, "untracked.txt", "x\n")
+        self.assertFalse(_post_merge_clean(repo))
+
+
+class TestSafeStageAll(_TempWorkspace):
+    """Cardinal-rule regression: `git add -A` could destroy submodule
+    pointers (when the dir was empty after deinit) or commit stray
+    gitlinks at unregistered paths (when a buggy script placed a `.git`
+    at a doubled path). `safe_stage_all` refuses both classes outright.
+
+    These tests model the two failure modes the user lost real files
+    to on 2026-05-01."""
+
+    def _bare_remote(self, name: str = "remote.git", branch: str = "master") -> Path:
+        bare = self.tmp / name
+        bare.mkdir()
+        _run(bare, "git", "init", "--bare", "-q", "-b", branch)
+        return bare
+
+    def test_refuses_submodule_pointer_deletion_when_dir_empty(self) -> None:
+        """The Mobile-sweep failure mode: a registered submodule whose
+        working directory is empty (e.g. after `git submodule deinit`)
+        shows up as a `D` entry in porcelain status. Plain `git add -A`
+        stages that deletion as a submodule pointer removal — destroying
+        the link. `safe_stage_all` refuses outright."""
+        from git_ops import safe_stage_all
+
+        # Outer parent + a registered submodule pointing at a bare
+        # remote. The submodule's working dir starts populated.
+        sub_remote = self._bare_remote("sub.git")
+        # Seed sub_remote with a commit so we can clone it.
+        seed = self.tmp / "seed"
+        _run(self.tmp, "git", "clone", "-q", str(sub_remote), "seed")
+        write_file(seed, "lib.txt", "hi\n")
+        stage_and_commit(seed, "init")
+        _run(seed, "git", "push", "-q", "-u", "origin", "master")
+
+        parent = make_repo(self.tmp, "parent")
+        _run(parent, "git", "-c", "protocol.file.allow=always",
+             "submodule", "add", str(sub_remote), "vendor/sub")
+        stage_and_commit(parent, "register submodule")
+
+        # Empty out the submodule's working directory (the deinit
+        # scenario — the .gitmodules entry remains, the gitlink in the
+        # parent's index remains, but the dir is gone).
+        shutil.rmtree(parent / "vendor" / "sub")
+
+        ok, msg = safe_stage_all(parent)
+        self.assertFalse(ok, "must refuse to stage when submodule dir is empty")
+        self.assertIn("vendor/sub", msg)
+        self.assertIn("submodule", msg.lower())
+
+        # And — most importantly — nothing was staged.
+        diff = _run(parent, "git", "diff", "--cached", "--name-only").stdout
+        self.assertEqual(diff.strip(), "",
+                         "safe_stage_all must stage nothing on refusal")
+
+    def test_refuses_stray_gitlink_at_unregistered_path(self) -> None:
+        """The path-doubling failure mode: some other tool placed a
+        nested `.git` at a path that's NOT in `.gitmodules`. Plain
+        `git add -A` would commit a gitlink at that bogus path.
+        `safe_stage_all` refuses."""
+        from git_ops import safe_stage_all
+
+        parent = make_repo(self.tmp, "parent")
+        # Drop a fully-formed nested git repo at an unregistered path.
+        stray = parent / "weird" / "doubled" / "path"
+        stray.mkdir(parents=True)
+        _run(stray, "git", "init", "-q", "-b", "master")
+        write_file(stray, "x.txt", "x\n")
+        stage_and_commit(stray, "stray")
+
+        ok, msg = safe_stage_all(parent)
+        self.assertFalse(ok)
+        self.assertIn("stray gitlink", msg)
+        self.assertIn("weird/doubled/path", msg)
+
+        diff = _run(parent, "git", "diff", "--cached", "--name-only").stdout
+        self.assertEqual(diff.strip(), "")
+
+    def test_stages_normal_changes_when_no_risk(self) -> None:
+        """Sanity: when the WT has only ordinary edits / additions,
+        `safe_stage_all` behaves exactly like `git add -A`."""
+        from git_ops import safe_stage_all
+
+        repo = make_repo(self.tmp, "r")
+        write_file(repo, "edit.txt", "hello\n")
+        write_file(repo, "nested/new.txt", "hi\n")
+
+        ok, msg = safe_stage_all(repo)
+        self.assertTrue(ok, msg)
+        staged = _run(repo, "git", "diff", "--cached", "--name-only").stdout
+        self.assertIn("edit.txt", staged)
+        self.assertIn("nested/new.txt", staged)
+
+    def test_does_not_refuse_normal_submodule_modification(self) -> None:
+        """The guard is about D-on-submodule and stray gitlinks ONLY.
+        A submodule with an in-WT change (its HEAD moved) still stages
+        normally — that's the legitimate update flow."""
+        from git_ops import safe_stage_all
+
+        sub_remote = self._bare_remote("sub.git")
+        seed = self.tmp / "seed"
+        _run(self.tmp, "git", "clone", "-q", str(sub_remote), "seed")
+        write_file(seed, "lib.txt", "hi\n")
+        stage_and_commit(seed, "init")
+        _run(seed, "git", "push", "-q", "-u", "origin", "master")
+
+        parent = make_repo(self.tmp, "parent")
+        _run(parent, "git", "-c", "protocol.file.allow=always",
+             "submodule", "add", str(sub_remote), "vendor/sub")
+        stage_and_commit(parent, "register submodule")
+
+        # Move the submodule's HEAD by adding a new commit.
+        write_file(parent / "vendor" / "sub", "new.txt", "y\n")
+        _run(parent / "vendor" / "sub", "git", "add", "new.txt")
+        _run(parent / "vendor" / "sub",
+             "git", "-c", "user.email=t@x", "-c", "user.name=t",
+             "commit", "-q", "-m", "advance")
+
+        ok, msg = safe_stage_all(parent)
+        self.assertTrue(ok, msg)
+        # The submodule pointer change is staged in the parent.
+        staged = _run(parent, "git", "diff", "--cached", "--name-only").stdout
+        self.assertIn("vendor/sub", staged)
+
+
+class TestSyncSiblingAncestorGuard(_TempWorkspace):
+    """Cardinal-rule regression: post-push fan-out called
+    `git checkout origin/<branch>` from a detached HEAD without
+    checking whether HEAD's commits were on origin. Git would silently
+    orphan them. `sync_sibling` now requires HEAD to be an ancestor
+    of the target ref."""
+
+    def test_refuses_checkout_when_head_has_unique_commit(self) -> None:
+        from git_ops import sync_sibling
+
+        bare = self.tmp / "u.git"
+        bare.mkdir()
+        _run(bare, "git", "init", "--bare", "-q", "-b", "master")
+        sib = self.tmp / "sib"
+        _run(self.tmp, "git", "clone", "-q", str(bare), "sib")
+        write_file(sib, "README.md", "# r\n")
+        stage_and_commit(sib, "init")
+        _run(sib, "git", "push", "-q", "-u", "origin", "master")
+
+        # Detach + add a unique commit not on origin/master.
+        head = _run(sib, "git", "rev-parse", "HEAD").stdout.strip()
+        _run(sib, "git", "checkout", "-q", head)
+        write_file(sib, "Upskill_Lightmap_Prefab_Baker.cs", "class Foo {}\n")
+        _run(sib, "git", "add", "Upskill_Lightmap_Prefab_Baker.cs")
+        _run(sib, "git", "-c", "user.email=t@x", "-c", "user.name=t",
+             "commit", "-q", "-m", "add baker")
+
+        ok, msg = sync_sibling(sib, "master")
+        self.assertFalse(ok, "must refuse a checkout that would orphan commits")
+        self.assertIn("orphan", msg)
+        # The unique file is still in the WT (it was in HEAD's tree).
+        self.assertTrue((sib / "Upskill_Lightmap_Prefab_Baker.cs").exists())
+
+    def test_allows_checkout_when_head_is_ancestor(self) -> None:
+        """The standard happy path: detached HEAD points at the same
+        commit as origin/master (or earlier). Sync proceeds."""
+        from git_ops import sync_sibling
+
+        bare = self.tmp / "u.git"
+        bare.mkdir()
+        _run(bare, "git", "init", "--bare", "-q", "-b", "master")
+        sib = self.tmp / "sib"
+        _run(self.tmp, "git", "clone", "-q", str(bare), "sib")
+        write_file(sib, "README.md", "# r\n")
+        stage_and_commit(sib, "init")
+        _run(sib, "git", "push", "-q", "-u", "origin", "master")
+
+        # Detach at a commit that IS on origin/master.
+        head = _run(sib, "git", "rev-parse", "HEAD").stdout.strip()
+        _run(sib, "git", "checkout", "-q", head)
+
+        ok, msg = sync_sibling(sib, "master")
+        self.assertTrue(ok, msg)
+
+
+class TestStashPreservedAlways(_TempWorkspace):
+    """Cardinal rule: idlegit MUST NOT call `git stash drop` on the
+    user's behalf. Both redundant-dirty fast paths now leave the stash
+    on the list, even after a successful operation."""
+
+    def _seed(self, branch: str = "master") -> Path:
+        bare = self.tmp / "u.git"
+        bare.mkdir()
+        _run(bare, "git", "init", "--bare", "-q", "-b", branch)
+        loser = self.tmp / "loser"
+        _run(self.tmp, "git", "clone", "-q", str(bare), "loser")
+        write_file(loser, "README.md", "# r\n")
+        stage_and_commit(loser, "init")
+        _run(loser, "git", "push", "-q", "-u", "origin", branch)
+        return loser
+
+    def test_ff_through_redundant_dirty_keeps_stash(self) -> None:
+        """After the redundant-dirty FF succeeds, the stash entry MUST
+        still be on the stash list — pruning is the user's call."""
+        from workers import _try_ff_through_redundant_dirty
+        from models import Repo, SmartSyncCheckout, State
+
+        loser = self._seed()
+        # Advance origin: another clone pushes a new file.
+        winner = self.tmp / "winner"
+        _run(self.tmp, "git", "clone", "-q",
+             str(self.tmp / "u.git"), "winner")
+        write_file(winner, "shared.txt", "v2\n")
+        stage_and_commit(winner, "v2")
+        _run(winner, "git", "push", "-q", "origin", "master")
+
+        # Loser fetches origin (so origin/master is up-to-date locally)
+        # and gets the SAME edit in WT — bit-identical to what FF will land.
+        _run(loser, "git", "fetch", "-q", "origin", "master")
+        write_file(loser, "shared.txt", "v2\n")
+
+        c = SmartSyncCheckout(
+            canonical=Repo(rel="ws", path=loser),
+            parent=None, path=loser, branch="master", label="loser",
+            dirty=True)
+        state = State(repos=[], workspace_name="test")
+        result = _try_ff_through_redundant_dirty(state, c, "master", "ws")
+        self.assertTrue(result, "redundant-dirty FF should succeed here")
+
+        # Stash list MUST still contain idlegit's entry.
+        stash_out = _run(loser, "git", "stash", "list").stdout
+        self.assertIn("redundant dirty", stash_out,
+                      "stash MUST be preserved (cardinal rule)")
+
+    def test_detached_checkout_through_redundant_dirty_keeps_stash(self) -> None:
+        """Same guarantee on the detached-loser checkout path."""
+        from workers import _try_detached_checkout_through_redundant_dirty
+        from models import Repo, SmartSyncCheckout, State
+
+        loser = self._seed()
+        winner = self.tmp / "winner"
+        _run(self.tmp, "git", "clone", "-q",
+             str(self.tmp / "u.git"), "winner")
+        write_file(winner, "shared.txt", "v2\n")
+        stage_and_commit(winner, "v2")
+        _run(winner, "git", "push", "-q", "origin", "master")
+
+        # Loser detaches at HEAD, fetches, gets the same WT edit.
+        head = _run(loser, "git", "rev-parse", "HEAD").stdout.strip()
+        _run(loser, "git", "checkout", "-q", head)
+        _run(loser, "git", "fetch", "-q", "origin", "master")
+        write_file(loser, "shared.txt", "v2\n")
+
+        c = SmartSyncCheckout(
+            canonical=Repo(rel="ws", path=loser),
+            parent=None, path=loser, branch="(detached)", label="loser",
+            dirty=True)
+        state = State(repos=[], workspace_name="test")
+        result = _try_detached_checkout_through_redundant_dirty(
+            state, c, "master", "ws")
+        self.assertTrue(result)
+
+        stash_out = _run(loser, "git", "stash", "list").stdout
+        self.assertIn("redundant dirty", stash_out)
+
+
+class TestStashPopConflictNoHardReset(_TempWorkspace):
+    """Cardinal rule: when `git stash pop` conflicts during the
+    detached-winner switch, idlegit MUST NOT run `git reset --hard
+    HEAD` to tidy up. The conflict markers stay in the WT and the
+    stash stays on the stash list — both are recoverable. The user
+    resolves manually."""
+
+    def test_no_hard_reset_after_pop_conflict(self) -> None:
+        from workers import _stash_switch_pop_winner
+        from models import Repo, SmartSyncCheckout, State
+
+        # Build a repo with two branches whose 'collide.txt' differs.
+        # Detach on 'master' with a dirty edit that conflicts with the
+        # 'feature' branch's version of 'collide.txt' — stash + checkout
+        # feature works (clean WT after stash), but stash pop will
+        # conflict.
+        repo = self.tmp / "repo"
+        repo.mkdir()
+        _run(repo, "git", "init", "-q", "-b", "master")
+        write_file(repo, "collide.txt", "master-base\n")
+        stage_and_commit(repo, "init master")
+        _run(repo, "git", "checkout", "-q", "-b", "feature")
+        write_file(repo, "collide.txt", "feature-content\n")
+        stage_and_commit(repo, "feature edit")
+        _run(repo, "git", "checkout", "-q", "master")
+        # Detach at master HEAD, then dirty-edit collide.txt with text
+        # that doesn't match either branch — guarantees a pop conflict
+        # when we land on feature.
+        head = _run(repo, "git", "rev-parse", "HEAD").stdout.strip()
+        _run(repo, "git", "checkout", "-q", head)
+        write_file(repo, "collide.txt", "winner-edit\n")
+
+        winner = SmartSyncCheckout(
+            canonical=Repo(rel="ws", path=repo),
+            parent=None, path=repo, branch="(detached)", label=repo.name,
+            dirty=True)
+        state = State(repos=[], workspace_name="test")
+        ok = _stash_switch_pop_winner(state, winner, "feature", "ws")
+        self.assertFalse(ok, "pop should have conflicted")
+
+        # WT must show the conflict (NOT a clean tip from a hard reset).
+        # Conflict markers in collide.txt OR the file in conflicted state
+        # in porcelain status.
+        status = _run(repo, "git", "status", "--porcelain=v1").stdout
+        self.assertTrue(
+            any(line[:2] in ("UU", "AA", "DD", "AU", "UA", "DU", "UD")
+                for line in status.splitlines()) or
+            "<<<<<<<" in (repo / "collide.txt").read_text(),
+            "WT should be in conflicted state, not reset clean",
+        )
+
+        # Stash must be preserved.
+        stash_out = _run(repo, "git", "stash", "list").stdout
+        self.assertIn("align detached winner", stash_out)
+
+
+class TestCommitWorkerDetachedGuard(_TempWorkspace):
+    """Regression: pushing on a detached-HEAD top-level repo used to
+    produce `error: src refspec (detached) does not match` — the push
+    refspec was the literal "(detached)" sentinel from refresh_repo.
+    `commit_worker` now mirrors `commit_worker_for_child`'s early-bail:
+    detached HEAD → fail with a clear "switch to a branch first"
+    message before any stage/commit/push runs."""
+
+    def test_commit_worker_refuses_on_detached_head(self) -> None:
+        from workers import commit_worker
+        from models import Repo, State
+
+        repo_path = make_repo(self.tmp, "r")
+        # Stage a real change so the staging step would otherwise have
+        # work to do — proves we bail BEFORE staging, not just because
+        # there's nothing to commit.
+        write_file(repo_path, "edit.txt", "hi\n")
+        # Detach at HEAD.
+        head = _run(repo_path, "git", "rev-parse", "HEAD").stdout.strip()
+        _run(repo_path, "git", "checkout", "-q", head)
+
+        repo = Repo(rel="r", path=repo_path)
+        # Skip refresh_repo — set the cached fields the worker reads
+        # explicitly so the test exercises the in-loop branch query.
+        repo.merging = False
+        repo.upstream = None
+        repo.remote_url = None
+        state = State(repos=[repo], workspace_name="test")
+        commit_worker(state, repo, "msg", lfs_cands=[])
+
+        labels = [t.label + " " + t.message
+                  for t in state.tasks.snapshot()]
+        # Exactly one task — the cannot-commit guard.
+        self.assertTrue(
+            any("cannot commit" in line and "detached" in line.lower()
+                for line in labels),
+            f"expected detached-HEAD refusal, got: {labels}",
+        )
+        # No stage, commit, or push ran.
+        for forbidden in ("stage all", ": commit", ": push"):
+            self.assertFalse(
+                any(forbidden in line for line in labels),
+                f"{forbidden!r} task fired despite detached HEAD: {labels}",
+            )
+        # The pre-existing edit is still in the WT (untouched).
+        self.assertEqual((repo_path / "edit.txt").read_text(), "hi\n")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -15,9 +15,21 @@ from .colors import (
     PAIR_SB_OK, PAIR_SB_WARN,
 )
 from .geometry import safe_addstr
+from .hints import KEY_CTRL_R, KEY_SHIFT_TAB, Hint, render_hints
 
 
 SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+
+
+def _empty_panel_hints(focused: bool) -> list:
+    """Hints shown beneath '(no tasks yet)' when the task panel is
+    empty. Ctrl+R is what surfaces new tasks (kicks off a refresh that
+    may produce them); Shift+Tab is offered only when this panel has
+    focus, since that's when the user actually needs the way out."""
+    hints = [Hint(KEY_CTRL_R, "refresh")]
+    if focused:
+        hints.append(Hint(KEY_SHIFT_TAB, "back to repos"))
+    return hints
 
 
 def _row_span(task) -> int:
@@ -74,8 +86,8 @@ def draw_sidebar(stdscr, state: State, x: int, w: int) -> None:
         safe_addstr(stdscr, header_y, x + 1, "Tasks", header_attr)
         safe_addstr(stdscr, header_y + 2, x + 1, "(no tasks yet)",
                     sb | curses.A_DIM)
-        safe_addstr(stdscr, header_y + 3, x + 1, "Ctrl+R to refresh",
-                    sb | curses.A_DIM)
+        render_hints(stdscr, header_y + 3, x + 1, max(0, w - 2),
+                     _empty_panel_hints(focused), attr=sb | curses.A_DIM)
         return
 
     sel_idx = state.task_selected if focused else -1

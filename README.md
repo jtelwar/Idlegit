@@ -12,16 +12,18 @@ And because the name lazygit was already taken, but it's just not lazy enough fo
 
 ## Run
 
-Drop the `idlegit/` folder next to the repos you
-want to manage and run it; everything is on one keyboard-driven screen.
+Drop the `idlegit/` folder anywhere and run it; everything is on one
+keyboard-driven screen.
 
 ```sh
 ./idlegit/idlegit
 ```
 
-By default it scans the parent folder of `idlegit/` for git repos: the
-workspace itself if it is one, plus any immediate child folder containing
-`.git`. Edit `idlegit.conf` if you want it to look elsewhere.
+On first launch it pops a setup dialog asking you to type one or more
+folder paths to scan; each one becomes a named workspace you can switch
+between at runtime (Up to the title row, ←/→ to cycle, Space to edit
+that workspace's overrides). Workspaces are persisted to
+`idlegit.workspaces` next to the script.
 
 ## Design Goals
 

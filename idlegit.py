@@ -22,7 +22,12 @@ import sys
 import termios
 import time
 
-from config import CONFIG_FILE, load_config
+from config import (
+    apply_workspace_overrides,
+    load_config,
+    load_workspaces,
+    save_workspaces,
+)
 from git_ops import discover_repos
 from models import State
 from ui import (
@@ -37,12 +42,20 @@ from ui import (
     handle_reset_prompt_key,
     handle_task_action_menu_key,
     handle_workflow_picker_key,
+    handle_workspace_creator_key,
+    handle_workspace_menu_key,
+    handle_workspaces_picker_key,
     init_colors,
-    refresh_all,
+    refresh_all_workspaces,
     safe_addstr,
-    PAIR_ERR,
+    tick_creator_checks,
+    tick_menu_path_checks,
 )
-from workers import kick_off_inline_refresh, kick_off_sync_siblings
+from workers import (
+    kick_off_inline_refresh,
+    kick_off_sync_siblings,
+    switch_workspace,
+)
 
 
 def _disable_flow_control() -> None:
@@ -63,7 +76,82 @@ def _disable_flow_control() -> None:
         pass
 
 
-def run(stdscr, cfg) -> None:
+def _discover_workspace_repos(folders) -> list:
+    """Walk every folder configured for a workspace, collect repos, dedupe
+    by absolute path, and return them sorted by display name. Shared by
+    startup and the runtime workspace-switch helper so both paths see the
+    same dedupe order regardless of which folder a repo came from."""
+    repos = []
+    seen: set = set()
+    for folder in folders:
+        for r in discover_repos(folder):
+            if r.path in seen:
+                continue
+            seen.add(r.path)
+            repos.append(r)
+    repos.sort(key=lambda r: r.display_name.lower())
+    return repos
+
+
+def _run_workspace_creator_subloop(stdscr, cfg):
+    """Run the workspace creator as a self-contained sub-loop. Used at
+    first launch when idlegit.workspaces is empty/missing — drives a
+    blank welcome backdrop with the creator modal overlaid until the
+    user either commits at least one workspace (returns the list, also
+    persisted via save_workspaces) or cancels with Esc (returns [])."""
+    from models import State
+    from ui import (
+        PAIR_HEADER, draw_workspace_creator,
+        open_workspace_creator,
+        sidebar_geometry,
+    )
+    state = State(
+        repos=[], workspace_name="", workspaces=[], base_config=cfg,
+    )
+    open_workspace_creator(
+        state,
+        title="Welcome to idlegit",
+        intro=("No workspaces are configured yet. Add one or more folder "
+               "paths to scan for git repos."))
+    stdscr.timeout(100)
+    while state.workspace_creator is not None:
+        if state.workspace_creator.result is not None:
+            break
+        # Spawn / track live discover_repos checks for any draft whose
+        # path text drifted from what's been validated.
+        tick_creator_checks(state)
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+        title = "idlegit"
+        safe_addstr(stdscr, 1, max(2, (w - len(title)) // 2), title,
+                    curses.A_BOLD | curses.color_pair(PAIR_HEADER))
+        sidebar_x, _ = sidebar_geometry(w)
+        draw_workspace_creator(stdscr, state, sidebar_x)
+        stdscr.refresh()
+        try:
+            key = stdscr.getch()
+        except KeyboardInterrupt:
+            return []
+        if key == -1:
+            continue
+        if key == curses.KEY_RESIZE:
+            try:
+                curses.update_lines_cols()
+            except (AttributeError, curses.error):
+                pass
+            try:
+                stdscr.clear()
+            except curses.error:
+                pass
+            continue
+        handle_workspace_creator_key(state, key)
+    creator = state.workspace_creator
+    result = list(creator.result) if creator and creator.result else []
+    state.workspace_creator = None
+    return result
+
+
+def run(stdscr, cfg, workspaces, initial_active_idx: int = 0) -> None:
     try:
         curses.set_escdelay(25)
     except (AttributeError, curses.error):
@@ -74,46 +162,47 @@ def run(stdscr, cfg) -> None:
     stdscr.keypad(True)
     stdscr.timeout(100)  # non-blocking getch — drives sidebar animation.
 
-    # Walk every configured folder, collect repos, dedupe by absolute
-    # path, and present them sorted by display name (case-insensitive)
-    # so the order is stable across resizes and refreshes regardless
-    # of which folder a repo came from.
-    repos = []
-    seen: set = set()
-    for folder in cfg.repository_folders:
-        for r in discover_repos(folder):
-            if r.path in seen:
-                continue
-            seen.add(r.path)
-            repos.append(r)
-    repos.sort(key=lambda r: r.display_name.lower())
-
-    if not repos:
-        folders_str = ", ".join(str(f) for f in cfg.repository_folders)
-        safe_addstr(stdscr, 0, 0,
-                    f"no git repos found under {folders_str}",
-                    curses.color_pair(PAIR_ERR))
-        safe_addstr(stdscr, 2, 0,
-                    f"edit {CONFIG_FILE.name} to point 'repository_folders' "
-                    "at one or more valid paths, then re-run.",
-                    curses.A_DIM)
-        stdscr.refresh()
-        stdscr.timeout(-1)
-        stdscr.getch()
-        return
-
-    refresh_all(stdscr, repos, cfg.name_display_max,
-                cfg.name_truncation, cfg.subtrees)
-
-    # Title uses the first folder's name when there's only one;
-    # multiple folders show as "idlegit · N folders" since we can't
-    # cram every name into a window title.
-    if len(cfg.repository_folders) == 1:
-        first = cfg.repository_folders[0]
-        workspace_name = first.name or str(first)
+    # First-run path: idlegit.workspaces missing or empty drops us into
+    # the creator wizard before the main UI gets to draw. The wizard
+    # blocks until the user commits at least one workspace (then we
+    # persist it) or cancels with Esc (we exit cleanly).
+    if not workspaces:
+        workspaces = _run_workspace_creator_subloop(stdscr, cfg)
+        if not workspaces:
+            return
+        try:
+            save_workspaces(workspaces, active_index=0)
+        except OSError:
+            # Persistence failure is non-fatal — the user can re-create
+            # the workspaces next run; right now just keep going.
+            pass
+        active_idx = 0
     else:
-        workspace_name = f"{len(cfg.repository_folders)} folders"
-    title = f"idlegit · {workspace_name}" if workspace_name else "idlegit"
+        # Honour the persisted last-active index from idlegit.workspaces
+        # so the user lands back where they left off. main() already
+        # validated this against the post-filter workspace list.
+        active_idx = max(0, min(initial_active_idx, len(workspaces) - 1))
+    active_ws = workspaces[active_idx]
+    # Discover repos for EVERY configured workspace up front, then
+    # refresh them all in parallel. Loading every workspace at startup
+    # makes ←/→ workspace switching instant (the lists are already
+    # there, no async fetch race), and surfaces every workspace's
+    # repos on the loading screen so the user can see the whole
+    # picture instead of just the active workspace's contents.
+    workspace_repos: list = []
+    for ws in workspaces:
+        ws_repos = _discover_workspace_repos(ws.folders)
+        # Stash the discovered list onto the Workspace so switching
+        # later just reuses these refreshed Repo objects — no re-
+        # discovery, no async refresh race when the user rapid-fires
+        # ←/→ between workspaces.
+        ws.cached_repos = ws_repos
+        workspace_repos.append((ws.name, ws_repos, ws.subtrees))
+    repos = workspace_repos[active_idx][1]
+    refresh_all_workspaces(stdscr, workspace_repos, cfg.name_display_max,
+                           cfg.name_truncation, active_index=active_idx)
+
+    title = f"idlegit · {active_ws.name}" if active_ws.name else "idlegit"
     # Re-emit immediately after curses owns the terminal: VS Code's
     # integrated terminal (and a few others) overwrite the title with
     # the running-process name once the alt-screen comes up.
@@ -122,25 +211,15 @@ def run(stdscr, cfg) -> None:
     last_title_at = time.monotonic()
     state = State(
         repos=repos,
-        workspace_name=workspace_name,
-        suggest_added=cfg.suggest_added,
-        suggest_updated=cfg.suggest_updated,
-        suggest_deleted=cfg.suggest_deleted,
-        lfs_warn_bytes=cfg.lfs_warn_bytes,
-        branch_display_max=cfg.branch_display_max,
-        name_display_max=cfg.name_display_max,
-        task_name_display_max=cfg.task_name_display_max,
-        name_truncation=cfg.name_truncation,
-        branch_truncation=cfg.branch_truncation,
-        task_name_truncation=cfg.task_name_truncation,
-        max_visible_repo_rows=cfg.max_visible_repo_rows,
-        subtrees=cfg.subtrees,
-        track_actions_default=cfg.track_actions_default,
-        actions_poll_seconds=cfg.actions_poll_seconds,
-        auto_remove_completed_after=cfg.auto_remove_completed_after,
-        auto_stage=cfg.default_auto_stage,
-        auto_push=cfg.default_auto_push,
+        workspace_name=active_ws.name,
+        workspaces=workspaces,
+        active_workspace_index=active_idx,
+        base_config=cfg,
     )
+    # Layer base-config defaults + this workspace's overrides on top of
+    # the freshly-built State so the same code path runs on startup and
+    # later workspace switches.
+    apply_workspace_overrides(state, cfg, active_ws)
 
     while True:
         now = time.monotonic()
@@ -162,12 +241,60 @@ def run(stdscr, cfg) -> None:
         # animations (sidebar tasks, in-field suggest, in-row refresh) play.
         # Also keep ticking while a finished task is fading out so the
         # progress-bar countdown actually animates.
+        # While the workspace creator is open, kick off / track the
+        # background discover_repos checks for any draft whose path
+        # text changed since its last check. The tick returns True
+        # while any worker is in flight so the spinner keeps animating.
+        creator_checking = (
+            tick_creator_checks(state)
+            if state.workspace_creator is not None else False)
+        # Same idea for the workspace settings modal — its folder rows
+        # carry per-path drafts that need re-checking when text edits
+        # land. Bundling both into anim_running keeps the spinner
+        # ticking through any in-flight discover_repos work.
+        menu_checking = (
+            tick_menu_path_checks(state)
+            if state.workspace_menu is not None else False)
+        # Runtime commit: if the creator finished while open as a
+        # modal (e.g. via the "+ Create new workspace" picker entry),
+        # consume its result here — append the new workspaces, persist,
+        # close both modals, and switch to the first new workspace so
+        # the user lands inside what they just created.
+        if (state.workspace_creator is not None
+                and state.workspace_creator.result is not None):
+            new_ws = state.workspace_creator.result
+            state.workspace_creator = None
+            if new_ws:
+                first_new_index = len(state.workspaces)
+                state.workspaces = list(state.workspaces) + list(new_ws)
+                state.workspaces_picker = None
+                switch_workspace(state, first_new_index)
+                # switch_workspace now persists the post-switch active
+                # index; mirror it here for the append+save case so the
+                # newly-created workspace is also written to disk.
+                try:
+                    save_workspaces(state.workspaces,
+                                    state.active_workspace_index)
+                except OSError:
+                    pass
+                ws = state.active_workspace
+                if ws is not None:
+                    title = (f"idlegit · {ws.name}"
+                             if ws.name else "idlegit")
+        action_menu_loading = (
+            state.action_menu is not None
+            and (state.action_menu.state_loading
+                 or state.action_menu.tree_loading
+                 or state.action_menu.commits_loading))
         anim_running = (state.tasks.has_running()
                         or state.tasks.has_pending_auto_remove(
                             state.auto_remove_completed_after)
                         or any(r.suggesting or r.refreshing for r in state.repos)
                         or any(c.suggesting
-                               for r in state.repos for c in r.children))
+                               for r in state.repos for c in r.children)
+                        or creator_checking
+                        or menu_checking
+                        or action_menu_loading)
         if anim_running:
             state.spinner_frame = (state.spinner_frame + 1) % len(SPINNER_FRAMES)
 
@@ -221,6 +348,18 @@ def run(stdscr, cfg) -> None:
         if state.action_menu is not None:
             handle_action_menu_key(state, key)
             continue
+        if state.workspace_menu is not None:
+            handle_workspace_menu_key(state, key)
+            continue
+        # Creator dispatched before the picker so a creator opened from
+        # the picker's "+ Create new workspace" entry receives keys
+        # while the picker is still alive underneath.
+        if state.workspace_creator is not None:
+            handle_workspace_creator_key(state, key)
+            continue
+        if state.workspaces_picker is not None:
+            handle_workspaces_picker_key(state, key)
+            continue
 
         action = handle_main_key(state, key)
         if action == "quit":
@@ -235,6 +374,13 @@ def run(stdscr, cfg) -> None:
             continue
         if action == "sync":
             kick_off_sync_siblings(state)
+            continue
+        if action == "switch-workspace":
+            # Re-derive the title once the active workspace changes, so the
+            # OSC re-emit loop above picks the new name up next tick.
+            ws = state.active_workspace
+            if ws is not None:
+                title = f"idlegit · {ws.name}" if ws.name else "idlegit"
             continue
         if action == "confirm":
             stdscr.timeout(-1)  # confirm sub-loop wants blocking input
@@ -258,30 +404,35 @@ def _set_terminal_title(title: str) -> None:
 
 def main() -> int:
     cfg = load_config()
-    valid = [f for f in cfg.repository_folders if f.is_dir()]
-    if not valid:
-        listed = ", ".join(str(f) for f in cfg.repository_folders) or "(none)"
-        print(f"error: no valid repository folders. Tried: {listed}",
-              file=sys.stderr)
-        print(f"edit {CONFIG_FILE} to set 'repository_folders' to one or "
-              "more existing directories (comma-separated).",
-              file=sys.stderr)
-        return 1
-    if len(valid) < len(cfg.repository_folders):
-        # Drop missing entries silently after warning so the rest of
-        # the run still works against whatever's actually on disk.
-        missing = [str(f) for f in cfg.repository_folders if not f.is_dir()]
-        print(f"warning: skipping missing folders: {', '.join(missing)}",
-              file=sys.stderr)
-        cfg.repository_folders = valid
-    if len(valid) == 1:
-        first = valid[0]
-        title_name = first.name or str(first)
-    else:
-        title_name = f"{len(valid)} folders"
+    workspaces, persisted_active_idx = load_workspaces()
+    # Remember the last-active workspace name BEFORE filtering — so if
+    # we drop the entry whose folders no longer exist, we can still try
+    # to honour the user's previous choice in the resulting list (or
+    # fall back to 0 cleanly).
+    remembered_name = (workspaces[persisted_active_idx].name
+                       if 0 <= persisted_active_idx < len(workspaces)
+                       else "")
+    # Drop folders that no longer exist on disk; if a workspace loses
+    # all its folders, drop the workspace entirely. The in-app creator
+    # wizard fires when run() sees an empty list.
+    for ws in workspaces:
+        ws.folders = [f for f in ws.folders if f.is_dir()]
+    workspaces = [ws for ws in workspaces if ws.folders]
+    # Re-resolve the remembered active index against the post-filter
+    # list. If the remembered workspace was dropped (its folders all
+    # vanished), default to 0 so the user lands somewhere valid.
+    initial_active_idx = 0
+    for i, ws in enumerate(workspaces):
+        if ws.name == remembered_name:
+            initial_active_idx = i
+            break
+
+    title_name = (workspaces[initial_active_idx].name
+                  if workspaces else "")
     _set_terminal_title(f"idlegit · {title_name}" if title_name else "idlegit")
     try:
-        curses.wrapper(lambda stdscr: run(stdscr, cfg))
+        curses.wrapper(
+            lambda stdscr: run(stdscr, cfg, workspaces, initial_active_idx))
     except KeyboardInterrupt:
         pass
     finally:

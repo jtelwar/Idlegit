@@ -36,17 +36,29 @@ from .geometry import (  # noqa: F401  (re-exported public API)
     SIDEBAR_W, SIDEBAR_W_NARROW, draw_modal_fill, field_visible,
     modal_geometry, safe_addstr, sidebar_geometry, truncate,
 )
+from .hints import (  # noqa: F401  (re-exported public API)
+    KEY_BACKSPACE, KEY_CTRL_R, KEY_CTRL_S, KEY_DOWN, KEY_END, KEY_ENTER,
+    KEY_ESC, KEY_HOME, KEY_LEFT, KEY_LEFT_RIGHT, KEY_RIGHT, KEY_SHIFT_TAB,
+    KEY_SPACE, KEY_TAB, KEY_UP, KEY_UP_DOWN, Hint, fit_hints,
+    render_hint, render_hints,
+)
 # Modals — each one is self-contained in ui.modals.<name>; the package
 # re-exports the public open/draw/handle trio. Imported here so callers
 # of the package don't have to know which submodule owns which modal.
 from .modals import (  # noqa: F401  (re-exported public API)
+    commit_workspace_creator,
     draw_action_menu, draw_align_heads_prompt, draw_branch_picker,
     draw_reset_prompt, draw_task_action_menu, draw_workflow_picker,
+    draw_workspace_creator, draw_workspace_menu, draw_workspaces_picker,
     handle_action_menu_key, handle_align_heads_prompt_key,
     handle_branch_picker_key, handle_reset_prompt_key,
     handle_task_action_menu_key, handle_workflow_picker_key,
+    handle_workspace_creator_key, handle_workspace_menu_key,
+    handle_workspaces_picker_key,
     open_action_menu, open_align_heads_prompt, open_branch_picker,
     open_reset_prompt, open_task_action_menu, open_workflow_picker,
+    open_workspace_creator, open_workspace_menu, open_workspaces_picker,
+    tick_creator_checks, tick_menu_path_checks,
 )
 # Right-hand task panel.
 from .sidebar import (  # noqa: F401  (re-exported public API)
@@ -57,66 +69,125 @@ from .sidebar import (  # noqa: F401  (re-exported public API)
 # ---------- Loading screen (startup only) ---------------------------------
 
 
-def refresh_all(stdscr, repos: List[Repo], name_max: int,
-                name_mode: str = DEFAULT_TRUNCATION_MODE,
-                subtrees=None,
-                header: str = "loading repos") -> None:
-    """Refresh every repo in parallel, animating a spinner while it runs.
-    Used at startup; runtime refreshes go through workers.kick_off_inline_refresh."""
-    if not repos:
-        return
-    done = [False] * len(repos)
+def refresh_all_workspaces(stdscr,
+                           workspace_repos: List[Tuple[str, List[Repo], object]],
+                           name_max: int,
+                           name_mode: str = DEFAULT_TRUNCATION_MODE,
+                           active_index: int = 0) -> None:
+    """Refresh every repo across every configured workspace in parallel,
+    rendering a grouped loading screen so the user sees all workspaces
+    at once instead of one in isolation.
 
-    def work(i: int) -> None:
-        refresh_repo_with_remote_state(repos[i])
-        done[i] = True
+    `workspace_repos` is a list of (workspace_name, repos, subtrees)
+    triples — typically built from `state.workspaces` plus a per-
+    workspace `discover_repos`. `active_index` is the workspace the
+    main UI will land in once loading completes; it gets an "(active)"
+    marker on its header row. Total work is parallel across all repos
+    in all workspaces, so a 3-workspace startup completes in roughly
+    the same wall-clock time as a single-workspace one."""
+    all_repos: List[Repo] = [r for _, repos, _ in workspace_repos
+                             for r in repos]
+    if not all_repos:
+        return
+    # Track completion by repo identity so concurrent threads can flip
+    # their own bit without coordinating on a shared index.
+    done: dict = {id(r): False for r in all_repos}
+
+    def work(r: Repo) -> None:
+        refresh_repo_with_remote_state(r)
+        done[id(r)] = True
 
     curses.curs_set(0)
-    with ThreadPoolExecutor(max_workers=len(repos)) as ex:
-        futures = [ex.submit(work, i) for i in range(len(repos))]
+    with ThreadPoolExecutor(max_workers=max(1, len(all_repos))) as ex:
+        futures = [ex.submit(work, r) for r in all_repos]
         frame = 0
         while not all(f.done() for f in futures):
-            draw_loading(stdscr, repos, done, name_max, name_mode, header,
-                         SPINNER_FRAMES[frame % len(SPINNER_FRAMES)])
+            draw_workspace_loading(
+                stdscr, workspace_repos, done, name_max, name_mode,
+                active_index, SPINNER_FRAMES[frame % len(SPINNER_FRAMES)])
             curses.napms(80)
             frame += 1
-        draw_loading(stdscr, repos, done, name_max, name_mode, header, "✓")
+        draw_workspace_loading(
+            stdscr, workspace_repos, done, name_max, name_mode,
+            active_index, "✓")
         curses.napms(120)
         for f in futures:
-            f.result()  # surface thread exceptions if any
-    link_siblings(repos, subtrees)
+            f.result()  # surface any thread exception
+    # Link siblings within each workspace independently — a submodule
+    # inside one workspace shouldn't be linked to a same-URL repo in
+    # a different workspace.
+    for _, repos, subtrees in workspace_repos:
+        link_siblings(repos, subtrees)
 
 
-def draw_loading(stdscr, repos: List[Repo], done: List[bool],
-                 name_max: int, name_mode: str,
-                 header: str, spinner: str) -> None:
+def draw_workspace_loading(stdscr,
+                           workspace_repos: List[Tuple[str, List[Repo], object]],
+                           done: dict, name_max: int, name_mode: str,
+                           active_index: int, spinner: str) -> None:
+    """Render the loading screen as one row per workspace — no expanded
+    repo lists. A workspace's row ticks ✓ once every one of its repos
+    finishes refreshing; until then the spinner glyph spins next to it.
+    The active workspace gets a bold "(active)" tag so the user can see
+    where they'll land."""
     stdscr.erase()
     h, w = stdscr.getmaxyx()
-    completed = sum(done)
-    total = len(repos)
+    n_ws = len(workspace_repos)
+    if n_ws == 0:
+        return
+
+    # Per-workspace completion: a workspace is "done" only when every
+    # one of its repos has refreshed. Empty workspaces (no repos found)
+    # are considered done immediately.
+    ws_done = []
+    for _, repos, _ in workspace_repos:
+        if not repos:
+            ws_done.append(True)
+        else:
+            ws_done.append(all(done.get(id(r), False) for r in repos))
 
     title = "idlegit"
-    summary = f"{spinner}  {header} ({completed}/{total})"
+    completed_ws = sum(1 for d in ws_done if d)
+    if n_ws == 1:
+        summary = f"{spinner}  loading workspace"
+    else:
+        summary = (f"{spinner}  loading workspaces "
+                   f"({completed_ws}/{n_ws})")
 
-    name_w = max(len(truncate(r.display_name, name_max, name_mode)) for r in repos)
-    block_h = 4 + len(repos)
+    # Layout: title (1) + spacer (1) + summary (1) + spacer (1) + N
+    # workspace rows.
+    block_h = 4 + n_ws
+    name_w = max(
+        max((len(ws_name) for ws_name, _, _ in workspace_repos), default=0),
+        len(" (active)") + 8,
+    )
     top = max(1, (h - block_h) // 2)
     cx = w // 2
+    list_left = max(0, cx - (name_w + 8) // 2)
 
     safe_addstr(stdscr, top, max(0, cx - len(title) // 2), title,
                 curses.A_BOLD | curses.color_pair(PAIR_HEADER))
     safe_addstr(stdscr, top + 2, max(0, cx - len(summary) // 2),
                 summary, curses.color_pair(PAIR_BRANCH))
 
-    list_left = max(0, cx - (name_w + 4) // 2)
-    for i, repo in enumerate(repos):
-        if done[i]:
-            mark, attr = "✓", curses.color_pair(PAIR_OK)
+    y = top + 4
+    for i, (ws_name, repos, _) in enumerate(workspace_repos):
+        is_active = (i == active_index)
+        if ws_done[i]:
+            mark, mark_attr = "✓", curses.color_pair(PAIR_OK)
         else:
-            mark, attr = "·", curses.A_DIM
-        safe_addstr(stdscr, top + 4 + i, list_left,
-                    f"  {mark}  {truncate(repo.display_name, name_max, name_mode)}",
-                    attr)
+            mark, mark_attr = spinner, curses.A_DIM
+        # Glyph + workspace name on a single line. (active) suffix in a
+        # dimmer attribute keeps the visual hierarchy: name first, then
+        # the marker tag.
+        safe_addstr(stdscr, y, list_left, f"  {mark}  ", mark_attr)
+        name_attr = (curses.color_pair(PAIR_BRANCH) | curses.A_BOLD
+                     if is_active
+                     else curses.color_pair(PAIR_BRANCH))
+        safe_addstr(stdscr, y, list_left + 5, ws_name, name_attr)
+        if is_active:
+            safe_addstr(stdscr, y, list_left + 5 + len(ws_name),
+                        " (active)", curses.A_DIM)
+        y += 1
 
     stdscr.refresh()
 
@@ -140,10 +211,10 @@ def _body_height_for(state: State, h: int) -> int:
 
 
 def _ensure_focused_visible(state: State, body_h: int, total_body: int) -> None:
-    """Adjust state.body_scroll so the focused body row is on-screen."""
-    if state.on_toggle:
-        return
-    body_idx = state.selected - 3  # 3 toggle rows precede the body
+    """Adjust state.body_scroll so the focused body row is on-screen.
+    Workspace row (selected = -1) is rendered on the title line and
+    isn't part of the body, so it doesn't move scroll."""
+    body_idx = state.selected
     if body_idx < 0 or body_idx >= total_body:
         return
     if body_idx < state.body_scroll:
@@ -151,6 +222,104 @@ def _ensure_focused_visible(state: State, body_h: int, total_body: int) -> None:
     elif body_idx >= state.body_scroll + body_h:
         state.body_scroll = body_idx - body_h + 1
     state.body_scroll = max(0, min(state.body_scroll, max(0, total_body - body_h)))
+
+
+# ---------- Main-screen hints registry -----------------------------------
+
+
+def _esc_hint(state: State) -> Hint:
+    """Esc means three different things on the main screen — pick the
+    one that's actually about to fire so the footer doesn't lie."""
+    if state.focused_panel == "tasks":
+        return Hint(KEY_ESC, "back to repos")
+    holder = _focused_message_holder(state)
+    if holder is not None and holder.message:
+        return Hint(KEY_ESC, "clear message")
+    if state.has_messages:
+        return Hint(KEY_ESC, "discard + quit")
+    return Hint(KEY_ESC, "quit")
+
+
+def _workspace_row_hints(state: State) -> List[Hint]:
+    hints = [Hint(KEY_UP_DOWN, "navigate")]
+    if len(state.workspaces) > 1:
+        hints.append(Hint(KEY_LEFT_RIGHT, "cycle workspaces"))
+    hints.append(Hint(KEY_TAB, "workspaces…"))
+    hints.append(Hint(KEY_ENTER, "settings…"))
+    return hints
+
+
+def _body_row_hints(state: State) -> List[Hint]:
+    """Hints for repo / submodule-child rows. Reflects whether the
+    focused row has an editable message field, whether suggest is
+    available, and whether Enter would actually launch the review."""
+    hints: List[Hint] = [Hint(KEY_UP_DOWN, "navigate")]
+    holder = _focused_message_holder(state)
+    cur_repo = state.current_repo
+    cur_child = state.current_child
+
+    # Tab opens the per-row action menu for repos and submodule
+    # children; a subtree child has no actions menu, so we omit it.
+    if cur_repo is not None or (cur_child is not None
+                                and cur_child[1].kind == "submodule"):
+        hints.append(Hint(KEY_TAB, "actions…"))
+
+    if holder is not None:
+        # Editable row: typing edits the message inline. Surface
+        # "Enter commit + push" only when there's something to commit
+        # so the user isn't promised an action that won't run.
+        if not holder.message:
+            hints.append(Hint(KEY_LEFT, "suggest"))
+            hints.append(Hint(f"Shift+{KEY_LEFT}", "suggest all"))
+        if state.has_messages:
+            hints.append(Hint(KEY_ENTER, "review + commit"))
+    else:
+        # Subtree row or otherwise non-editable. Enter still triggers
+        # review iff some other row already carries a message.
+        if state.has_messages:
+            hints.append(Hint(KEY_ENTER, "review + commit"))
+
+    return hints
+
+
+def _task_panel_hints(state: State) -> List[Hint]:
+    items = state.tasks.snapshot()
+    n = len(items)
+    hints: List[Hint] = []
+    if n > 0:
+        hints.append(Hint(KEY_UP_DOWN, "navigate"))
+        hints.append(Hint(KEY_TAB, "task detail…"))
+        if 0 <= state.task_selected < n:
+            t = items[state.task_selected]
+            if t.status != "running":
+                hints.append(Hint(KEY_ENTER, "remove task"))
+    return hints
+
+
+def _main_hints_primary(state: State) -> List[Hint]:
+    """First footer line — context-specific. Picks the hint set for
+    whichever zone of the main UI currently has focus. The toggle
+    row is gone now — every body index lands on a repo / child."""
+    if state.focused_panel == "tasks":
+        return _task_panel_hints(state)
+    if state.on_workspace_row:
+        return _workspace_row_hints(state)
+    return _body_row_hints(state)
+
+
+def _main_hints_global(state: State) -> List[Hint]:
+    """Second footer line — always-applicable shortcuts. Shift+Tab,
+    Ctrl+R / Ctrl+S, and the context-aware Esc, in that order."""
+    if state.focused_panel == "tasks":
+        panel_hint = Hint(KEY_SHIFT_TAB, "back to repos")
+    else:
+        panel_hint = Hint(KEY_SHIFT_TAB, "tasks panel")
+    return [
+        panel_hint,
+        Hint(KEY_CTRL_R, "refresh"),
+        Hint(KEY_CTRL_S, "smart-sync"),
+        _esc_hint(state),
+    ]
 
 
 def draw_main(stdscr, state: State) -> None:
@@ -171,8 +340,23 @@ def draw_main(stdscr, state: State) -> None:
                 curses.A_BOLD | curses.color_pair(PAIR_HEADER))
     if state.workspace_name:
         safe_addstr(stdscr, 0, len("idlegit"), " · ", curses.A_DIM)
-        safe_addstr(stdscr, 0, len("idlegit") + 3, state.workspace_name,
-                    curses.A_BOLD | curses.color_pair(PAIR_BRANCH))
+        # Workspace selector. When the title row has focus the name is
+        # wrapped in muted chevrons (advertising ←/→ as cycle keys; the
+        # same "‹ X ›" convention used by the then-run line). The
+        # chevrons stay dim so the workspace name itself reads as the
+        # primary content; with a single workspace they're cosmetic
+        # (cycling is a no-op) but the visual cue still tells the user
+        # "this row is focused".
+        ws_focused = state.on_workspace_row
+        x = len("idlegit") + 3
+        if ws_focused:
+            safe_addstr(stdscr, 0, x, "‹ ", curses.A_DIM)
+            x += 2
+        ws_attr = curses.A_BOLD | curses.color_pair(PAIR_BRANCH)
+        safe_addstr(stdscr, 0, x, state.workspace_name, ws_attr)
+        x += len(state.workspace_name)
+        if ws_focused:
+            safe_addstr(stdscr, 0, x, " ›", curses.A_DIM)
 
     toggle_y = 2
     # "Repositories" header on the left of the toggles row, mirroring
@@ -187,22 +371,18 @@ def draw_main(stdscr, state: State) -> None:
         else curses.A_DIM | curses.A_BOLD)
     safe_addstr(stdscr, toggle_y, 2, "Repositories", repos_header_attr)
 
-    # Right-align the toggles inside the main panel so they sit just
-    # left of the sidebar boundary, above the commit-message column.
-    # Three toggles: auto-stage / auto-push / align-heads. Each `draw_toggle`
-    # writes "[x] label" so we budget label+4 cells per toggle plus a 2-cell
-    # gap between them.
-    toggles_w = (4 + 10) + 2 + (4 + 9) + 2 + (4 + 11)  # auto-stage + auto-push + align-heads
-    panel_right = sidebar_x if sidebar_w > 0 else main_w
-    toggles_x = max(2 + len("Repositories") + 4, panel_right - toggles_w - 2)
-    draw_toggle(stdscr, toggle_y, toggles_x, "auto-stage", state.auto_stage,
-                state.selected == 0)
-    draw_toggle(stdscr, toggle_y, toggles_x + 16, "auto-push", state.auto_push,
-                state.selected == 1)
-    draw_toggle(stdscr, toggle_y, toggles_x + 31, "align-heads",
-                state.align_heads, state.selected == 2)
+    # The three commit/sync toggles that used to live on this row
+    # (auto-stage, auto-push, align-heads) moved into the workspace
+    # menu's COMMIT and SMART-SYNC sections — the main panel just
+    # displays the "Repositories" header here now.
 
     nm = state.name_display_max
+    # Children share the parent's name cap by default (-1 sentinel);
+    # a positive value lets the user truncate submodule + subtree
+    # rows tighter without affecting parent rows.
+    cnm = state.child_name_display_max
+    if cnm < 0:
+        cnm = nm
     bm = state.branch_display_max
     nmode = state.name_truncation
     bmode = state.branch_truncation
@@ -219,7 +399,7 @@ def draw_main(stdscr, state: State) -> None:
     for parent in state.repos:
         for ch in parent.children:
             name_lengths.append(
-                4 + len(truncate(ch.repo.display_name, nm, nmode)))
+                4 + len(truncate(ch.repo.display_name, cnm, nmode)))
             if ch.branch:
                 branch_lengths.append(
                     len(f"[{truncate(ch.branch, bm, bmode)}]"))
@@ -230,7 +410,7 @@ def draw_main(stdscr, state: State) -> None:
     field_w = max(20, main_w - field_x - 2)
 
     base_y = 4
-    body_rows = state.selectable_rows()[3:]  # drop the 3 toggle rows
+    body_rows = state.selectable_rows()
     _ensure_focused_visible(state, body_h, len(body_rows))
     visible_start = state.body_scroll
     visible_end = min(len(body_rows), visible_start + body_h)
@@ -241,8 +421,7 @@ def draw_main(stdscr, state: State) -> None:
         row = body_rows[body_idx]
         y = base_y + screen_i
         y_for_body[body_idx] = y
-        full_idx = body_idx + 3  # 3 toggle rows precede body indices in selectable_rows
-        focused = (state.selected == full_idx)
+        focused = (state.selected == body_idx)
         if row[0] == "repo":
             row_cursor = state.field_cursor if focused else 0
             draw_repo_row(stdscr, y, row[1], focused,
@@ -252,7 +431,7 @@ def draw_main(stdscr, state: State) -> None:
             row_cursor = state.field_cursor if focused else 0
             draw_child_row(stdscr, y, row[2], focused,
                            name_w, branch_w, field_x, field_w,
-                           nm, bm, nmode, bmode,
+                           cnm, bm, nmode, bmode,
                            row_cursor, spinner_char)
 
     if visible_start > 0:
@@ -263,26 +442,23 @@ def draw_main(stdscr, state: State) -> None:
         safe_addstr(stdscr, base_y + body_h, 2,
                     f"↓ {below} more below", curses.A_DIM)
 
-    # Subtle focus marker at column 0 of the active row. Toggles share a
-    # row so we mark it whenever any of the three toggles is selected;
-    # for body rows we use the cached y from the render loop above.
+    # Subtle focus marker at column 0 of the active body row. Skipped
+    # on the workspace row (selected = -1) since the chevrons around
+    # the workspace name already advertise focus and an extra glyph at
+    # column 0 would clobber the "i" of "idlegit".
     focus_y: Optional[int] = None
-    if state.selected < 3:
-        focus_y = toggle_y
-    else:
-        body_idx = state.selected - 3  # 3 toggle rows precede the body
-        focus_y = y_for_body.get(body_idx)
+    if state.selected >= 0:
+        focus_y = y_for_body.get(state.selected)
     if focus_y is not None:
         safe_addstr(stdscr, focus_y, 0, "›",
                     curses.color_pair(PAIR_BRANCH) | curses.A_BOLD)
 
     hint_y = base_y + body_h + 1
-    safe_addstr(stdscr, hint_y, 2,
-                "↑/↓ navigate · Tab menu · Shift+Tab → tasks · Left/Shift+Left suggest · Enter review",
-                curses.A_DIM)
-    safe_addstr(stdscr, hint_y + 1, 2,
-                "Space toggles · Ctrl+R refresh · Ctrl+S smart-sync · Esc clears / back / quits",
-                curses.A_DIM)
+    hint_max_w = max(0, main_w - 4)
+    render_hints(stdscr, hint_y, 2, hint_max_w,
+                 _main_hints_primary(state), attr=curses.A_DIM)
+    render_hints(stdscr, hint_y + 1, 2, hint_max_w,
+                 _main_hints_global(state), attr=curses.A_DIM)
     draw_state_legend(stdscr, hint_y + 2, 2)
 
     modal_active = (state.action_menu is not None
@@ -290,7 +466,10 @@ def draw_main(stdscr, state: State) -> None:
                     or state.reset_prompt is not None
                     or state.workflow_picker is not None
                     or state.align_heads_prompt is not None
-                    or state.task_action_menu is not None)
+                    or state.task_action_menu is not None
+                    or state.workspace_menu is not None
+                    or state.workspaces_picker is not None
+                    or state.workspace_creator is not None)
     if state.action_menu is not None:
         draw_action_menu(stdscr, state, sidebar_x)
     if state.branch_picker is not None:
@@ -303,6 +482,14 @@ def draw_main(stdscr, state: State) -> None:
         draw_align_heads_prompt(stdscr, state, sidebar_x)
     if state.task_action_menu is not None:
         draw_task_action_menu(stdscr, state, sidebar_x)
+    if state.workspace_menu is not None:
+        draw_workspace_menu(stdscr, state, sidebar_x)
+    # Picker drawn before creator so the creator (when both are open)
+    # paints on top — common during the "Create new workspace" flow.
+    if state.workspaces_picker is not None:
+        draw_workspaces_picker(stdscr, state, sidebar_x)
+    if state.workspace_creator is not None:
+        draw_workspace_creator(stdscr, state, sidebar_x)
 
     # Sidebar drawn LAST so it's always the freshest paint on screen —
     # avoids the resize artifacts where stale cells from the old layout
@@ -311,8 +498,8 @@ def draw_main(stdscr, state: State) -> None:
         draw_sidebar(stdscr, state, sidebar_x, sidebar_w)
 
     cursor_set = False
-    if not modal_active and not state.on_toggle:
-        body_idx = state.selected - 3  # 3 toggle rows precede the body
+    if not modal_active and state.selected >= 0:
+        body_idx = state.selected
         if 0 <= body_idx < len(body_rows) and body_idx in y_for_body:
             row = body_rows[body_idx]
             target = None
@@ -361,15 +548,6 @@ def draw_state_legend(stdscr, y: int, x: int) -> None:
         safe_addstr(stdscr, y, cur, "●", attr)
         safe_addstr(stdscr, y, cur + 2, label, curses.A_DIM)
         cur += 2 + len(label) + 2
-
-
-def draw_toggle(stdscr, y: int, x: int, label: str, value: bool, focused: bool) -> None:
-    box = "[x]" if value else "[ ]"
-    pair = PAIR_TOGGLE_ON if value else PAIR_TOGGLE_OFF
-    attr = curses.color_pair(pair)
-    if focused:
-        attr |= curses.A_REVERSE
-    safe_addstr(stdscr, y, x, f"{box} {label}", attr)
 
 
 def draw_repo_row(stdscr, y: int, repo: Repo, focused: bool,
@@ -726,6 +904,41 @@ def cycle_then_run(selector: ThenRunSelector, direction: int) -> None:
     _then_run_set(selector, wheel[i])
 
 
+def _confirm_hints(candidates: List[LFSCandidate],
+                   wf_toggles: List[WorkflowToggle],
+                   then_run_items: List[ThenRunSelector],
+                   cursor: int) -> List[Hint]:
+    """Hints for the review screen. Reflects which kind of focusable
+    row the cursor is on — LFS candidate rows take Space to toggle
+    LFS-tracking, workflow rows take Space to toggle action-tracking,
+    then-run rows take ←/→ to cycle the chained workflow target. With
+    no focusables, ↑/↓ scrolls the body."""
+    n_cands = len(candidates)
+    n_toggles = len(wf_toggles)
+    hints: List[Hint] = []
+    if cursor < 0:
+        hints.append(Hint(KEY_UP_DOWN, "scroll"))
+        hints.append(Hint(KEY_ENTER, "execute commits"))
+        hints.append(Hint(KEY_ESC, "back"))
+        return hints
+    hints.append(Hint(KEY_UP_DOWN, "select"))
+    if cursor < n_cands:
+        cand = candidates[cursor]
+        hints.append(Hint(KEY_SPACE,
+                          "stop tracking" if cand.track else "track with LFS"))
+    elif cursor < n_cands + n_toggles:
+        tog = wf_toggles[cursor - n_cands]
+        on = tog.repo.track_workflow.get(tog.workflow_name, False)
+        hints.append(Hint(KEY_SPACE,
+                          "untrack workflow" if on else "track workflow"))
+    else:
+        # then-run selector
+        hints.append(Hint(KEY_LEFT_RIGHT, "cycle then-run target"))
+    hints.append(Hint(KEY_ENTER, "execute commits"))
+    hints.append(Hint(KEY_ESC, "back"))
+    return hints
+
+
 def draw_confirm(stdscr,
                  lines: List[Tuple[str, int]],
                  candidates: List[LFSCandidate],
@@ -778,12 +991,11 @@ def draw_confirm(stdscr,
         safe_addstr(stdscr, h - 2, 0,
                     f"({scroll}/{max_scroll} lines scrolled)", curses.A_DIM)
 
-    if candidates or wf_toggles or then_run_items:
-        hint = ("↑/↓ select · Space toggle · ←/→ then-run · "
-                "Enter execute · Esc back")
-    else:
-        hint = "Enter execute · Esc back · ↑/↓ scroll"
-    safe_addstr(stdscr, h - 1, 0, hint, curses.A_DIM)
+    _, term_w = stdscr.getmaxyx()
+    render_hints(stdscr, h - 1, 0, max(0, term_w - 1),
+                 _confirm_hints(candidates, wf_toggles, then_run_items,
+                                cursor),
+                 attr=curses.A_DIM)
 
     curses.curs_set(0)
     stdscr.refresh()
@@ -796,8 +1008,9 @@ def draw_confirm(stdscr,
 
 def _focused_message_holder(state: State):
     """Return the Repo or ChildRef whose message field is currently
-    editable, or None for toggle / subtree rows."""
-    if state.on_toggle:
+    editable, or None for the workspace row, subtree rows, or any
+    other non-editable focus."""
+    if state.on_workspace_row:
         return None
     if state.current_repo is not None:
         return state.current_repo
@@ -883,6 +1096,24 @@ def handle_task_panel_key(state: State, key: int) -> Optional[str]:
     return None
 
 
+def _cycle_workspace(state: State, direction: int) -> Optional[str]:
+    """Cycle the active workspace by `direction` (+1 / -1) and trigger
+    the synchronous discover + apply-overrides + async-refresh switch.
+    Returns "switch-workspace" so the main loop can re-derive the OSC
+    terminal title; returns None when there are fewer than two
+    workspaces (cycling would be a no-op)."""
+    if len(state.workspaces) < 2:
+        return None
+    n = len(state.workspaces)
+    new_idx = (state.active_workspace_index + direction) % n
+    # Imported lazily — workers depends on git_ops which is fine at
+    # module load, but keeping the import local mirrors how other key
+    # handlers in this file pull worker entry points on demand.
+    from workers import switch_workspace
+    switch_workspace(state, new_idx)
+    return "switch-workspace"
+
+
 def handle_main_key(state: State, key: int) -> Optional[str]:
     if key == curses.KEY_RESIZE:
         return None
@@ -904,8 +1135,42 @@ def handle_main_key(state: State, key: int) -> Optional[str]:
     if key == 19:  # Ctrl+S — fetch + checkout every tracked sibling
         return "sync"
 
+    # Workspace title-row navigation. `selected = -1` is a sentinel for
+    # "the workspace selector on the title row"; Up from the top body
+    # row lands here, Down from here returns to the first body row.
+    # ←/→ cycles workspaces; Space/Enter opens the workspace-overrides
+    # modal.
+    if state.on_workspace_row:
+        if key == curses.KEY_UP:
+            # Wrap to the bottom of the body (preserves the existing
+            # "Up from the top wraps to the last row" feel).
+            state.selected = max(-1, state.total_rows - 1)
+            _reset_field_cursor(state)
+            return None
+        if key == curses.KEY_DOWN:
+            state.selected = 0
+            _reset_field_cursor(state)
+            return None
+        if key == curses.KEY_LEFT:
+            return _cycle_workspace(state, -1)
+        if key == curses.KEY_RIGHT:
+            return _cycle_workspace(state, +1)
+        if key == 9:  # Tab — opens the workspaces picker
+            open_workspaces_picker(state)
+            return None
+        if key in (ord(" "), 10, 13, curses.KEY_ENTER):
+            open_workspace_menu(state)
+            return None
+        if key == 27:
+            return "confirm-quit" if state.has_messages else "quit"
+        return None
+
     if key == curses.KEY_UP:
-        state.selected = (state.selected - 1) % state.total_rows
+        if state.selected == 0:
+            # Up from the first body row lands on the workspace row.
+            state.selected = -1
+        else:
+            state.selected = (state.selected - 1) % state.total_rows
         _reset_field_cursor(state)
         return None
     if key == curses.KEY_DOWN:
@@ -914,14 +1179,6 @@ def handle_main_key(state: State, key: int) -> Optional[str]:
         return None
 
     if key in (10, 13, curses.KEY_ENTER):
-        if state.on_toggle:
-            if state.selected == 0:
-                state.auto_stage = not state.auto_stage
-            elif state.selected == 1:
-                state.auto_push = not state.auto_push
-            else:
-                state.align_heads = not state.align_heads
-            return None
         if state.has_messages:
             return "confirm"
         return None
@@ -933,23 +1190,11 @@ def handle_main_key(state: State, key: int) -> Optional[str]:
     target_message_holder = _focused_message_holder(state)
 
     if key == 27:
-        if state.on_toggle:
-            return "confirm-quit" if state.has_messages else "quit"
         if target_message_holder is not None and target_message_holder.message:
             target_message_holder.message = ""
             state.field_cursor = 0
             return None
         return "confirm-quit" if state.has_messages else "quit"
-
-    if state.on_toggle:
-        if key == ord(" "):
-            if state.selected == 0:
-                state.auto_stage = not state.auto_stage
-            elif state.selected == 1:
-                state.auto_push = not state.auto_push
-            else:
-                state.align_heads = not state.align_heads
-        return None
 
     if target_message_holder is None:
         return None  # subtree row or otherwise non-editable

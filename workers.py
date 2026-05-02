@@ -17,7 +17,7 @@ from git_ops import (
     apply_lfs_tracking, discover_repos, dispatch_workflow, first_line,
     get_run_view, gh_available, git, link_siblings, list_branches,
     list_recent_runs, merge_remote_workflow_states, parse_github_slug,
-    refresh_repo, signature_mtime, suggest_commit_message,
+    refresh_repo, safe_stage_all, signature_mtime, suggest_commit_message,
     suggest_commit_message_at, sync_sibling, sync_subtree,
     working_tree_signature,
 )
@@ -447,10 +447,21 @@ def kick_off_action(state: State, action_id: str, *,
                 "" if rc == 0 else first_line(err))
         elif action_id == "switch_branch":
             t = state.tasks.add(f"{target_label}: checkout {branch_arg}")
-            rc, _, err = git(target_path, ["checkout", branch_arg])
-            state.tasks.update(
-                t, "ok" if rc == 0 else "fail",
-                "" if rc == 0 else first_line(err))
+            # Refuse the switch if HEAD has commits not on the chosen
+            # branch — git would otherwise silently orphan them and
+            # files unique to those commits would vanish from WT.
+            # The user picked the branch via the menu, but they may
+            # not realise their HEAD is detached with unpushed work.
+            if not _head_is_ancestor_of(target_path, branch_arg):
+                state.tasks.update(
+                    t, "warn",
+                    f"HEAD has commits not on {branch_arg} — would orphan "
+                    "them; manual: `git checkout -b <name>` to keep them")
+            else:
+                rc, _, err = git(target_path, ["checkout", branch_arg])
+                state.tasks.update(
+                    t, "ok" if rc == 0 else "fail",
+                    "" if rc == 0 else first_line(err))
         else:
             return  # unknown action — nothing to do
 
@@ -546,11 +557,28 @@ def commit_worker(state: State, repo: Repo, msg: str,
         tasks.update(t, "warn", "merge in progress")
         return
 
+    # Refuse the whole pipeline when the repo is on a detached HEAD.
+    # Committing on a detached HEAD silently creates an orphan commit;
+    # pushing it then tries `git push --set-upstream origin "(detached)"`
+    # (the sentinel string from refresh_repo) and fails with `error:
+    # src refspec (detached) does not match`. Mirrors the same guard
+    # commit_worker_for_child has had since the start. The user resolves
+    # via the action menu's "switch branch…" item — that path is
+    # already cardinal-rule safe (it refuses if HEAD has commits not on
+    # the chosen branch).
+    rc, branch_out, _ = git(repo.path, ["branch", "--show-current"])
+    if rc != 0 or not branch_out.strip():
+        t = tasks.add(f"{name}: cannot commit")
+        tasks.update(t, "fail",
+                     "detached HEAD — switch to a branch first via the "
+                     "action menu's \"switch branch…\" item")
+        return
+
     if auto_stage:
-        t = tasks.add(f"{name}: git add -A")
-        rc, _, err = git(repo.path, ["add", "-A"])
-        if rc != 0:
-            tasks.update(t, "fail", first_line(err))
+        t = tasks.add(f"{name}: stage all")
+        ok, stage_err = safe_stage_all(repo.path)
+        if not ok:
+            tasks.update(t, "fail", stage_err)
             return
         tasks.update(t, "ok")
 
@@ -635,10 +663,10 @@ def commit_worker_for_child(state: State, parent: Repo, ref: ChildRef,
         return
 
     if auto_stage:
-        t = tasks.add(f"{name}: git add -A")
-        rc, _, err = git(ref.nested_path, ["add", "-A"])
-        if rc != 0:
-            tasks.update(t, "fail", first_line(err))
+        t = tasks.add(f"{name}: stage all")
+        ok, stage_err = safe_stage_all(ref.nested_path)
+        if not ok:
+            tasks.update(t, "fail", stage_err)
             return
         tasks.update(t, "ok")
 
@@ -843,9 +871,9 @@ def _commit_dirty_winner(state: State, winner: SmartSyncCheckout,
     is local-only and reversible via `git reset --soft HEAD~1`, so this
     step is non-destructive even if the subsequent push fails."""
     t = state.tasks.add(f"  ↳ align {name}: stage at {winner.label}")
-    rc, _, err = git(winner.path, ["add", "-A"])
-    if rc != 0:
-        state.tasks.update(t, "fail", first_line(err))
+    ok, stage_err = safe_stage_all(winner.path)
+    if not ok:
+        state.tasks.update(t, "fail", stage_err)
         return False
     state.tasks.update(t, "ok")
 
@@ -882,6 +910,23 @@ def _push_winner(state: State, winner: SmartSyncCheckout,
     return True
 
 
+def _head_is_ancestor_of(path: Path, ref: str) -> bool:
+    """True if HEAD is fully contained in `ref`'s history — i.e. `git
+    checkout <ref>` would advance HEAD without orphaning any commits.
+
+    This is the safety check smart-sync uses before any plain checkout
+    from a detached HEAD. Git's own behaviour when leaving a detached
+    HEAD with unique commits is to print a stderr warning + return 0,
+    which means rc-only callers (us, until now) blow past it and the
+    file content unique to those orphaned commits disappears from the
+    working tree. Returns False on any error (missing ref, malformed
+    HEAD, …) so callers default to "refuse to proceed"."""
+    rc, _, _ = git(path, [
+        "merge-base", "--is-ancestor", "HEAD", ref,
+    ])
+    return rc == 0
+
+
 def _switch_to_branch(state: State, c: SmartSyncCheckout,
                       branch: str, name: str) -> bool:
     """Move a checkout onto a named branch. Git refuses if the WT has
@@ -891,6 +936,299 @@ def _switch_to_branch(state: State, c: SmartSyncCheckout,
     if rc != 0:
         state.tasks.update(t, "fail", first_line(err))
         return False
+    state.tasks.update(t, "ok")
+    return True
+
+
+# Status XY codes the redundant-dirty check is willing to reason about.
+# Each one is "the working-tree byte content is what we want to compare
+# against the target's blob" — every member is safe to handle by
+# hashing the WT path directly:
+#   ' M' — WT modified (not staged)
+#   'M ' — staged modified (WT == index, both differ from HEAD)
+#   'MM' — staged AND further-modified in WT
+#   'A ' — newly added in index (WT == index, file is new)
+#   'AM' — added in index, then modified in WT
+#   '??' — untracked file
+# Renames, copies, and deletes are deliberately excluded — those cases
+# need different reasoning (deletion implies the file SHOULDN'T exist
+# in target; rename implies a path mapping). The fallback warn-skips
+# them rather than risk a stash-and-drop that loses the user's intent.
+_REDUNDANT_DIRTY_STATUS_CODES = frozenset({
+    " M", "??", "M ", "MM", "A ", "AM",
+})
+
+
+def _verify_dirty_matches_target(c: SmartSyncCheckout,
+                                 target_ref: str) -> Optional[bool]:
+    """Hash every dirty path's working-tree content and compare to the
+    same path's blob in `target_ref`. Returns True when every dirty
+    path is bit-identical to the target's version (the change is
+    "redundant" — what the user typed is already what's about to be
+    installed by FF / checkout, so it's safe to stash → operate →
+    drop), False when any path diverges (a real conflict), and None
+    on infrastructure error. Conservative on weird status shapes —
+    deletes, renames, and quoted paths short-circuit to False so the
+    caller warn-skips rather than risks losing state. The caller
+    never sees the False vs None split — it just means "don't take
+    the redundant-dirty fast path"."""
+    rc, status_out, _ = git(c.path, ["status", "--porcelain=v1"])
+    if rc != 0:
+        return None
+    if not status_out.strip():
+        return None  # not dirty; caller's failure must be something else
+
+    dirty: List[Tuple[str, str]] = []
+    for line in status_out.splitlines():
+        if len(line) < 3:
+            continue
+        xy = line[:2]
+        rest = line[3:]
+        if xy not in _REDUNDANT_DIRTY_STATUS_CODES:
+            return False
+        if " -> " in rest:
+            return False
+        if rest.startswith('"'):
+            return False
+        dirty.append((xy, rest))
+
+    if not dirty:
+        return None
+
+    for _, path_str in dirty:
+        rc, lt_out, _ = git(c.path, ["ls-tree", target_ref, "--", path_str])
+        if rc != 0 or not lt_out.strip():
+            # Path absent in target — for a fresh "added" status this
+            # means the winner didn't push the file, so dropping the
+            # stash would lose the user's new file. For a modified
+            # status it means the path was deleted upstream, also a
+            # genuine divergence. Either way, not safe.
+            return False
+        head, _, _ = lt_out.partition("\t")
+        parts = head.split()
+        if len(parts) < 3 or parts[1] != "blob":
+            return False
+        target_hash = parts[2]
+        rc, ho_out, _ = git(c.path, ["hash-object", "--", path_str])
+        if rc != 0:
+            return False
+        if ho_out.strip() != target_hash:
+            return False
+    return True
+
+
+def _post_merge_clean(path: Path) -> bool:
+    """True if the working tree is fully clean — i.e. `git status
+    --porcelain=v1` produces no output. Used as the safety gate before
+    any `git stash drop` in smart-sync: if anything is unexpectedly
+    dirty after a merge / checkout that was supposed to consolidate
+    everything, we leave the stash on the stash list so the user's
+    content is recoverable instead of silently discarded."""
+    rc, status_out, _ = git(path, ["status", "--porcelain=v1"])
+    return rc == 0 and not status_out.strip()
+
+
+def _try_ff_through_redundant_dirty(state: State, c: SmartSyncCheckout,
+                                    winner_branch: str,
+                                    name: str) -> Optional[bool]:
+    """Best-effort fast-forward for the case where the loser is dirty
+    with content that's bit-identical to what's about to land via FF
+    (a common pattern when multiple sub-module checkouts received the
+    same edit before smart-sync ran). Stash → merge, with safety nets
+    on every step:
+
+      - The pre-condition `_verify_dirty_matches_target` proves every
+        dirty path is bit-identical to target_ref.
+      - `merge --ff-only` itself refuses to orphan commits (FF-only
+        won't run if HEAD has commits not on target_ref).
+      - On post-merge cleanliness failure, the stash is left on the
+        list so the user can recover via `git stash list`.
+
+    Cardinal rule: idlegit NEVER calls `git stash drop` on the user's
+    behalf. Even on a successful merge where the stash content is now
+    redundant with HEAD (we verified bit-equality before stashing),
+    the stash entry is left on the list — pruning is the user's call,
+    via `git stash list` / `git stash drop`. The cost is one stash
+    entry per redundant-dirty alignment; the benefit is that no idlegit
+    code path can ever delete content a user expected to keep.
+
+    Returns True/False/None where False means "let the caller warn-
+    skip" and None means infrastructure error (same calling contract)."""
+    target_ref = f"origin/{winner_branch}"
+    matches = _verify_dirty_matches_target(c, target_ref)
+    if matches is not True:
+        return matches
+
+    stash_msg = "idlegit smart-sync: redundant dirty changes"
+    rc, _, _ = git(c.path, [
+        "stash", "push", "--include-untracked", "-m", stash_msg,
+    ])
+    if rc != 0:
+        return False
+
+    rc, _, _ = git(c.path, ["merge", "--ff-only", target_ref])
+    if rc != 0:
+        git(c.path, ["stash", "pop"])
+        return False
+
+    if not _post_merge_clean(c.path):
+        # Something didn't reconcile the way verification predicted.
+        # Leave the stash on the list — the user's content is fully
+        # preserved there, recoverable via `git stash list`. Surface
+        # this in the task panel so the user sees that there's
+        # recoverable state and where to find it.
+        kept = state.tasks.add(f"  ↳ align {name}: stash kept on {c.label}")
+        state.tasks.update(
+            kept, "warn",
+            "post-merge WT not clean — recover via `git stash list`")
+        return False
+
+    # Successful merge. Stash is intentionally NOT dropped (cardinal
+    # rule). Surface the kept stash so the user knows where the
+    # redundant-dirty content is parked and can prune at leisure.
+    kept = state.tasks.add(f"  ↳ align {name}: stash kept on {c.label}")
+    state.tasks.update(
+        kept, "ok",
+        "redundant dirty preserved — prune via `git stash drop`")
+    return True
+
+
+def _try_detached_checkout_through_redundant_dirty(
+        state: State, c: SmartSyncCheckout,
+        winner_branch: str, name: str) -> Optional[bool]:
+    """Sibling of `_try_ff_through_redundant_dirty` for the detached-
+    loser case. After a winner pushes, detached losers need a `git
+    checkout origin/<branch>` to land them on the new commit; if their
+    WT carries the same edit that the winner just published, that
+    checkout would otherwise refuse with "would be overwritten." This
+    helper verifies bit-equality against `origin/<branch>`, then does
+    stash → checkout with the same safety nets as the FF path:
+
+      - Pre-condition: `_verify_dirty_matches_target` confirms every
+        dirty path is bit-identical to target_ref.
+      - Ancestor check: HEAD must be in target_ref's history so the
+        checkout doesn't orphan unique commits.
+      - Post-condition: `_post_merge_clean` confirms WT is fully clean,
+        otherwise the stash stays on the list.
+
+    Cardinal rule: as in the FF sibling, idlegit NEVER calls `git stash
+    drop` — the stash is preserved on every code path so no content can
+    be lost to a wrong post-condition prediction."""
+    target_ref = f"origin/{winner_branch}"
+    matches = _verify_dirty_matches_target(c, target_ref)
+    if matches is not True:
+        return matches
+
+    if not _head_is_ancestor_of(c.path, target_ref):
+        # HEAD has commits not on target_ref — switching would orphan
+        # them; refuse rather than risk losing files unique to those
+        # commits.
+        return False
+
+    stash_msg = "idlegit smart-sync: redundant dirty changes"
+    rc, _, _ = git(c.path, [
+        "stash", "push", "--include-untracked", "-m", stash_msg,
+    ])
+    if rc != 0:
+        return False
+
+    rc, _, _ = git(c.path, ["checkout", target_ref])
+    if rc != 0:
+        git(c.path, ["stash", "pop"])
+        return False
+
+    if not _post_merge_clean(c.path):
+        kept = state.tasks.add(f"  ↳ align {name}: stash kept on {c.label}")
+        state.tasks.update(
+            kept, "warn",
+            "post-checkout WT not clean — recover via `git stash list`")
+        return False
+
+    # Successful checkout. Stash is intentionally NOT dropped.
+    kept = state.tasks.add(f"  ↳ align {name}: stash kept on {c.label}")
+    state.tasks.update(
+        kept, "ok",
+        "redundant dirty preserved — prune via `git stash drop`")
+    return True
+
+
+def _stash_switch_pop_winner(state: State, winner: SmartSyncCheckout,
+                             branch: str, name: str) -> bool:
+    """Switch a detached winner onto `branch` BEFORE committing its
+    dirty content — committing first would create an orphan commit
+    that the subsequent checkout would silently leave behind, and the
+    push step would then push an empty change to the chosen branch.
+
+    Plain `git checkout <branch>` works when the WT is clean OR when
+    the chosen branch's tree happens to match the detached HEAD's
+    tree for every dirty path. When git refuses ("would be overwritten
+    by checkout"), we fall back to stash → checkout → pop so the
+    user's edits get carried onto the new branch and end up included
+    in the subsequent commit. Stash content is preserved on every
+    failure path — pop conflicts in particular leave the stash on the
+    stash list, so the user can recover with `git stash pop` manually."""
+    t = state.tasks.add(
+        f"  ↳ align {name}: switch {winner.label} → {branch}")
+
+    # Refuse to switch if HEAD has commits that aren't on `branch` —
+    # git would silently orphan them (rc=0 with a stderr warning)
+    # and any files unique to those commits would vanish from the
+    # working tree because the new branch's tree replaces them. The
+    # user has to deal with this manually (e.g. by creating a branch
+    # at HEAD first, or merging into the target branch). This guard
+    # is the reason your file got deleted last time, so we treat it
+    # as an absolute red line.
+    if not _head_is_ancestor_of(winner.path, branch):
+        state.tasks.update(
+            t, "warn",
+            f"{winner.label}: detached HEAD has commits not on {branch} "
+            "— would orphan them; manual: `git checkout -b <name>` to keep them")
+        return False
+
+    rc, _, err = git(winner.path, ["checkout", branch])
+    if rc == 0:
+        state.tasks.update(t, "ok")
+        return True
+    initial_err = first_line(err)
+
+    # Dirty WT blocked the plain checkout. Stash it so checkout has a
+    # clean tree to land on, then pop the diffs back on top of the
+    # branch. `git stash pop` preserves the stash on conflict, so the
+    # user never loses their changes.
+    rc, _, _ = git(winner.path, [
+        "stash", "push", "--include-untracked",
+        "-m", "idlegit smart-sync: align detached winner",
+    ])
+    if rc != 0:
+        state.tasks.update(t, "fail", initial_err)
+        return False
+
+    rc, _, err = git(winner.path, ["checkout", branch])
+    if rc != 0:
+        git(winner.path, ["stash", "pop"])  # restore on bail
+        state.tasks.update(t, "fail",
+                           f"checkout {branch}: {first_line(err)}")
+        return False
+
+    rc, _, err = git(winner.path, ["stash", "pop"])
+    if rc != 0:
+        # Pop conflicted. Git's behaviour: the stash entry is preserved
+        # on the stash list AND the conflicted three-way merge is left
+        # in the working tree (with conflict markers in the affected
+        # files). Cardinal rule: idlegit MUST NOT run `git reset --hard`
+        # to "tidy up" the WT here — even though the conflicted state
+        # is in some sense "garbage" that we know is reproducible from
+        # the stash, throwing it away on the user's behalf is exactly
+        # the class of destructive op that has cost real files in the
+        # past. The user resolves the conflicts manually, and if they
+        # want a clean WT instead, they run `git reset --hard` themself
+        # knowing the stash is recoverable.
+        state.tasks.update(
+            t, "fail",
+            f"stash pop on {branch} conflicted — resolve conflict markers "
+            "in WT, or `git reset --hard HEAD` then `git stash pop`")
+        return False
+
     state.tasks.update(t, "ok")
     return True
 
@@ -909,29 +1247,82 @@ def _align_loser_ff(state: State, c: SmartSyncCheckout,
         return False
     rc, _, err = git(
         c.path, ["merge", "--ff-only", f"origin/{winner_branch}"])
-    if rc != 0:
-        state.tasks.update(t, "warn", first_line(err))
-        return False
-    state.tasks.update(t, "ok")
-    return True
+    if rc == 0:
+        state.tasks.update(t, "ok")
+        return True
+
+    # FF refused — usually because the WT has changes that "would be
+    # overwritten by merge". When those changes are bit-identical to
+    # what's about to land (a common pattern when the same edit was
+    # made in multiple submodule checkouts), stash them, retry, and
+    # drop the stash. Anything else: restore via the helper's stash
+    # pop and warn-skip with the original merge error preserved.
+    redundant = _try_ff_through_redundant_dirty(state, c, winner_branch, name)
+    if redundant is True:
+        state.tasks.update(t, "ok", "merged identical dirty changes")
+        return True
+    state.tasks.update(t, "warn", first_line(err))
+    return False
 
 
 def _align_detached_loser(state: State, c: SmartSyncCheckout,
                           winner_branch: str, name: str) -> bool:
     """Bring a detached-HEAD loser onto the winner's published commit
-    via `fetch + checkout origin/<branch>`. Git refuses if a WT change
-    would clobber a tracked file — surfaces as a warn task."""
+    via `fetch + checkout origin/<branch>`. Plain checkout fails when
+    a dirty WT path differs from origin's — for the very common case
+    where the dirty content is bit-identical to what origin now holds
+    (multiple checkouts received the same edit before smart-sync ran),
+    fall back to the same stash-and-retry pattern the FF path uses.
+
+    Refuses to touch the checkout if HEAD has commits that aren't on
+    `origin/<winner_branch>` — switching would orphan them and any
+    files unique to those commits would vanish."""
     t = state.tasks.add(f"  ↳ align {name}: switch+sync {c.label}")
     rc, _, err = git(c.path, ["fetch", "origin", winner_branch])
     if rc != 0:
         state.tasks.update(t, "fail", first_line(err))
         return False
-    rc, _, err = git(c.path, ["checkout", f"origin/{winner_branch}"])
-    if rc != 0:
-        state.tasks.update(t, "warn", first_line(err))
+    target_ref = f"origin/{winner_branch}"
+    if not _head_is_ancestor_of(c.path, target_ref):
+        state.tasks.update(
+            t, "warn",
+            f"detached HEAD has commits not on {target_ref} "
+            "— would orphan them; manual: `git checkout -b <name>`")
         return False
-    state.tasks.update(t, "ok")
-    return True
+    rc, _, err = git(c.path, ["checkout", target_ref])
+    if rc == 0:
+        state.tasks.update(t, "ok")
+        return True
+
+    # Plain checkout refused — verify the dirty content is bit-
+    # identical to origin/<branch>'s. If so, stash + retry + drop;
+    # if any path differs, leave the loser alone and warn-skip with
+    # the original git error so the user can resolve manually.
+    redundant = _try_detached_checkout_through_redundant_dirty(
+        state, c, winner_branch, name)
+    if redundant is True:
+        state.tasks.update(t, "ok", "merged identical dirty changes")
+        return True
+    state.tasks.update(t, "warn", first_line(err))
+    return False
+
+
+def _resolve_origin_head_branch(path: Path) -> str:
+    """Return the local short branch name pointed at by `origin/HEAD`,
+    or "" when origin's HEAD pointer isn't set / can't be resolved.
+    Used by the detached-winner flow when `prompt_for_branch` is OFF —
+    we auto-resolve to whatever GitHub / the remote's clone considers
+    its default branch (typically `main` or `master`) instead of asking
+    the user."""
+    rc, out, _ = git(path, [
+        "symbolic-ref", "--short", "refs/remotes/origin/HEAD",
+    ])
+    if rc != 0:
+        return ""
+    ref = out.strip()
+    if ref.startswith("origin/"):
+        return ref[len("origin/"):]
+    return ""
 
 
 def _open_align_heads_prompt_and_wait(state: State, canonical_name: str,
@@ -1012,7 +1403,48 @@ def _align_canonical(state: State, canonical: Repo) -> Tuple[int, int]:
     if winner is None:
         return 0, 0
 
-    # Stage + commit dirty winner (auto-stage off → warn-skip).
+    # Detached winner: pick a branch via the modal and switch onto it
+    # BEFORE committing. Committing on a detached HEAD would create an
+    # orphan commit that the post-checkout `git checkout <branch>`
+    # silently leaves behind — push would then succeed but carry no
+    # change, and losers would fail to align because origin still
+    # holds the pre-edit content. Switching first means the
+    # subsequent commit lands on the chosen branch and propagates
+    # properly through push + loser-FF.
+    winner_branch = winner.branch
+    if winner_branch == "(detached)":
+        if not state.align_heads:
+            t = state.tasks.add(f"  ↳ align {name}")
+            state.tasks.update(
+                t, "warn",
+                f"{winner.label} detached — turn on align-heads to pick a branch")
+            return 0, 1
+        if state.prompt_for_branch:
+            chosen = _open_align_heads_prompt_and_wait(state, name, winner)
+            if not chosen:
+                t = state.tasks.add(f"  ↳ align {name}")
+                state.tasks.update(
+                    t, "warn", "user cancelled detached-branch pick")
+                return 0, 1
+        else:
+            # `prompt_for_branch` off: auto-resolve to origin/HEAD
+            # (whatever the remote considers its default branch).
+            chosen = _resolve_origin_head_branch(winner.path)
+            if not chosen:
+                t = state.tasks.add(f"  ↳ align {name}")
+                state.tasks.update(
+                    t, "warn",
+                    f"{winner.label}: origin/HEAD not set — turn on "
+                    "prompt-for-branch to pick manually")
+                return 0, 1
+        if not _stash_switch_pop_winner(state, winner, chosen, name):
+            return 0, 1
+        winner.branch = chosen
+        winner_branch = chosen
+
+    # Stage + commit dirty winner (auto-stage off → warn-skip). With
+    # the detached → branch switch done above, we're guaranteed to be
+    # on a real branch by the time the commit lands.
     if winner.dirty:
         if not state.auto_stage:
             t = state.tasks.add(f"  ↳ align {name}")
@@ -1027,31 +1459,25 @@ def _align_canonical(state: State, canonical: Repo) -> Tuple[int, int]:
         # re-probing in the middle of the worker.)
         winner.ahead = max(winner.ahead, 1)
 
-    # Detached winner: pick a branch via the modal (align_heads on) or
-    # warn-skip the canonical entirely (align_heads off).
-    winner_branch = winner.branch
-    if winner_branch == "(detached)":
-        if not state.align_heads:
-            t = state.tasks.add(f"  ↳ align {name}")
-            state.tasks.update(
-                t, "warn",
-                f"{winner.label} detached — turn on align-heads to pick a branch")
-            return 0, 1
-        chosen = _open_align_heads_prompt_and_wait(state, name, winner)
-        if not chosen:
-            t = state.tasks.add(f"  ↳ align {name}")
-            state.tasks.update(t, "warn", "user cancelled detached-branch pick")
-            return 0, 1
-        if not _switch_to_branch(state, winner, chosen, name):
-            return 0, 1
-        winner_branch = chosen
-
     # Push winner if it has unpushed commits (real or just-committed).
     if winner.ahead > 0:
         if not _push_winner(state, winner, winner_branch, name):
             return 0, 1
 
-    # Align losers.
+    # Re-probe winner.head — the branch switch / commit / push above
+    # may have advanced HEAD to a brand-new sha that the original
+    # `_probe_checkout_full` couldn't have known about. Without this,
+    # the loser-skip shortcut below would compare each loser's head
+    # against the PRE-OP winner sha and falsely skip any loser that
+    # was already at that earlier point, leaving it 1+ behind origin.
+    rc, head_out, _ = git(winner.path, ["rev-parse", "HEAD"])
+    if rc == 0 and head_out.strip():
+        winner.head = head_out.strip()
+
+    # Align losers. With `auto_ff` off the user opted out of automatic
+    # alignment entirely — winner still commits + pushes, but each
+    # loser warn-skips so the user can resolve them manually (or in a
+    # follow-up Ctrl+S after re-enabling).
     ok = 1 if winner.ahead > 0 else 0
     fail = 0
     for c in checkouts:
@@ -1059,6 +1485,12 @@ def _align_canonical(state: State, canonical: Repo) -> Tuple[int, int]:
             continue
         if c.head == winner.head and not c.dirty:
             # Already in sync.
+            continue
+        if not state.auto_ff:
+            t = state.tasks.add(f"  ↳ align {name}: {c.label}")
+            state.tasks.update(
+                t, "warn", "auto-ff off — manual align")
+            fail += 1
             continue
         if c.branch == winner_branch:
             if _align_loser_ff(state, c, winner_branch, name):
@@ -1185,16 +1617,20 @@ def kick_off_inline_refresh(state: State) -> None:
             return
         _inline_refresh_in_flight = True
 
-    if state.repos:
-        if state.repos[0].rel == ".":
-            workspace = state.repos[0].path
+    # Prefer the active workspace's folder list when available — it
+    # supports multi-folder workspaces (which the legacy
+    # `state.repos[0].path.parent` anchor couldn't, silently dropping
+    # repos discovered from any folder other than the first one).
+    folders = list(state.active_folders)
+    if not folders:
+        if state.repos:
+            anchor = state.repos[0]
+            folders = [anchor.path if anchor.rel == "." else anchor.path.parent]
         else:
-            workspace = state.repos[0].path.parent
-    else:
-        # No repos to anchor — release the gate and bail.
-        with _inline_refresh_lock:
-            _inline_refresh_in_flight = False
-        return
+            # No repos and no workspace folders — release the gate and bail.
+            with _inline_refresh_lock:
+                _inline_refresh_in_flight = False
+            return
 
     # Flip every row's refreshing flag SYNCHRONOUSLY before we spawn the
     # worker. The main loop's `anim_running` check fires as soon as any
@@ -1211,18 +1647,25 @@ def kick_off_inline_refresh(state: State) -> None:
     def worker() -> None:
         global _inline_refresh_in_flight
         try:
-            try:
-                fresh = discover_repos(workspace)
-            except Exception:
-                fresh = []
-            fresh_by_rel = {r.rel: r for r in fresh}
-            kept_rels = {r.rel for r in state.repos if r.rel in fresh_by_rel}
+            fresh: List[Repo] = []
+            seen_paths: set = set()
+            for folder in folders:
+                try:
+                    discovered = discover_repos(folder)
+                except Exception:
+                    discovered = []
+                for r in discovered:
+                    if r.path in seen_paths:
+                        continue
+                    seen_paths.add(r.path)
+                    fresh.append(r)
+            fresh_by_path = {r.path: r for r in fresh}
+            kept = [r for r in state.repos if r.path in fresh_by_path]
+            state.repos[:] = kept
 
-            state.repos[:] = [r for r in state.repos if r.rel in kept_rels]
-
-            existing_rels = {r.rel for r in state.repos}
+            existing_paths = {r.path for r in state.repos}
             for r in fresh:
-                if r.rel not in existing_rels:
+                if r.path not in existing_paths:
                     state.repos.append(r)
             state.repos.sort(
                 key=lambda r: (r.rel != ".", r.rel.lower() if r.rel != "." else ""))
@@ -1241,8 +1684,13 @@ def kick_off_inline_refresh(state: State) -> None:
                     list(ex.map(refresh_one, state.repos))
             link_siblings(state.repos, state.subtrees)
 
-            state.selected = max(
-                0, min(state.selected, max(0, state.total_rows - 1)))
+            # `selected = -1` is the title-row workspace selector — keep
+            # it as-is rather than clamping back into the body. Other
+            # values clamp into [0, total_rows-1] so a removed repo
+            # doesn't leave the cursor pointing past the new end.
+            if state.selected != -1:
+                state.selected = max(
+                    0, min(state.selected, max(0, state.total_rows - 1)))
             state.body_scroll = max(
                 0, min(state.body_scroll, max(0, state.total_rows - 1)))
         finally:
@@ -1250,3 +1698,107 @@ def kick_off_inline_refresh(state: State) -> None:
                 _inline_refresh_in_flight = False
 
     threading.Thread(target=worker, daemon=True).start()
+
+
+def switch_workspace(state: State, new_index: int) -> None:
+    """Switch the active workspace. The cheap path — and the one taken
+    every time after the first — is to swap `state.repos` to the new
+    workspace's `cached_repos`, populated at startup. No re-discovery,
+    no async refresh: each ←/→ keystroke is instant and the previously-
+    fetched per-repo state (branch, head, dirty flags) is preserved.
+
+    The cache-miss path covers exactly two cases:
+      1. A workspace freshly created at runtime via the creator wizard
+         that hasn't been refreshed yet.
+      2. A test or out-of-tree caller that built `state.workspaces`
+         without populating cached_repos.
+    Both fall back to discover-then-async-refresh, with `kick_off_
+    inline_refresh`'s gate keeping concurrent refreshes well-behaved.
+
+    No-op when the new index doesn't actually change the active
+    workspace."""
+    if not state.workspaces:
+        return
+    new_index %= len(state.workspaces)
+    if new_index == state.active_workspace_index:
+        return
+    # Persist any in-place repo mutations on the way out — kick_off_
+    # inline_refresh and the commit pipeline both mutate state.repos
+    # in place (status fields, message strings, etc.), and we want
+    # the next switch back to surface those changes rather than the
+    # stale snapshot taken at startup.
+    cur_idx = state.active_workspace_index
+    if 0 <= cur_idx < len(state.workspaces):
+        state.workspaces[cur_idx].cached_repos = state.repos
+
+    state.active_workspace_index = new_index
+    ws = state.workspaces[new_index]
+
+    if ws.cached_repos:
+        # Cache hit — instant swap. The cached list is the same Python
+        # object subsequent kick_off_inline_refresh runs will mutate
+        # in place, so a later Ctrl+R updates both `state.repos` and
+        # the workspace's cache simultaneously without copying.
+        state.repos = ws.cached_repos
+        kick_refresh = False
+    else:
+        # Cache miss (newly-added workspace) — do the expensive bits.
+        # Sync discovery is fast; remote-state refresh stays async so
+        # the UI doesn't block.
+        fresh: List[Repo] = []
+        seen_paths: set = set()
+        for folder in ws.folders:
+            try:
+                discovered = discover_repos(folder)
+            except Exception:
+                discovered = []
+            for r in discovered:
+                if r.path in seen_paths:
+                    continue
+                seen_paths.add(r.path)
+                fresh.append(r)
+        fresh.sort(key=lambda r: r.display_name.lower())
+        state.repos = fresh
+        ws.cached_repos = fresh
+        kick_refresh = True
+
+    state.workspace_name = ws.name
+
+    # Re-apply settings from base config + this workspace's overrides.
+    # Imported here to avoid a hard config dependency in workers' module
+    # namespace (workers is a leaf used by tests that don't load config).
+    from config import apply_workspace_overrides
+    if state.base_config is not None:
+        apply_workspace_overrides(state, state.base_config, ws)
+    else:
+        state.subtrees = list(ws.subtrees)
+
+    # Always re-link — link_siblings is idempotent and inexpensive on
+    # already-refreshed Repos, and the cache-hit path skipped any
+    # discovery that would have touched these references.
+    link_siblings(state.repos, state.subtrees)
+
+    # Park focus back on the workspace selector and reset scroll so the
+    # new list starts at the top. Tasks panel state is intentionally
+    # untouched — running tasks belong to the previous workspace's
+    # commits/syncs but the user can let them finish or kill them via
+    # the task-detail modal.
+    state.selected = -1
+    state.body_scroll = 0
+    state.field_cursor = 0
+    state.task_selected = 0
+    state.task_scroll = 0
+    state.focused_panel = "repos"
+
+    # Persist the new active workspace name so the next session lands
+    # the user back here automatically. Save failures are non-fatal —
+    # the in-memory switch already happened, the file just won't
+    # remember it; on next launch we'll default to the first workspace.
+    from config import save_workspaces
+    try:
+        save_workspaces(state.workspaces, state.active_workspace_index)
+    except OSError:
+        pass
+
+    if kick_refresh:
+        kick_off_inline_refresh(state)

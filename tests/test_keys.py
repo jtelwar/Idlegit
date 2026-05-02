@@ -36,9 +36,10 @@ def _make_repo(rel: str = "r", **kwargs) -> Repo:
     return Repo(rel=rel, path=Path(f"/tmp/{rel}"), **kwargs)
 
 
-def _state(*repos: Repo, selected: int = 3, **kwargs) -> State:
-    # Default selected=3: first repo row. Toggles occupy rows 0-2
-    # (auto-stage, auto-push, align-heads).
+def _state(*repos: Repo, selected: int = 0, **kwargs) -> State:
+    # Default selected=0: first repo row. The old toggle row (auto-
+    # stage / auto-push / align-heads) moved into the workspace menu;
+    # body rows now start at index 0.
     return State(repos=list(repos), workspace_name="ws",
                  selected=selected, **kwargs)
 
@@ -49,45 +50,28 @@ class TestNavigation(unittest.TestCase):
         s = _state(_make_repo("a"), _make_repo("b"), selected=0)
         handle_main_key(s, curses.KEY_DOWN)
         self.assertEqual(s.selected, 1)
+        # Wraps via mod when stepping past the last body row.
         handle_main_key(s, curses.KEY_DOWN)
-        self.assertEqual(s.selected, 2)
+        self.assertEqual(s.selected, 0)
 
-    def test_up_wraps_around(self) -> None:
-        s = _state(_make_repo("a"), selected=0)
+    def test_up_from_top_body_row_lands_on_workspace_row(self) -> None:
+        # Up from the first body row lands on the workspace title-row
+        # selector (selected = -1), not the bottom of the body.
+        # Pressing Up again from -1 wraps to the last body row.
+        s = _state(_make_repo("a"), _make_repo("b"), selected=0)
         handle_main_key(s, curses.KEY_UP)
-        # 0 → wraps to total_rows - 1; 3 toggles + 1 repo = 4
-        self.assertEqual(s.selected, 3)
+        self.assertEqual(s.selected, -1)
+        handle_main_key(s, curses.KEY_UP)
+        self.assertEqual(s.selected, 1)  # last body row (2 repos → idx 1)
 
     def test_navigation_resets_field_cursor_to_message_end(self) -> None:
         a = _make_repo("a")
         a.message = "hello"
-        s = _state(a, selected=0)  # start on toggle
+        s = _state(a, selected=-1)  # start on workspace row
         s.field_cursor = 999
-        handle_main_key(s, curses.KEY_DOWN)
-        handle_main_key(s, curses.KEY_DOWN)
-        handle_main_key(s, curses.KEY_DOWN)  # land on repo a (past 3 toggles)
-        self.assertEqual(s.selected, 3)
+        handle_main_key(s, curses.KEY_DOWN)  # → first body row (a)
+        self.assertEqual(s.selected, 0)
         self.assertEqual(s.field_cursor, len("hello"))
-
-
-@unittest.skipUnless(UI_AVAILABLE, "ui module unavailable")
-class TestToggleRows(unittest.TestCase):
-    def test_space_flips_auto_stage(self) -> None:
-        s = _state(_make_repo("a"), selected=0, auto_stage=True)
-        handle_main_key(s, ord(" "))
-        self.assertFalse(s.auto_stage)
-        handle_main_key(s, ord(" "))
-        self.assertTrue(s.auto_stage)
-
-    def test_space_flips_auto_push(self) -> None:
-        s = _state(_make_repo("a"), selected=1, auto_push=True)
-        handle_main_key(s, ord(" "))
-        self.assertFalse(s.auto_push)
-
-    def test_enter_on_toggle_also_flips(self) -> None:
-        s = _state(_make_repo("a"), selected=0, auto_stage=False)
-        handle_main_key(s, 10)  # \n
-        self.assertTrue(s.auto_stage)
 
 
 @unittest.skipUnless(UI_AVAILABLE, "ui module unavailable")
@@ -113,13 +97,13 @@ class TestEscBehavior(unittest.TestCase):
         a = _make_repo("a")
         b = _make_repo("b")
         b.message = "wip"
-        s = _state(a, b, selected=3)  # focused on a (no message)
+        s = _state(a, b, selected=0)  # focused on a (no message)
         self.assertEqual(handle_main_key(s, 27), "confirm-quit")
 
     def test_esc_clears_focused_message_first(self) -> None:
         a = _make_repo("a")
         a.message = "wip"
-        s = _state(a, selected=3)
+        s = _state(a, selected=0)
         result = handle_main_key(s, 27)
         self.assertIsNone(result)
         self.assertEqual(a.message, "")
@@ -130,7 +114,7 @@ class TestTypingAndCursor(unittest.TestCase):
     def test_typing_inserts_at_cursor(self) -> None:
         a = _make_repo("a")
         a.staged = [("M", "x")]  # mark dirty so the field is "live"
-        s = _state(a, selected=3)
+        s = _state(a, selected=0)
         handle_main_key(s, ord("h"))
         handle_main_key(s, ord("i"))
         self.assertEqual(a.message, "hi")
@@ -140,7 +124,7 @@ class TestTypingAndCursor(unittest.TestCase):
         a = _make_repo("a")
         a.staged = [("M", "x")]
         a.message = "hllo"
-        s = _state(a, selected=3)
+        s = _state(a, selected=0)
         s.field_cursor = 1  # between "h" and "l"
         handle_main_key(s, ord("e"))
         self.assertEqual(a.message, "hello")
@@ -150,7 +134,7 @@ class TestTypingAndCursor(unittest.TestCase):
         a = _make_repo("a")
         a.staged = [("M", "x")]
         a.message = "ab"
-        s = _state(a, selected=3)
+        s = _state(a, selected=0)
         s.field_cursor = 2
         handle_main_key(s, curses.KEY_BACKSPACE)
         self.assertEqual(a.message, "a")
@@ -160,7 +144,7 @@ class TestTypingAndCursor(unittest.TestCase):
         a = _make_repo("a")
         a.staged = [("M", "x")]
         a.message = "abc"
-        s = _state(a, selected=3)
+        s = _state(a, selected=0)
         s.field_cursor = 1
         handle_main_key(s, curses.KEY_DC)
         self.assertEqual(a.message, "ac")
@@ -170,7 +154,7 @@ class TestTypingAndCursor(unittest.TestCase):
         a = _make_repo("a")
         a.staged = [("M", "x")]
         a.message = "hello"
-        s = _state(a, selected=3)
+        s = _state(a, selected=0)
         s.field_cursor = 3
         handle_main_key(s, curses.KEY_LEFT)
         self.assertEqual(s.field_cursor, 2)
@@ -179,7 +163,7 @@ class TestTypingAndCursor(unittest.TestCase):
         a = _make_repo("a")
         a.staged = [("M", "x")]
         a.message = "hi"
-        s = _state(a, selected=3)
+        s = _state(a, selected=0)
         s.field_cursor = 2
         handle_main_key(s, curses.KEY_RIGHT)
         self.assertEqual(s.field_cursor, 2)
@@ -188,7 +172,7 @@ class TestTypingAndCursor(unittest.TestCase):
         a = _make_repo("a")
         a.staged = [("M", "x")]
         a.message = "hello"
-        s = _state(a, selected=3)
+        s = _state(a, selected=0)
         s.field_cursor = 4
         handle_main_key(s, curses.KEY_HOME)
         self.assertEqual(s.field_cursor, 0)
@@ -197,7 +181,7 @@ class TestTypingAndCursor(unittest.TestCase):
         a = _make_repo("a")
         a.staged = [("M", "x")]
         a.message = "hello"
-        s = _state(a, selected=3)
+        s = _state(a, selected=0)
         s.field_cursor = 0
         handle_main_key(s, curses.KEY_END)
         self.assertEqual(s.field_cursor, 5)
