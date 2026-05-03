@@ -42,6 +42,12 @@ DEFAULT_MAX_VISIBLE_REPO_ROWS = 0  # 0 = use all available height
 DEFAULT_TRACK_ACTIONS = True
 DEFAULT_ACTIONS_POLL_SECONDS = 5.0
 DEFAULT_AUTO_REMOVE_COMPLETED_AFTER = -1.0  # <0 = never auto-remove
+# Cap on commit-message length displayed on the review screen. The
+# message wraps across as many rows as needed to fit; only end-
+# truncation kicks in once a single message exceeds the cap. Long
+# messages get fully visible by default (480 chars ≈ 6-8 wrapped rows
+# at typical pane widths) — set to 0 to disable the cap entirely.
+DEFAULT_MAX_COMMIT_MESSAGE_LENGTH_IN_REVIEW = 480
 # Smart-sync defaults — match the historical always-on behaviour so
 # existing setups are unaffected by the new toggles.
 DEFAULT_ALIGN_HEADS = True
@@ -71,6 +77,8 @@ class Config:
     track_actions_default: bool = DEFAULT_TRACK_ACTIONS
     actions_poll_seconds: float = DEFAULT_ACTIONS_POLL_SECONDS
     auto_remove_completed_after: float = DEFAULT_AUTO_REMOVE_COMPLETED_AFTER
+    max_commit_message_length_in_review: int = (
+        DEFAULT_MAX_COMMIT_MESSAGE_LENGTH_IN_REVIEW)
     # Smart-sync starting values. Each one maps onto a State attribute
     # of the same root name and lives in the workspace menu's
     # SMART-SYNC section.
@@ -99,6 +107,8 @@ def load_config() -> Config:
     track_actions_default = DEFAULT_TRACK_ACTIONS
     actions_poll_seconds = DEFAULT_ACTIONS_POLL_SECONDS
     auto_remove_completed_after = DEFAULT_AUTO_REMOVE_COMPLETED_AFTER
+    max_commit_message_length_in_review = (
+        DEFAULT_MAX_COMMIT_MESSAGE_LENGTH_IN_REVIEW)
     default_align_heads = DEFAULT_ALIGN_HEADS
     default_auto_ff = DEFAULT_AUTO_FF
     default_prompt_for_branch = DEFAULT_PROMPT_FOR_BRANCH
@@ -146,6 +156,9 @@ def load_config() -> Config:
             auto_remove_completed_after = cp.getfloat(
                 "idlegit", "auto_remove_completed_tasks_after_interval",
                 fallback=DEFAULT_AUTO_REMOVE_COMPLETED_AFTER)
+            max_commit_message_length_in_review = cp.getint(
+                "idlegit", "max_commit_message_length_in_review",
+                fallback=DEFAULT_MAX_COMMIT_MESSAGE_LENGTH_IN_REVIEW)
             default_align_heads = cp.getboolean(
                 "idlegit", "default_align_heads",
                 fallback=DEFAULT_ALIGN_HEADS)
@@ -182,6 +195,8 @@ def load_config() -> Config:
         track_actions_default=track_actions_default,
         actions_poll_seconds=max(0.5, actions_poll_seconds),
         auto_remove_completed_after=auto_remove_completed_after,
+        max_commit_message_length_in_review=max(
+            0, max_commit_message_length_in_review),
         default_align_heads=default_align_heads,
         default_auto_ff=default_auto_ff,
         default_prompt_for_branch=default_prompt_for_branch,
@@ -519,6 +534,8 @@ def apply_workspace_overrides(state, cfg: Config, ws: Workspace) -> None:
     state.track_actions_default = cfg.track_actions_default
     state.actions_poll_seconds = cfg.actions_poll_seconds
     state.auto_remove_completed_after = cfg.auto_remove_completed_after
+    state.max_commit_message_length_in_review = (
+        cfg.max_commit_message_length_in_review)
     state.auto_stage = cfg.default_auto_stage
     state.auto_push = cfg.default_auto_push
     state.align_heads = cfg.default_align_heads

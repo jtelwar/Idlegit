@@ -425,6 +425,73 @@ class FileChange:
     weight: float = 0.0
 
 
+@dataclass
+class DiffViewer:
+    """Modal popped from the review screen's right pane when the user
+    presses Enter on a file row. Loads `git diff HEAD -- <path>` (or
+    the raw file contents for an untracked addition) in a background
+    thread, then renders the result in a scrollable pane. Enter or
+    Esc closes the modal."""
+    file_path: str          # repo-relative path, used for the title + git command
+    target_path: Path       # repo working-tree dir the path is rooted in
+    label: str              # block label rendered in the modal title
+    untracked: bool = False
+    lines: "list[str]" = field(default_factory=list)
+    loading: bool = True
+    scroll: int = 0
+    cancel_event: threading.Event = field(default_factory=threading.Event)
+
+
+@dataclass
+class ReviewBlock:
+    """One commit target on the two-panel review screen — a top-level
+    repo OR a nested submodule child. Each block owns its own LFS
+    warnings, workflow toggles, and then-run selectors (the same
+    focusables the old single-list review surfaced), grouped under a
+    repo-specific header so the user can navigate target-by-target.
+
+    The right pane reads `files` (populated asynchronously after the
+    review opens — `files_loading` stays True until the first
+    `query_working_tree` finishes for this block). `cancel_event`
+    lets a worker short-circuit if the user dismisses the review
+    before the load completes."""
+    label: str
+    branch: str
+    target_path: Path
+    target_repo: Optional[Repo] = None
+    target_parent: Optional[Repo] = None
+    target_child: Optional["ChildRef"] = None
+    message: str = ""
+    merging: bool = False
+    conflict_paths: "list[str]" = field(default_factory=list)
+    has_origin: bool = False
+    upstream: Optional[str] = None
+    siblings_summary: str = ""
+    push_summary: str = ""    # rendered "push: yes (sets upstream …)" line
+    auto_stage: bool = True
+    auto_push: bool = True
+    is_child: bool = False    # True for submodule child blocks
+    threshold_mb: int = 0     # LFS threshold for the warning header
+    lfs_candidates: "list[LFSCandidate]" = field(default_factory=list)
+    workflow_toggles: "list[WorkflowToggle]" = field(default_factory=list)
+    then_run_items: "list[ThenRunSelector]" = field(default_factory=list)
+    # Right-pane working-tree files. Populated by the async loader the
+    # review screen kicks off when the block is built. `files_loading`
+    # is True while the worker is in flight so the pane shows a
+    # spinner instead of "(no changes)".
+    files: "list[FileEntry]" = field(default_factory=list)
+    files_loading: bool = True
+    # Per-block right-pane cursor — preserved across panel-focus
+    # toggles so the user's place in the file list isn't lost when
+    # they Shift+Tab back to the left side.
+    file_selected: int = 0
+    file_scroll: int = 0
+    # Set by the review's Esc / Enter handler so the file-loader
+    # worker drops its result on the floor instead of mutating a
+    # block the user has already moved on from.
+    cancel_event: threading.Event = field(default_factory=threading.Event)
+
+
 # ---------- Action menu + sub-modals --------------------------------------
 
 
@@ -815,6 +882,7 @@ _DEFAULT_MAX_VISIBLE_REPO_ROWS = 0
 _DEFAULT_TRACK_ACTIONS = True
 _DEFAULT_ACTIONS_POLL_SECONDS = 5.0
 _DEFAULT_AUTO_REMOVE_COMPLETED_AFTER = -1.0
+_DEFAULT_MAX_COMMIT_MESSAGE_LENGTH_IN_REVIEW = 480
 
 
 @dataclass
@@ -841,6 +909,12 @@ class State:
     track_actions_default: bool = _DEFAULT_TRACK_ACTIONS
     actions_poll_seconds: float = _DEFAULT_ACTIONS_POLL_SECONDS
     auto_remove_completed_after: float = _DEFAULT_AUTO_REMOVE_COMPLETED_AFTER
+    # Cap on the commit message rendered on the review screen. The
+    # message wraps onto as many rows as needed to fit; only end-
+    # truncation kicks in once a single message exceeds this many
+    # chars. 0 disables the cap entirely.
+    max_commit_message_length_in_review: int = (
+        _DEFAULT_MAX_COMMIT_MESSAGE_LENGTH_IN_REVIEW)
     # Multi-workspace state. `workspaces` is the list loaded from
     # idlegit.workspaces (or a single synthesized entry derived from
     # idlegit.conf when the file doesn't exist); `active_workspace_index`
@@ -896,6 +970,11 @@ class State:
     workflow_picker: Optional[WorkflowPicker] = None
     align_heads_prompt: Optional[AlignHeadsPrompt] = None
     detached_recovery_prompt: Optional[DetachedRecoveryPrompt] = None
+    # Opened from the review screen's right pane when the user presses
+    # Enter on a file row — sub-modal of the review's inner loop, not
+    # the main loop, so dispatch happens inside handle_confirm rather
+    # than alongside the other modals.
+    diff_viewer: Optional[DiffViewer] = None
     task_action_menu: Optional[TaskActionMenu] = None
     workspace_menu: Optional["WorkspaceMenu"] = None
     workspace_creator: Optional["WorkspaceCreator"] = None

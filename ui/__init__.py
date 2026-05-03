@@ -10,12 +10,13 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from models import (
-    ChildRef, LFSCandidate, Repo, State, ThenRunSelector, WorkflowToggle,
+    ChildRef, FileEntry, LFSCandidate, Repo, ReviewBlock, State,
+    ThenRunSelector, WorkflowToggle,
 )
 from config import CONFIG_FILE, DEFAULT_TRUNCATION_MODE
 from git_ops import (
     find_lfs_warnings, gh_available, link_siblings,
-    parse_github_slug, would_run_on_push,
+    parse_github_slug, query_working_tree, would_run_on_push,
 )
 from workers import (
     _build_recovery_prompt, execute_detached_recovery,
@@ -28,9 +29,11 @@ from workers import (
 # `from ui import PAIR_…, state_color, init_colors`-style imports.
 from .colors import (  # noqa: F401  (re-exported public API)
     PAIR_AHEAD, PAIR_BEHIND, PAIR_BRANCH, PAIR_DIRTY, PAIR_ERR,
-    PAIR_HEADER, PAIR_HINT, PAIR_OK, PAIR_SB_CYAN, PAIR_SB_ERR,
-    PAIR_SB_FG, PAIR_SB_FG_ACTIVE, PAIR_SB_OK, PAIR_SB_WARN,
-    PAIR_TOGGLE_OFF, PAIR_TOGGLE_ON, PAIR_WARN,
+    PAIR_HEADER, PAIR_HINT, PAIR_OK,
+    PAIR_PASTEL_BLUE, PAIR_PASTEL_GREEN, PAIR_PASTEL_RED,
+    PAIR_PASTEL_YELLOW,
+    PAIR_SB_CYAN, PAIR_SB_ERR, PAIR_SB_FG, PAIR_SB_FG_ACTIVE,
+    PAIR_SB_OK, PAIR_SB_WARN, PAIR_TOGGLE_OFF, PAIR_TOGGLE_ON, PAIR_WARN,
     _state_color, child_state_color, init_colors, state_color,
 )
 from .geometry import (  # noqa: F401  (re-exported public API)
@@ -49,19 +52,19 @@ from .hints import (  # noqa: F401  (re-exported public API)
 from .modals import (  # noqa: F401  (re-exported public API)
     commit_workspace_creator,
     draw_action_menu, draw_align_heads_prompt, draw_branch_name_prompt,
-    draw_branch_picker, draw_detached_recovery_prompt, draw_reset_prompt,
-    draw_task_action_menu, draw_workflow_picker, draw_workspace_creator,
-    draw_workspace_menu, draw_workspaces_picker,
+    draw_branch_picker, draw_detached_recovery_prompt, draw_diff_viewer,
+    draw_reset_prompt, draw_task_action_menu, draw_workflow_picker,
+    draw_workspace_creator, draw_workspace_menu, draw_workspaces_picker,
     handle_action_menu_key, handle_align_heads_prompt_key,
     handle_branch_name_prompt_key, handle_branch_picker_key,
-    handle_detached_recovery_prompt_key, handle_reset_prompt_key,
-    handle_task_action_menu_key, handle_workflow_picker_key,
-    handle_workspace_creator_key, handle_workspace_menu_key,
-    handle_workspaces_picker_key,
+    handle_detached_recovery_prompt_key, handle_diff_viewer_key,
+    handle_reset_prompt_key, handle_task_action_menu_key,
+    handle_workflow_picker_key, handle_workspace_creator_key,
+    handle_workspace_menu_key, handle_workspaces_picker_key,
     open_action_menu, open_align_heads_prompt, open_branch_name_prompt,
-    open_branch_picker, open_detached_recovery_prompt, open_reset_prompt,
-    open_task_action_menu, open_workflow_picker, open_workspace_creator,
-    open_workspace_menu, open_workspaces_picker,
+    open_branch_picker, open_detached_recovery_prompt, open_diff_viewer,
+    open_reset_prompt, open_task_action_menu, open_workflow_picker,
+    open_workspace_creator, open_workspace_menu, open_workspaces_picker,
     tick_creator_checks, tick_menu_path_checks,
 )
 # Right-hand task panel.
@@ -696,102 +699,43 @@ def draw_child_row(stdscr, y: int, child: ChildRef, focused: bool,
 # ---------- Confirm screen -------------------------------------------------
 
 
-def build_confirm_lines(
-    state: State,
-) -> Tuple[List[Tuple[str, int]], List[LFSCandidate],
-           List[WorkflowToggle], List["ThenRunSelector"]]:
-    lines: List[Tuple[str, int]] = []
-    lfs_candidates: List[LFSCandidate] = []
-    wf_toggles: List[WorkflowToggle] = []
-    then_run_items: List[ThenRunSelector] = []
-    have_gh = gh_available()
-    repos = [r for r in state.repos if r.message.strip()]
-    child_targets: List[Tuple[Repo, ChildRef]] = []
-    for parent in state.repos:
-        for ref in parent.children:
-            if ref.kind == "submodule" and ref.message.strip():
-                child_targets.append((parent, ref))
-
-    total = len(repos) + len(child_targets)
-    lines.append((f"{total} target(s) to commit  ·  "
-                  f"auto-stage: {'on' if state.auto_stage else 'off'}  ·  "
-                  f"auto-push: {'on' if state.auto_push else 'off'}",
-                  curses.A_DIM))
-    lines.append(("", 0))
-
+def _block_for_repo(state: State, repo: Repo) -> ReviewBlock:
+    """Build the per-repo review block for a top-level commit target.
+    Picks up its LFS warnings, workflow toggles, and then-run
+    selectors — same focusables the old single-list review surfaced
+    — so the two-panel layout has all of them grouped under this
+    repo's header instead of mixed with other repos'."""
     threshold_mb = state.lfs_warn_bytes // (1024 * 1024)
-
-    for repo in repos:
-        header = f"{repo.display_name}  [{repo.branch}]"
-        lines.append((header, curses.A_BOLD))
-
-        if repo.merging:
-            lines.append(("  ⚠ merge / rebase in progress — commit will be skipped",
-                          curses.color_pair(PAIR_ERR)))
-            lines.append(("    resolve conflicts and finish the operation, then re-run.",
-                          curses.A_DIM))
-            for cp in repo.conflict_paths:
-                lines.append((f"      {cp}", curses.color_pair(PAIR_ERR)))
-            lines.append(("", 0))
-            continue
-
-        lines.append((f'  message:  "{repo.message.strip()}"', 0))
-
-        if state.auto_stage:
-            files = [(s, p) for s, p in repo.staged]
-            files += [(s, p) for s, p in repo.unstaged]
-            files += [("?", p) for p in repo.untracked]
-            stage_label = "stage:    "
+    block = ReviewBlock(
+        label=repo.display_name,
+        branch=repo.branch,
+        target_path=repo.path,
+        target_repo=repo,
+        message=repo.message.strip(),
+        merging=repo.merging,
+        conflict_paths=list(repo.conflict_paths),
+        has_origin=bool(repo.remote_url),
+        upstream=repo.upstream,
+        siblings_summary=", ".join(s[0].display_name for s in repo.siblings),
+        auto_stage=state.auto_stage,
+        auto_push=state.auto_push,
+        threshold_mb=threshold_mb,
+    )
+    if state.auto_push:
+        if repo.upstream:
+            block.push_summary = f"push: yes → {repo.upstream}"
         else:
-            files = list(repo.staged)
-            stage_label = "staged:   "
-
-        if files:
-            first = True
-            for status, path in files:
-                prefix = f"  {stage_label}" if first else "  " + " " * len(stage_label)
-                lines.append((f"{prefix}{status}  {path}", curses.A_DIM))
-                first = False
-        else:
-            lines.append(("  ⚠ no changes — will be skipped",
-                          curses.color_pair(PAIR_WARN)))
-
-        warnings = find_lfs_warnings(repo, state.auto_stage, state.lfs_warn_bytes)
-        if warnings:
-            lines.append((f"  ⚠ files ≥{threshold_mb} MB not LFS-tracked — push will fail:",
-                          curses.color_pair(PAIR_ERR)))
-            for path, size in warnings:
-                cand = LFSCandidate(
-                    repo=repo, path=path, size_str=size,
-                    line_index=len(lines),
-                )
-                lfs_candidates.append(cand)
-                lines.append(("", curses.color_pair(PAIR_ERR)))
-
-        if state.auto_push:
-            if repo.upstream:
-                lines.append((f"  push:     yes → {repo.upstream}", 0))
-            else:
-                lines.append((f"  push:     yes (sets upstream → origin/{repo.branch})", 0))
-            if repo.siblings:
-                names = ", ".join(s[0].display_name for s in repo.siblings)
-                lines.append((f"  sync:     {names}", 0))
-        else:
-            lines.append(("  push:     no", curses.A_DIM))
-
-        # Per-workflow track-this-run toggles. Only emitted for workflows
-        # that we can predict will actually fire on this push:
-        #  - gh CLI must be available at startup
-        #  - the repo's remote URL must parse as a github.com slug
-        #  - the user is auto-pushing (no push → no run to track)
-        #  - `would_run_on_push` must be True for the repo's current branch
-        #    (push trigger present, branch matches)
-        #  - the workflow's GitHub-side state isn't `disabled_*` (a
-        #    disabled workflow won't fire on push, so there's no run
-        #    to track and offering the toggle is misleading)
-        # Each toggle's live state lives in repo.track_workflow[wf.name];
-        # initialise it from the global default the first time we see it.
-        if (state.auto_push and have_gh and repo.workflows
+            block.push_summary = (
+                f"push: yes (sets upstream → origin/{repo.branch})")
+    else:
+        block.push_summary = "push: no"
+    if not repo.merging:
+        warnings = find_lfs_warnings(
+            repo, state.auto_stage, state.lfs_warn_bytes)
+        for path, size in warnings:
+            block.lfs_candidates.append(LFSCandidate(
+                repo=repo, path=path, size_str=size))
+        if (state.auto_push and gh_available() and repo.workflows
                 and parse_github_slug(repo.remote_url_raw)):
             dispatchable_options = [
                 w.name for w in repo.workflows
@@ -804,81 +748,88 @@ def build_confirm_lines(
                     continue
                 if wf.name not in repo.track_workflow:
                     repo.track_workflow[wf.name] = state.track_actions_default
-                wf_toggles.append(WorkflowToggle(
-                    repo=repo, workflow_name=wf.name,
-                    line_index=len(lines),
-                ))
-                # Placeholder — render_workflow_toggle_line below paints
-                # over this slot during draw.
-                lines.append(("", 0))
-                # Indented "then run" selector — fires when this tracked
-                # workflow's run completes successfully. Only meaningful
-                # if the repo has at least one dispatchable+active
-                # workflow to chain to.
+                block.workflow_toggles.append(WorkflowToggle(
+                    repo=repo, workflow_name=wf.name))
                 if dispatchable_options:
-                    then_run_items.append(ThenRunSelector(
-                        repo=repo, after_workflow=wf.name,
-                        line_index=len(lines),
-                    ))
-                    lines.append(("", 0))
-            # Root-level "then run after push" — fires once the push
-            # itself completes, independent of any tracked workflow run.
+                    block.then_run_items.append(ThenRunSelector(
+                        repo=repo, after_workflow=wf.name))
             if dispatchable_options:
-                then_run_items.append(ThenRunSelector(
-                    repo=repo, after_workflow="",
-                    line_index=len(lines),
-                ))
-                lines.append(("", 0))
-
-        lines.append(("", 0))
-
-    for parent, ref in child_targets:
-        header = f"↳ {ref.repo.display_name} in {parent.display_name}"
-        lines.append((header, curses.A_BOLD))
-        lines.append((f'  message:  "{ref.message.strip()}"', 0))
-        lines.append((f'  path:     {ref.nested_path}', curses.A_DIM))
-        if state.auto_push:
-            lines.append(("  push:     yes (from nested checkout)", 0))
-            other_targets = [ref.repo.display_name + " (top-level)"]
-            for other_parent, other_path in ref.repo.siblings:
-                if other_path != ref.nested_path:
-                    other_targets.append(
-                        f"{ref.repo.display_name} in {other_parent.display_name}")
-            if other_targets:
-                lines.append((f"  sync:     {', '.join(other_targets)}", 0))
-        else:
-            lines.append(("  push:     no", curses.A_DIM))
-        lines.append(("  ⚠ if the nested checkout is in detached HEAD, the "
-                      "commit will be skipped", curses.A_DIM))
-        lines.append(("", 0))
-
-    return lines, lfs_candidates, wf_toggles, then_run_items
+                block.then_run_items.append(ThenRunSelector(
+                    repo=repo, after_workflow=""))
+    return block
 
 
-def render_candidate_line(cand: LFSCandidate, focused: bool) -> Tuple[str, int]:
-    check = "[x]" if cand.track else "[ ]"
-    text = f"      {check}  {cand.path}  ({cand.size_str})"
-    base = PAIR_OK if cand.track else PAIR_ERR
-    attr = curses.color_pair(base)
-    if focused:
-        attr |= curses.A_REVERSE
-    return text, attr
+def _block_for_child(state: State,
+                     parent: Repo, ref: ChildRef) -> ReviewBlock:
+    """Build the per-child review block for a nested submodule
+    commit target. Children don't carry their own workflow toggles —
+    those live on the canonical's top-level row — so this block is a
+    simpler header + message + push-summary shape."""
+    label = f"↳ {ref.repo.display_name} in {parent.display_name}"
+    block = ReviewBlock(
+        label=label,
+        branch=ref.branch,
+        target_path=ref.nested_path,
+        target_parent=parent,
+        target_child=ref,
+        message=ref.message.strip(),
+        is_child=True,
+        auto_stage=state.auto_stage,
+        auto_push=state.auto_push,
+        threshold_mb=state.lfs_warn_bytes // (1024 * 1024),
+    )
+    if state.auto_push:
+        targets = [ref.repo.display_name + " (top-level)"]
+        for other_parent, other_path in ref.repo.siblings:
+            if other_path != ref.nested_path:
+                targets.append(
+                    f"{ref.repo.display_name} in {other_parent.display_name}")
+        block.siblings_summary = ", ".join(targets)
+        block.push_summary = "push: yes (from nested checkout)"
+    else:
+        block.push_summary = "push: no"
+    return block
 
 
-def render_workflow_toggle_line(toggle: WorkflowToggle,
-                                focused: bool) -> Tuple[str, int]:
-    """Render one workflow track-toggle line for the review screen. The
-    'live' state is read straight from the repo so the dict is the source
-    of truth; the cursor mutates it on Space."""
-    on = toggle.repo.track_workflow.get(toggle.workflow_name, False)
-    check = "[x]" if on else "[ ]"
-    text = f"  {check}  track action: {toggle.workflow_name}"
-    attr = curses.color_pair(PAIR_OK if on else PAIR_HEADER) | curses.A_DIM
-    if on:
-        attr = curses.color_pair(PAIR_OK)
-    if focused:
-        attr |= curses.A_REVERSE
-    return text, attr
+def build_review_blocks(state: State) -> List[ReviewBlock]:
+    """Per-repo / per-child review blocks for the two-panel review
+    screen. Top-level repos with a queued message come first (in
+    state.repos order), then submodule children (parent-by-parent).
+    Empty when nothing has a message — the caller treats that as
+    "nothing to review, just bail"."""
+    blocks: List[ReviewBlock] = []
+    for repo in state.repos:
+        if repo.message.strip():
+            blocks.append(_block_for_repo(state, repo))
+    for parent in state.repos:
+        for ref in parent.children:
+            if ref.kind == "submodule" and ref.message.strip():
+                blocks.append(_block_for_child(state, parent, ref))
+    return blocks
+
+
+def kick_off_review_files_load(blocks: List[ReviewBlock]) -> None:
+    """Spawn one daemon thread per block to populate `block.files`
+    via `query_working_tree`. Non-blocking — the review screen draws
+    immediately with `files_loading=True` placeholders, and each pane
+    fills in as its worker completes. Each worker checks
+    `block.cancel_event` before mutating so closing the review
+    mid-load drops the result on the floor."""
+    import threading
+
+    def loader(block: ReviewBlock) -> None:
+        try:
+            if block.cancel_event.is_set():
+                return
+            files: List[FileEntry] = query_working_tree(block.target_path)
+            if block.cancel_event.is_set():
+                return
+            block.files = files
+        finally:
+            block.files_loading = False
+
+    for block in blocks:
+        threading.Thread(target=loader, args=(block,), daemon=True).start()
 
 
 def _then_run_options(repo: Repo) -> List[str]:
@@ -910,22 +861,6 @@ def _then_run_set(selector: ThenRunSelector, value: str) -> None:
         selector.repo.then_run_after_push = value
 
 
-def render_then_run_line(selector: ThenRunSelector,
-                         focused: bool) -> Tuple[str, int]:
-    """Render a 'then run' chain selector. Indented one level under a
-    workflow toggle when `after_workflow` is set, otherwise sits at the
-    repo's body indent as the post-push action's then-run."""
-    indent = "        " if selector.after_workflow else "  "
-    label = "then run:" if selector.after_workflow else "then run after push:"
-    current = _then_run_current(selector) or "(none)"
-    text = f"{indent}{label} ‹ {current} ›"
-    if focused:
-        attr = curses.color_pair(PAIR_BRANCH) | curses.A_BOLD
-    else:
-        attr = curses.A_DIM
-    return text, attr
-
-
 def cycle_then_run(selector: ThenRunSelector, direction: int) -> None:
     """Cycle the selector's choice through the repo's dispatchable
     workflows + a '(none)' slot. `direction` is +1 (right arrow) or
@@ -934,113 +869,458 @@ def cycle_then_run(selector: ThenRunSelector, direction: int) -> None:
     if not options:
         _then_run_set(selector, "")
         return
-    # Wheel layout: ["", option0, option1, ..., optionN-1]
     wheel = [""] + options
     current = _then_run_current(selector)
     try:
         i = wheel.index(current)
     except ValueError:
-        i = 0  # current selection is no longer dispatchable; reset to none
+        i = 0
     i = (i + direction) % len(wheel)
     _then_run_set(selector, wheel[i])
 
 
-def _confirm_hints(candidates: List[LFSCandidate],
-                   wf_toggles: List[WorkflowToggle],
-                   then_run_items: List[ThenRunSelector],
-                   cursor: int) -> List[Hint]:
-    """Hints for the review screen. Reflects which kind of focusable
-    row the cursor is on — LFS candidate rows take Space to toggle
-    LFS-tracking, workflow rows take Space to toggle action-tracking,
-    then-run rows take ←/→ to cycle the chained workflow target. With
-    no focusables, ↑/↓ scrolls the body."""
-    n_cands = len(candidates)
-    n_toggles = len(wf_toggles)
-    hints: List[Hint] = []
-    if cursor < 0:
-        hints.append(Hint(KEY_UP_DOWN, "scroll"))
-        hints.append(Hint(KEY_ENTER, "execute commits"))
-        hints.append(Hint(KEY_ESC, "back"))
-        return hints
-    hints.append(Hint(KEY_UP_DOWN, "select"))
-    if cursor < n_cands:
-        cand = candidates[cursor]
-        hints.append(Hint(KEY_SPACE,
-                          "stop tracking" if cand.track else "track with LFS"))
-    elif cursor < n_cands + n_toggles:
-        tog = wf_toggles[cursor - n_cands]
-        on = tog.repo.track_workflow.get(tog.workflow_name, False)
-        hints.append(Hint(KEY_SPACE,
-                          "untrack workflow" if on else "track workflow"))
+# ---------- Two-panel review screen --------------------------------------
+
+
+def _file_status_pair(x: str, y: str) -> Optional[int]:
+    """Map an XY porcelain status pair to a pastel colour pair,
+    matching the action-menu's tree pane (delete > add > rename >
+    modify). Returns None for plain rows that don't need an overlay."""
+    pair = (x, y)
+    if "U" in pair or pair == ("A", "A") or pair == ("D", "D"):
+        return PAIR_PASTEL_RED
+    if "D" in pair:
+        return PAIR_PASTEL_RED
+    if "A" in pair:
+        return PAIR_PASTEL_GREEN
+    if "R" in pair:
+        return PAIR_PASTEL_BLUE
+    if "M" in pair:
+        return PAIR_PASTEL_YELLOW
+    return None
+
+
+def _review_spinner(state: State) -> str:
+    """Same spinner glyph the sidebar / action-menu animations use,
+    so every animated indicator on screen ticks in lockstep."""
+    return SPINNER_FRAMES[state.spinner_frame % len(SPINNER_FRAMES)]
+
+
+def _collect_review_focusables(
+    blocks: List[ReviewBlock],
+) -> List[Tuple[int, str, object]]:
+    """Flatten every block's interactive items into one ordered list
+    of `(block_idx, kind, item)`. `kind` is "lfs", "toggle", or
+    "then_run". Up/Down on the left pane navigates this list;
+    `block_idx` says which block's files the right pane should
+    show. The list intentionally omits headers / message / push
+    summary lines — those are display-only context."""
+    out: List[Tuple[int, str, object]] = []
+    for bi, block in enumerate(blocks):
+        for c in block.lfs_candidates:
+            out.append((bi, "lfs", c))
+        for tog in block.workflow_toggles:
+            out.append((bi, "toggle", tog))
+        for sel in block.then_run_items:
+            out.append((bi, "then_run", sel))
+    return out
+
+
+def _focused_block_idx(focusables: List[Tuple[int, str, object]],
+                       focus: int, default: int = 0) -> int:
+    if focus < 0 or focus >= len(focusables):
+        return default
+    return focusables[focus][0]
+
+
+def _word_wrap(text: str, first_w: int, cont_w: int) -> List[str]:
+    """Greedy word-wrap, breaking on whitespace. Words longer than a
+    row are hard-broken at the row boundary so a 200-char URL doesn't
+    silently truncate. Returns the list of wrapped lines, each at
+    most `first_w` (line 0) or `cont_w` (lines 1+) chars wide."""
+    if not text:
+        return []
+    if first_w <= 0:
+        first_w = 1
+    if cont_w <= 0:
+        cont_w = 1
+    words = text.split(" ")
+    lines: List[str] = []
+    current = ""
+    cap = first_w
+    for w in words:
+        # Hard-break a word that's longer than the available width.
+        while len(w) > cap:
+            if current:
+                lines.append(current)
+                current = ""
+                cap = cont_w
+            lines.append(w[:cap])
+            w = w[cap:]
+        candidate = w if not current else current + " " + w
+        if len(candidate) <= cap:
+            current = candidate
+        else:
+            lines.append(current)
+            current = w
+            cap = cont_w
+    if current:
+        lines.append(current)
+    return lines
+
+
+def _wrap_message_lines(message: str, cap: int, max_w: int
+                        ) -> List[str]:
+    """Lay out a commit message across as many rows as needed for
+    the review screen's left pane. End-truncates the FULL message
+    when `cap > 0` and `len(message) > cap` (cap=0 disables the
+    cap entirely). Continuation lines align under the opening
+    quote; the closing quote sits on the last line, on its own
+    line if the last chunk would otherwise overflow `max_w`."""
+    if cap > 0 and len(message) > cap:
+        message = message[: max(0, cap - 1)] + "…"
+    if not message:
+        return ['  message: ""']
+    prefix = '  message: "'
+    cont_indent = " " * len(prefix)
+    text = message.replace("\n", " ").replace("\r", "")
+    first_w = max(1, max_w - len(prefix))
+    cont_w = max(1, max_w - len(cont_indent))
+    chunks = _word_wrap(text, first_w, cont_w)
+    if not chunks:
+        return [prefix + '"']
+    lines = [prefix + chunks[0]]
+    for chunk in chunks[1:]:
+        lines.append(cont_indent + chunk)
+    last = lines[-1]
+    if len(last) + 1 > max_w:
+        # Pushing the closing quote here would overflow — drop it on
+        # its own indented row instead. Reads as "open quote, body,
+        # close quote on its own line".
+        lines.append(cont_indent + '"')
     else:
-        # then-run selector
-        hints.append(Hint(KEY_LEFT_RIGHT, "cycle then-run target"))
-    hints.append(Hint(KEY_ENTER, "execute commits"))
+        lines[-1] = last + '"'
+    return lines
+
+
+def _block_left_rows(
+    block: ReviewBlock,
+    focusables: List[Tuple[int, str, object]],
+    focus: int, panel_focus: str, block_idx: int,
+    inner_w: int, message_cap: int,
+) -> List[Tuple[str, int, bool]]:
+    """Build the (text, attr, is_focused) tuples for ONE block on
+    the left pane. Focus highlighting only kicks in when the left
+    pane has the active focus — when the user has Shift+Tab'd over
+    to the right pane, the rows render in their resting style so
+    both panels can't claim focus at the same time. `inner_w` is
+    the available pane width used to wrap multi-line content (the
+    commit message); `message_cap` end-truncates the full message
+    before wrapping (0 disables)."""
+    rows: List[Tuple[str, int, bool]] = []
+    header_attr = curses.A_BOLD | curses.color_pair(PAIR_BRANCH)
+    rows.append((f"{block.label}  [{block.branch}]", header_attr, False))
+
+    if block.merging:
+        rows.append((
+            "  ⚠ merge / rebase in progress — commit will be skipped",
+            curses.color_pair(PAIR_ERR), False))
+        for cp in block.conflict_paths:
+            rows.append((f"      {cp}",
+                         curses.color_pair(PAIR_ERR), False))
+        return rows
+
+    if block.message:
+        for line in _wrap_message_lines(block.message, message_cap, inner_w):
+            rows.append((line, 0, False))
+    rows.append((f"  {block.push_summary}", curses.A_DIM, False))
+    if block.siblings_summary:
+        rows.append((f"  sync: {block.siblings_summary}",
+                     curses.A_DIM, False))
+
+    if block.lfs_candidates:
+        rows.append((
+            f"  ⚠ files ≥{block.threshold_mb} MB not LFS-tracked — "
+            "push will fail:",
+            curses.color_pair(PAIR_ERR), False))
+        for cand in block.lfs_candidates:
+            is_focused = (panel_focus == "left" and focus >= 0
+                          and focusables[focus] == (block_idx, "lfs", cand))
+            check = "[x]" if cand.track else "[ ]"
+            text = f"      {check}  {cand.path}  ({cand.size_str})"
+            base = PAIR_OK if cand.track else PAIR_ERR
+            attr = curses.color_pair(base)
+            if is_focused:
+                attr |= curses.A_REVERSE
+            rows.append((text, attr, is_focused))
+
+    for tog in block.workflow_toggles:
+        is_focused = (panel_focus == "left" and focus >= 0
+                      and focusables[focus] == (block_idx, "toggle", tog))
+        on = tog.repo.track_workflow.get(tog.workflow_name, False)
+        check = "[x]" if on else "[ ]"
+        text = f"  {check}  track action: {tog.workflow_name}"
+        if on:
+            attr = curses.color_pair(PAIR_OK)
+        else:
+            attr = curses.color_pair(PAIR_HEADER) | curses.A_DIM
+        if is_focused:
+            attr |= curses.A_REVERSE
+        rows.append((text, attr, is_focused))
+
+    for sel in block.then_run_items:
+        is_focused = (panel_focus == "left" and focus >= 0
+                      and focusables[focus] == (block_idx, "then_run", sel))
+        indent = "        " if sel.after_workflow else "  "
+        label = "then run:" if sel.after_workflow else "then run after push:"
+        current = _then_run_current(sel) or "(none)"
+        text = f"{indent}{label} ‹ {current} ›"
+        if is_focused:
+            attr = curses.color_pair(PAIR_BRANCH) | curses.A_BOLD
+        else:
+            attr = curses.A_DIM
+        rows.append((text, attr, is_focused))
+    return rows
+
+
+def _build_left_pane_rows(
+    blocks: List[ReviewBlock],
+    focusables: List[Tuple[int, str, object]],
+    focus: int, panel_focus: str, inner_w: int,
+    message_cap: int,
+) -> Tuple[List[Tuple[str, int]], int]:
+    """Concatenate every block's rows into one flat (text, attr)
+    list, with subtle divider lines between blocks. Returns
+    (rows, focused_row_index) — the second value tells the caller
+    which row index to keep visible when adjusting scroll.
+
+    `inner_w` is the available pane width (commit messages wrap to
+    fit it); `message_cap` end-truncates the full message before
+    wrapping (0 disables the cap)."""
+    rows: List[Tuple[str, int]] = []
+    focused_row_idx = -1
+    for bi, block in enumerate(blocks):
+        block_rows = _block_left_rows(
+            block, focusables, focus, panel_focus, bi,
+            inner_w, message_cap)
+        for text, attr, is_focused in block_rows:
+            if is_focused:
+                focused_row_idx = len(rows)
+            rows.append((text, attr))
+        if bi < len(blocks) - 1:
+            rows.append(("─" * max(1, inner_w - 2), curses.A_DIM))
+    return rows, focused_row_idx
+
+
+def _draw_left_pane(stdscr, x: int, y: int, w: int, h: int,
+                    rows: List[Tuple[str, int]], scroll: int) -> None:
+    for i in range(h):
+        idx = scroll + i
+        if idx >= len(rows):
+            break
+        text, attr = rows[idx]
+        safe_addstr(stdscr, y + i, x, text[:w], attr)
+
+
+def _render_review_file_row(stdscr, y: int, x: int, w: int,
+                            fe: FileEntry, focused: bool) -> None:
+    """Same shape as the action-menu's tree-row renderer — pastel
+    overlay on the status code, green/red on the +ins/-del numbers."""
+    code = "??" if fe.untracked else f"{fe.x}{fe.y}"
+    stat_ins = f"+{fe.inserted}" if (fe.inserted or fe.deleted) else ""
+    stat_del = f"-{fe.deleted}" if (fe.inserted or fe.deleted) else ""
+    stat = f"{stat_ins} {stat_del}".strip()
+    left = f" {code}  "
+    pad = max(1, w - len(left) - len(stat) - 1)
+    name = fe.path
+    if len(name) > pad:
+        name = name[: pad - 1] + "…"
+    name = name.ljust(pad)
+    full = f"{left}{name} {stat}"
+    if focused:
+        safe_addstr(stdscr, y, x, full, curses.A_REVERSE)
+        return
+    base = curses.A_DIM if fe.untracked else 0
+    safe_addstr(stdscr, y, x, full, base)
+    if not fe.untracked:
+        pair_id = _file_status_pair(fe.x, fe.y)
+        if pair_id is not None:
+            safe_addstr(stdscr, y, x + 1, code, curses.color_pair(pair_id))
+    if stat:
+        stat_x = x + len(left) + pad + 1
+        safe_addstr(stdscr, y, stat_x, stat_ins,
+                    curses.color_pair(PAIR_PASTEL_GREEN))
+        safe_addstr(stdscr, y, stat_x + len(stat_ins) + 1, stat_del,
+                    curses.color_pair(PAIR_PASTEL_RED))
+
+
+def _draw_right_pane(stdscr, x: int, y: int, w: int, h: int,
+                     block: Optional[ReviewBlock],
+                     panel_focus: str, state: State) -> None:
+    """Right pane = working-tree files for the focused block. Header
+    accents bright when the right pane has focus, dims otherwise so
+    the user can see at a glance which side ↑/↓ steers."""
+    if block is None or w <= 0 or h <= 0:
+        return
+    if panel_focus == "right":
+        header_attr = curses.A_BOLD | curses.color_pair(PAIR_SB_CYAN)
+    else:
+        header_attr = curses.A_BOLD | curses.A_DIM
+    if block.files_loading and not block.files:
+        count_str = _review_spinner(state)
+    else:
+        count_str = str(len(block.files))
+    header = f"{block.label}: {count_str} file(s)"
+    safe_addstr(stdscr, y, x, header[:w], header_attr)
+
+    line = y + 2
+    list_h = max(0, h - (line - y))
+    if list_h <= 0:
+        return
+
+    if block.files_loading and not block.files:
+        safe_addstr(stdscr, line, x + 2,
+                    f"{_review_spinner(state)} loading files…",
+                    curses.A_DIM)
+        return
+    if not block.files:
+        safe_addstr(stdscr, line, x + 2, "(no changes)", curses.A_DIM)
+        return
+
+    sel = block.file_selected
+    if sel < block.file_scroll:
+        block.file_scroll = sel
+    elif sel >= block.file_scroll + list_h:
+        block.file_scroll = sel - list_h + 1
+    block.file_scroll = max(0, min(
+        block.file_scroll, max(0, len(block.files) - list_h)))
+
+    for slot in range(list_h):
+        idx = block.file_scroll + slot
+        if idx >= len(block.files):
+            break
+        fe = block.files[idx]
+        focused = panel_focus == "right" and idx == sel
+        _render_review_file_row(stdscr, line + slot, x, w, fe, focused)
+    if block.file_scroll > 0:
+        msg = f"  ↑ {block.file_scroll} more above"
+        safe_addstr(stdscr, line, x + max(0, w - len(msg) - 1),
+                    msg, curses.A_DIM)
+    end = min(len(block.files), block.file_scroll + list_h)
+    if end < len(block.files):
+        below = len(block.files) - end
+        msg = f"  ↓ {below} more below"
+        safe_addstr(stdscr, line + list_h - 1, x + max(0, w - len(msg) - 1),
+                    msg, curses.A_DIM)
+
+
+def _review_hints(focusables: List[Tuple[int, str, object]],
+                  focus: int, panel_focus: str) -> List[Hint]:
+    hints: List[Hint] = []
+    if panel_focus == "left":
+        hints.append(Hint(KEY_UP_DOWN, "select"))
+        if 0 <= focus < len(focusables):
+            _, kind, obj = focusables[focus]
+            if kind == "lfs":
+                hints.append(Hint(
+                    KEY_SPACE,
+                    "stop tracking" if obj.track else "track with LFS"))
+            elif kind == "toggle":
+                on = obj.repo.track_workflow.get(obj.workflow_name, False)
+                hints.append(Hint(
+                    KEY_SPACE,
+                    "untrack workflow" if on else "track workflow"))
+            else:  # then_run
+                hints.append(Hint(KEY_LEFT_RIGHT,
+                                  "cycle then-run target"))
+        hints.append(Hint(KEY_SHIFT_TAB, "files panel"))
+        hints.append(Hint(KEY_ENTER, "execute commits"))
+    else:  # right
+        hints.append(Hint(KEY_UP_DOWN, "select file"))
+        hints.append(Hint(KEY_ENTER, "view diff"))
+        hints.append(Hint(KEY_SHIFT_TAB, "back to repos"))
     hints.append(Hint(KEY_ESC, "back"))
     return hints
 
 
-def draw_confirm(stdscr,
-                 lines: List[Tuple[str, int]],
-                 candidates: List[LFSCandidate],
-                 wf_toggles: List[WorkflowToggle],
-                 then_run_items: List[ThenRunSelector],
-                 cursor: int,
-                 scroll: int) -> int:
-    """Returns max scroll value for clamping. `cursor` indexes a unified
-    list of focusable items in this order: LFS candidates → workflow
-    toggles → then-run selectors."""
+def draw_review(stdscr, state: State, blocks: List[ReviewBlock],
+                focusables: List[Tuple[int, str, object]],
+                focus: int, panel_focus: str,
+                scroll: int) -> int:
+    """Draw the two-panel review screen and return the (clamped)
+    left-pane scroll the caller should keep going forward.
+
+    Layout:
+        ┌─ Review · N targets · auto-stage on · auto-push on ─┐
+        │                                                       │
+        │  block A header   │   block A files (header)          │
+        │  ...              │   working-tree rows               │
+        │  ── divider ──    │                                   │
+        │  block B header   │                                   │
+        │  ...              │                                   │
+        │                                                       │
+        │  hint line                                            │
+        └───────────────────────────────────────────────────────┘
+    """
     stdscr.erase()
-    h, _ = stdscr.getmaxyx()
-    safe_addstr(stdscr, 0, 0, "Review",
+    h, w = stdscr.getmaxyx()
+
+    # Workspace title bar — same shape as the main screen's row 0
+    # (`idlegit · <workspace name>`), MINUS the focus chevrons. The
+    # review screen's workspace selector isn't navigable, just a
+    # label, so the chevrons would be misleading.
+    safe_addstr(stdscr, 0, 0, "idlegit",
                 curses.A_BOLD | curses.color_pair(PAIR_HEADER))
+    if state.workspace_name:
+        safe_addstr(stdscr, 0, len("idlegit"), " · ", curses.A_DIM)
+        ws_attr = curses.A_BOLD | curses.color_pair(PAIR_BRANCH)
+        safe_addstr(stdscr, 0, len("idlegit") + 3,
+                    state.workspace_name, ws_attr)
 
-    body_top = 2
+    # Review subtitle on row 2 (row 1 left blank to separate the
+    # workspace title from the screen-specific header).
+    safe_addstr(stdscr, 2, 0, "Review",
+                curses.A_BOLD | curses.color_pair(PAIR_HEADER))
+    sub = (f"{len(blocks)} target(s)  ·  "
+           f"auto-stage: {'on' if state.auto_stage else 'off'}  ·  "
+           f"auto-push: {'on' if state.auto_push else 'off'}")
+    safe_addstr(stdscr, 2, len("Review") + 3, sub, curses.A_DIM)
+
+    body_top = 4
     body_h = max(1, h - body_top - 2)
-    max_scroll = max(0, len(lines) - body_h)
+    left_w = max(40, int(w * 0.55))
+    if left_w >= w - 12:
+        left_w = max(20, w - 12)
+    right_x = left_w + 1
+    right_w = max(10, w - right_x - 1)
+
+    rows, focused_row = _build_left_pane_rows(
+        blocks, focusables, focus, panel_focus, left_w,
+        state.max_commit_message_length_in_review)
+    if focused_row >= 0:
+        if focused_row < scroll:
+            scroll = focused_row
+        elif focused_row >= scroll + body_h:
+            scroll = focused_row - body_h + 1
+    max_scroll = max(0, len(rows) - body_h)
     scroll = max(0, min(scroll, max_scroll))
+    _draw_left_pane(stdscr, 0, body_top, left_w, body_h, rows, scroll)
 
-    cand_at_line = {c.line_index: i for i, c in enumerate(candidates)}
-    wf_at_line = {t.line_index: i for i, t in enumerate(wf_toggles)}
-    tr_at_line = {s.line_index: i for i, s in enumerate(then_run_items)}
-    n_cands = len(candidates)
-    n_toggles = len(wf_toggles)
+    for row in range(body_h):
+        safe_addstr(stdscr, body_top + row, left_w, "│", curses.A_DIM)
 
-    for i in range(body_h):
-        idx = scroll + i
-        if idx >= len(lines):
-            break
-        if idx in cand_at_line:
-            cand_idx = cand_at_line[idx]
-            text, attr = render_candidate_line(
-                candidates[cand_idx], focused=(cursor == cand_idx))
-        elif idx in wf_at_line:
-            wf_idx = wf_at_line[idx]
-            focused = cursor == n_cands + wf_idx
-            text, attr = render_workflow_toggle_line(
-                wf_toggles[wf_idx], focused=focused)
-        elif idx in tr_at_line:
-            tr_idx = tr_at_line[idx]
-            focused = cursor == n_cands + n_toggles + tr_idx
-            text, attr = render_then_run_line(
-                then_run_items[tr_idx], focused=focused)
-        else:
-            text, attr = lines[idx]
-        safe_addstr(stdscr, body_top + i, 0, text, attr)
+    block = blocks[_focused_block_idx(focusables, focus)] if blocks else None
+    _draw_right_pane(stdscr, right_x + 1, body_top, right_w, body_h,
+                     block, panel_focus, state)
 
-    if max_scroll > 0:
-        safe_addstr(stdscr, h - 2, 0,
-                    f"({scroll}/{max_scroll} lines scrolled)", curses.A_DIM)
-
-    _, term_w = stdscr.getmaxyx()
-    render_hints(stdscr, h - 1, 0, max(0, term_w - 1),
-                 _confirm_hints(candidates, wf_toggles, then_run_items,
-                                cursor),
+    render_hints(stdscr, h - 1, 0, max(0, w - 1),
+                 _review_hints(focusables, focus, panel_focus),
                  attr=curses.A_DIM)
-
     curses.curs_set(0)
     stdscr.refresh()
-    return max_scroll
+    return scroll
+
+
 
 
 
@@ -1419,101 +1699,130 @@ def _drive_modal_until_closed(stdscr, state: State, slot: str) -> bool:
 
 
 def handle_confirm(stdscr, state: State) -> None:
-    """Inner loop for the review screen. Returns when the user confirms or
-    backs out; commits run async after Enter, so we just hand off and exit.
+    """Two-panel review screen.
 
-    Cursor model: one unified list of focusable items, sorted by
-    `line_index` so Up/Down navigation matches what's visible on
-    screen. Each item is `(kind, obj)` where kind is "lfs", "toggle",
-    or "then_run"; Space flips boolean items, ←/→ cycles a then-run
-    selector through its repo's dispatchable workflows."""
+    Left pane = per-target blocks (header + message + push summary +
+    LFS warnings + workflow toggles + then-runs). ↑/↓ navigates
+    across blocks; Space toggles LFS / workflow rows; ←/→ cycles a
+    then-run target.
+
+    Right pane = working-tree files for the block of the currently-
+    focused row (loaded asynchronously, with a spinner placeholder
+    until `query_working_tree` lands). Shift+Tab toggles focus
+    between the panes; in the right pane ↑/↓ navigates the file
+    list and Enter opens the diff modal — a sub-modal of this inner
+    loop, drawn on top of the review screen with its keys handled
+    here so Enter / Esc close it without leaving review.
+
+    Enter from the left pane runs the commits — the async pipeline
+    takes over the sidebar from there. Esc backs out without
+    committing."""
     if not _detached_review_preflight(stdscr, state):
         return
-    lines, candidates, wf_toggles, then_run_items = build_confirm_lines(state)
-    # Build one focus list ordered by visible line so a Down keystroke
-    # always lands on the row directly below — toggles + then-run rows
-    # were interleaved on screen but were previously cursored as two
-    # separate blocks, which made Down "skip past" a then-run row and
-    # come back to it later.
-    focusables: List[Tuple[str, object]] = []
-    for c in candidates:
-        focusables.append(("lfs", c))
-    for tog in wf_toggles:
-        focusables.append(("toggle", tog))
-    for s in then_run_items:
-        focusables.append(("then_run", s))
-    focusables.sort(key=lambda kv: kv[1].line_index)
-    n_focus = len(focusables)
-    cursor = 0 if n_focus else -1
+    blocks = build_review_blocks(state)
+    if not blocks:
+        return
+    kick_off_review_files_load(blocks)
+
+    focusables = _collect_review_focusables(blocks)
+    focus = 0 if focusables else -1
+    panel_focus = "left"
     scroll = 0
-    while True:
-        if cursor >= 0:
-            h, _ = stdscr.getmaxyx()
-            body_h = max(1, h - 4)
-            focus_line = focusables[cursor][1].line_index
-            scroll = ensure_cursor_visible(focus_line, scroll, body_h)
-        # `draw_confirm` keeps its existing interface (a single `cursor`
-        # value mapped through n_cands / n_toggles to figure out which
-        # item is focused). We derive that legacy index from the
-        # currently-focused entry in our line-ordered focus list so the
-        # highlight stays aligned with what `cursor` actually points at.
-        n_cands = len(candidates)
-        n_toggles = len(wf_toggles)
-        legacy_cursor = -1
-        if cursor >= 0:
-            kind, obj = focusables[cursor]
-            if kind == "lfs":
-                legacy_cursor = candidates.index(obj)
-            elif kind == "toggle":
-                legacy_cursor = n_cands + wf_toggles.index(obj)
-            else:  # then_run
-                legacy_cursor = (
-                    n_cands + n_toggles + then_run_items.index(obj))
-        max_scroll = draw_confirm(
-            stdscr, lines, candidates, wf_toggles, then_run_items,
-            legacy_cursor, scroll)
-        scroll = min(scroll, max_scroll)
-        try:
-            key = stdscr.getch()
-        except KeyboardInterrupt:
-            return
-        if key == curses.KEY_RESIZE:
-            continue
-        if key == 27:
-            return
-        if key in (10, 13, curses.KEY_ENTER):
-            kick_off_workers(state, candidates)
-            return  # async pipeline takes over the sidebar
-        if key == ord(" ") and cursor >= 0:
-            kind, obj = focusables[cursor]
-            if kind == "lfs":
-                obj.track = not obj.track
-            elif kind == "toggle":
-                cur = obj.repo.track_workflow.get(obj.workflow_name, False)
-                obj.repo.track_workflow[obj.workflow_name] = not cur
-            # Space on a then-run row is a no-op — use ←/→ to cycle.
-            continue
-        if (key in (curses.KEY_LEFT, curses.KEY_RIGHT)
-                and cursor >= 0
-                and focusables[cursor][0] == "then_run"):
-            cycle_then_run(
-                focusables[cursor][1],
-                -1 if key == curses.KEY_LEFT else 1)
-            continue
-        if key == curses.KEY_UP:
-            if cursor >= 0:
-                cursor = max(0, cursor - 1)
-            else:
-                scroll = max(0, scroll - 1)
-        elif key == curses.KEY_DOWN:
-            if cursor >= 0:
-                cursor = min(n_focus - 1, cursor + 1)
-            else:
-                scroll = min(max_scroll, scroll + 1)
-        elif key == curses.KEY_PPAGE:
-            scroll = max(0, scroll - 10)
-        elif key == curses.KEY_NPAGE:
-            scroll = min(max_scroll, scroll + 10)
+
+    try:
+        while True:
+            anim = any(b.files_loading for b in blocks) or (
+                state.diff_viewer is not None and state.diff_viewer.loading)
+            stdscr.timeout(100 if anim else 1000)
+            scroll = draw_review(stdscr, state, blocks, focusables,
+                                 focus, panel_focus, scroll)
+            if state.diff_viewer is not None:
+                draw_diff_viewer(stdscr, state)
+                stdscr.refresh()
+            try:
+                key = stdscr.getch()
+            except KeyboardInterrupt:
+                return
+            if key == -1:
+                if anim:
+                    state.spinner_frame = (
+                        state.spinner_frame + 1) % len(SPINNER_FRAMES)
+                continue
+            if key == curses.KEY_RESIZE:
+                continue
+
+            # Diff modal owns key handling while it's open. Enter / Esc
+            # both close it (per the user-specified gesture); arrow /
+            # page keys scroll the diff body.
+            if state.diff_viewer is not None:
+                handle_diff_viewer_key(state, key)
+                continue
+
+            if key == 27:  # Esc
+                return
+            if key in (10, 13, curses.KEY_ENTER):
+                if panel_focus == "left":
+                    cands = [c for b in blocks for c in b.lfs_candidates]
+                    kick_off_workers(state, cands)
+                    return  # async pipeline takes over the sidebar
+                # Right pane Enter → open the diff viewer for the
+                # focused file row. The viewer is a modal on top of
+                # the review screen; Enter / Esc inside the modal
+                # close it and we land back here on the same row.
+                bi = _focused_block_idx(focusables, focus)
+                if 0 <= bi < len(blocks):
+                    block = blocks[bi]
+                    if (not block.files_loading and block.files
+                            and 0 <= block.file_selected < len(block.files)):
+                        fe = block.files[block.file_selected]
+                        open_diff_viewer(
+                            state,
+                            target_path=block.target_path,
+                            label=block.label,
+                            file_path=fe.path,
+                            untracked=fe.untracked,
+                        )
+                continue
+            if key == curses.KEY_BTAB:
+                panel_focus = "right" if panel_focus == "left" else "left"
+                continue
+
+            if panel_focus == "left":
+                if key == ord(" ") and 0 <= focus < len(focusables):
+                    _, kind, obj = focusables[focus]
+                    if kind == "lfs":
+                        obj.track = not obj.track
+                    elif kind == "toggle":
+                        on = obj.repo.track_workflow.get(
+                            obj.workflow_name, False)
+                        obj.repo.track_workflow[obj.workflow_name] = not on
+                    # Space on a then-run row is a no-op (use ←/→).
+                    continue
+                if (key in (curses.KEY_LEFT, curses.KEY_RIGHT)
+                        and 0 <= focus < len(focusables)):
+                    _, kind, obj = focusables[focus]
+                    if kind == "then_run":
+                        cycle_then_run(
+                            obj, -1 if key == curses.KEY_LEFT else 1)
+                    continue
+                if key == curses.KEY_UP and focus > 0:
+                    focus -= 1
+                elif (key == curses.KEY_DOWN
+                        and focus < len(focusables) - 1):
+                    focus += 1
+            else:  # panel_focus == "right"
+                bi = _focused_block_idx(focusables, focus)
+                if 0 <= bi < len(blocks):
+                    block = blocks[bi]
+                    n = len(block.files)
+                    if key == curses.KEY_UP and block.file_selected > 0:
+                        block.file_selected -= 1
+                    elif (key == curses.KEY_DOWN
+                            and block.file_selected < n - 1):
+                        block.file_selected += 1
+    finally:
+        for b in blocks:
+            b.cancel_event.set()
 
 
 # ---------- Initial empty-repo screen helper ------------------------------
