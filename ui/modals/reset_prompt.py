@@ -38,7 +38,7 @@ def _hints(prompt: ResetPrompt) -> list:
             hints.append(Hint(KEY_ENTER, f"reset {n} commit{plural}"))
     else:
         hints.append(Hint("0-9", "type count"))
-        hints.append(Hint(KEY_ENTER, "wipe ALL unpushed"))
+        hints.append(Hint(KEY_ENTER, "type 0 to wipe all"))
     hints.append(Hint(KEY_ESC, "back"))
     return hints
 
@@ -105,12 +105,12 @@ def draw_reset_prompt(stdscr, state: State, sidebar_x: int) -> None:
     line += 1
     safe_addstr(stdscr, line, inner_x,
                 end_truncate(
-                    "Number to reset:  (Enter on 0 wipes ALL unpushed)",
+                    "Number to reset:  (type 0 to wipe ALL unpushed)",
                     inner_w),
                 sb | curses.A_DIM)
     line += 1
 
-    visible = prompt.typed if prompt.typed else "0"
+    visible = prompt.typed if prompt.typed else ""
     field_text = f" {visible} "
     safe_addstr(stdscr, line, inner_x, field_text.ljust(inner_w),
                 sb | curses.A_REVERSE)
@@ -127,8 +127,10 @@ def handle_reset_prompt_key(state: State, key: int) -> None:
         state.reset_prompt = None
         return
     if key in (10, 13, curses.KEY_ENTER):
+        if not prompt.typed:
+            return
         try:
-            n = int(prompt.typed) if prompt.typed else 0
+            n = int(prompt.typed)
         except ValueError:
             n = 0
         kick_off_action(

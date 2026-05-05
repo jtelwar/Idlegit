@@ -27,6 +27,7 @@ from config import (
     load_config,
     load_workspaces,
     save_workspaces,
+    get_load_warnings,
 )
 from git_ops import discover_repos
 from models import State
@@ -95,7 +96,7 @@ def _discover_workspace_repos(folders) -> list:
     return repos
 
 
-def _run_workspace_creator_subloop(stdscr, cfg):
+def _run_workspace_creator_subloop(stdscr, cfg, startup_warnings=None):
     """Run the workspace creator as a self-contained sub-loop. Used at
     first launch when idlegit.workspaces is empty/missing — drives a
     blank welcome backdrop with the creator modal overlaid until the
@@ -110,11 +111,15 @@ def _run_workspace_creator_subloop(stdscr, cfg):
     state = State(
         repos=[], workspace_name="", workspaces=[], base_config=cfg,
     )
+    intro = ("No workspaces are configured yet. Add one or more folder "
+             "paths to scan for git repos.")
+    if startup_warnings:
+        intro = (f"{startup_warnings[0]}\n\n"
+                 "Add one or more folder paths to scan for git repos.")
     open_workspace_creator(
         state,
         title="Welcome to idlegit",
-        intro=("No workspaces are configured yet. Add one or more folder "
-               "paths to scan for git repos."))
+        intro=intro)
     stdscr.timeout(100)
     while state.workspace_creator is not None:
         if state.workspace_creator.result is not None:
@@ -153,7 +158,8 @@ def _run_workspace_creator_subloop(stdscr, cfg):
     return result
 
 
-def run(stdscr, cfg, workspaces, initial_active_idx: int = 0) -> None:
+def run(stdscr, cfg, workspaces, initial_active_idx: int = 0,
+        startup_warnings=None) -> None:
     try:
         curses.set_escdelay(25)
     except (AttributeError, curses.error):
@@ -169,7 +175,8 @@ def run(stdscr, cfg, workspaces, initial_active_idx: int = 0) -> None:
     # blocks until the user commits at least one workspace (then we
     # persist it) or cancels with Esc (we exit cleanly).
     if not workspaces:
-        workspaces = _run_workspace_creator_subloop(stdscr, cfg)
+        workspaces = _run_workspace_creator_subloop(
+            stdscr, cfg, startup_warnings=startup_warnings)
         if not workspaces:
             return
         try:
@@ -218,6 +225,9 @@ def run(stdscr, cfg, workspaces, initial_active_idx: int = 0) -> None:
         active_workspace_index=active_idx,
         base_config=cfg,
     )
+    for warning in startup_warnings or []:
+        t = state.tasks.add("startup warning")
+        state.tasks.update(t, "warn", warning)
     # Layer base-config defaults + this workspace's overrides on top of
     # the freshly-built State so the same code path runs on startup and
     # later workspace switches.
@@ -296,7 +306,9 @@ def run(stdscr, cfg, workspaces, initial_active_idx: int = 0) -> None:
                                for r in state.repos for c in r.children)
                         or creator_checking
                         or menu_checking
-                        or action_menu_loading)
+                        or action_menu_loading
+                        or (state.diff_viewer is not None
+                            and state.diff_viewer.loading))
         if anim_running:
             state.spinner_frame = (state.spinner_frame + 1) % len(SPINNER_FRAMES)
 
@@ -413,6 +425,7 @@ def _set_terminal_title(title: str) -> None:
 def main() -> int:
     cfg = load_config()
     workspaces, persisted_active_idx = load_workspaces()
+    startup_warnings = get_load_warnings()
     # Remember the last-active workspace name BEFORE filtering — so if
     # we drop the entry whose folders no longer exist, we can still try
     # to honour the user's previous choice in the resulting list (or
@@ -424,7 +437,14 @@ def main() -> int:
     # all its folders, drop the workspace entirely. The in-app creator
     # wizard fires when run() sees an empty list.
     for ws in workspaces:
-        ws.folders = [f for f in ws.folders if f.is_dir()]
+        kept = []
+        for f in ws.folders:
+            if f.is_dir():
+                kept.append(f)
+            else:
+                startup_warnings.append(
+                    f"{ws.name}: workspace folder unavailable: {f}")
+        ws.folders = kept
     workspaces = [ws for ws in workspaces if ws.folders]
     # Re-resolve the remembered active index against the post-filter
     # list. If the remembered workspace was dropped (its folders all
@@ -440,7 +460,9 @@ def main() -> int:
     _set_terminal_title(f"idlegit · {title_name}" if title_name else "idlegit")
     try:
         curses.wrapper(
-            lambda stdscr: run(stdscr, cfg, workspaces, initial_active_idx))
+            lambda stdscr: run(
+                stdscr, cfg, workspaces, initial_active_idx,
+                startup_warnings=startup_warnings))
     except KeyboardInterrupt:
         pass
     finally:

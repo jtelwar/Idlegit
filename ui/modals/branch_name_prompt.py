@@ -38,7 +38,7 @@ _VALID_NAME_CHARS = frozenset(
 
 def _hints(prompt: BranchNamePrompt) -> list:
     name = prompt.typed or prompt.default_name
-    if not name:
+    if not name or name.startswith("-"):
         return [Hint(KEY_ESC, "back")]
     return [
         Hint("a-z, 0-9, /-_.", "type name"),
@@ -147,7 +147,7 @@ def handle_branch_name_prompt_key(state: State, key: int) -> None:
         return
     if key in (10, 13, curses.KEY_ENTER):
         name = prompt.typed.strip() or prompt.default_name
-        if not name:
+        if not name or name.startswith("-"):
             return
         kick_off_action(
             state, "branch_from_head",
@@ -166,5 +166,7 @@ def handle_branch_name_prompt_key(state: State, key: int) -> None:
     # Printable char in the allowlist gets appended.
     if 32 <= key < 127:
         ch = chr(key)
+        if not prompt.typed and ch == "-":
+            return
         if ch in _VALID_NAME_CHARS:
             prompt.typed += ch

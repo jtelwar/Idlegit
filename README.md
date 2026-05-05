@@ -26,10 +26,7 @@ that workspace's overrides). Workspaces are persisted to
 
 ## Design Goals
 
-- Frictionless 
-- Safe
-- Opinionated 
-- Configurable
+   Safe - Frictionless - Opinionated - Configurable
 
 ## Features
 
@@ -55,4 +52,4 @@ Defaults are sensible — you can run with no config at all.
 - `gh` on `$PATH` if you want github action running/tracking
 
 
-* NB no legal warranty to this effect is implied or offered. Don't come for me if this thing calls `rm -rf .git`. (It won't).
+\* NB no legal warranty to this effect is implied or offered. Don't come for me if this thing calls `rm -rf .git`. (I'm fairly sure it won't...).

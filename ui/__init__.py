@@ -13,9 +13,9 @@ from models import (
     ChildRef, FileEntry, LFSCandidate, Repo, ReviewBlock, State,
     ThenRunSelector, WorkflowToggle,
 )
-from config import CONFIG_FILE, DEFAULT_TRUNCATION_MODE
+from config import CONFIG_FILE, DEFAULT_TRUNCATION_MODE, VERSION
 from git_ops import (
-    find_lfs_warnings, gh_available, link_siblings,
+    find_lfs_warnings, gh_available, link_siblings, MAX_PARALLEL_GIT_JOBS,
     parse_github_slug, query_working_tree, would_run_on_push,
 )
 from workers import (
@@ -30,9 +30,12 @@ from workers import (
 from .colors import (  # noqa: F401  (re-exported public API)
     PAIR_AHEAD, PAIR_BEHIND, PAIR_BRANCH, PAIR_DIRTY, PAIR_ERR,
     PAIR_HEADER, PAIR_HINT, PAIR_OK,
-    PAIR_PASTEL_BLUE, PAIR_PASTEL_GREEN, PAIR_PASTEL_RED,
-    PAIR_PASTEL_YELLOW,
-    PAIR_SB_CYAN, PAIR_SB_ERR, PAIR_SB_FG, PAIR_SB_FG_ACTIVE,
+    PAIR_PASTEL_BLUE, PAIR_PASTEL_BLUE_ACTIVE,
+    PAIR_PASTEL_GREEN, PAIR_PASTEL_GREEN_ACTIVE,
+    PAIR_PASTEL_RED, PAIR_PASTEL_RED_ACTIVE,
+    PAIR_PASTEL_YELLOW, PAIR_PASTEL_YELLOW_ACTIVE,
+    PAIR_SB_CYAN, PAIR_SB_CYAN_ACTIVE, PAIR_SB_ERR, PAIR_SB_FG,
+    PAIR_SB_FG_ACTIVE,
     PAIR_SB_OK, PAIR_SB_WARN, PAIR_TOGGLE_OFF, PAIR_TOGGLE_ON, PAIR_WARN,
     _state_color, child_state_color, init_colors, state_color,
 )
@@ -105,7 +108,8 @@ def refresh_all_workspaces(stdscr,
         done[id(r)] = True
 
     curses.curs_set(0)
-    with ThreadPoolExecutor(max_workers=max(1, len(all_repos))) as ex:
+    max_workers = max(1, min(len(all_repos), MAX_PARALLEL_GIT_JOBS))
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futures = [ex.submit(work, r) for r in all_repos]
         frame = 0
         while not all(f.done() for f in futures):
@@ -153,6 +157,7 @@ def draw_workspace_loading(stdscr,
             ws_done.append(all(done.get(id(r), False) for r in repos))
 
     title = "idlegit"
+    ver_suffix = f"  v{VERSION}"
     completed_ws = sum(1 for d in ws_done if d)
     if n_ws == 1:
         summary = f"{spinner}  loading workspace"
@@ -171,8 +176,11 @@ def draw_workspace_loading(stdscr,
     cx = w // 2
     list_left = max(0, cx - (name_w + 8) // 2)
 
-    safe_addstr(stdscr, top, max(0, cx - len(title) // 2), title,
+    title_x = max(0, cx - (len(title) + len(ver_suffix)) // 2)
+    safe_addstr(stdscr, top, title_x, title,
                 curses.A_BOLD | curses.color_pair(PAIR_HEADER))
+    safe_addstr(stdscr, top, title_x + len(title), ver_suffix,
+                curses.color_pair(PAIR_BRANCH) | curses.A_DIM)
     safe_addstr(stdscr, top + 2, max(0, cx - len(summary) // 2),
                 summary, curses.color_pair(PAIR_BRANCH))
 
@@ -229,6 +237,26 @@ def _ensure_focused_visible(state: State, body_h: int, total_body: int) -> None:
     elif body_idx >= state.body_scroll + body_h:
         state.body_scroll = body_idx - body_h + 1
     state.body_scroll = max(0, min(state.body_scroll, max(0, total_body - body_h)))
+
+
+def _split_remaining_width(remaining_w: int, tasks_min_pct: float,
+                           tasks_max_pct: float) -> Tuple[int, int]:
+    """Split width after fixed repo columns into (message_w, tasks_w).
+
+    The task panel starts from an even split, then clamps to the
+    configured percentage band. Percentages are of `remaining_w`, not
+    of the full terminal width."""
+    if remaining_w <= 0:
+        return 0, 0
+    min_pct = max(0.0, min(1.0, tasks_min_pct))
+    max_pct = max(min_pct, max(0.0, min(1.0, tasks_max_pct)))
+    min_w = int(remaining_w * min_pct)
+    max_w = int(remaining_w * max_pct)
+    ideal_w = remaining_w // 2
+    tasks_w = max(min_w, min(max_w, ideal_w))
+    if remaining_w >= 2 and tasks_w >= remaining_w:
+        tasks_w = remaining_w - 1
+    return remaining_w - tasks_w, tasks_w
 
 
 # ---------- Main-screen hints registry -----------------------------------
@@ -333,15 +361,7 @@ def draw_main(stdscr, state: State) -> None:
     stdscr.erase()
     h, w = stdscr.getmaxyx()
 
-    sidebar_x, sidebar_w = sidebar_geometry(w)
-    main_w = sidebar_x
-
     body_h = _body_height_for(state, h)
-    if main_w < 80 or h < 8:
-        safe_addstr(stdscr, 0, 0, "terminal too small — resize and try again",
-                    curses.color_pair(PAIR_ERR))
-        stdscr.refresh()
-        return
 
     safe_addstr(stdscr, 0, 0, "idlegit",
                 curses.A_BOLD | curses.color_pair(PAIR_HEADER))
@@ -405,9 +425,9 @@ def draw_main(stdscr, state: State) -> None:
     # the tail of long child names and the configured truncation policy
     # never fires (it just looks like end-truncation by clipping).
     name_lengths = [len(truncate(r.display_name, nm, nmode))
-                    for r in state.repos]
+                    for r in state.repos] or [len("Repositories")]
     branch_lengths = [len(f"[{truncate(r.branch, bm, bmode)}]")
-                      for r in state.repos]
+                      for r in state.repos] or [0]
     for parent in state.repos:
         for ch in parent.children:
             name_lengths.append(
@@ -419,7 +439,19 @@ def draw_main(stdscr, state: State) -> None:
     branch_w = max(branch_lengths) + 2
     marker_w = 3
     field_x = 2 + name_w + branch_w + marker_w
-    field_w = max(20, main_w - field_x - 2)
+    remaining_w = max(0, w - field_x - 1)
+    field_w, sidebar_w = _split_remaining_width(
+        remaining_w,
+        state.tasks_min_width_percent,
+        state.tasks_max_width_percent)
+    sidebar_x = field_x + field_w
+    main_w = sidebar_x
+
+    if field_w < 1 or h < 8:
+        safe_addstr(stdscr, 0, 0, "terminal too small — resize and try again",
+                    curses.color_pair(PAIR_ERR))
+        stdscr.refresh()
+        return
 
     base_y = 4
     body_rows = state.selectable_rows()
@@ -491,7 +523,8 @@ def draw_main(stdscr, state: State) -> None:
                     or state.task_action_menu is not None
                     or state.workspace_menu is not None
                     or state.workspaces_picker is not None
-                    or state.workspace_creator is not None)
+                    or state.workspace_creator is not None
+                    or state.diff_viewer is not None)
     if state.action_menu is not None:
         draw_action_menu(stdscr, state, sidebar_x)
     if state.branch_picker is not None:
@@ -516,6 +549,8 @@ def draw_main(stdscr, state: State) -> None:
         draw_workspaces_picker(stdscr, state, sidebar_x)
     if state.workspace_creator is not None:
         draw_workspace_creator(stdscr, state, sidebar_x)
+    if state.diff_viewer is not None:
+        draw_diff_viewer(stdscr, state, sidebar_x)
 
     # Sidebar drawn LAST so it's always the freshest paint on screen —
     # avoids the resize artifacts where stale cells from the old layout
@@ -882,21 +917,21 @@ def cycle_then_run(selector: ThenRunSelector, direction: int) -> None:
 # ---------- Two-panel review screen --------------------------------------
 
 
-def _file_status_pair(x: str, y: str) -> Optional[int]:
+def _file_status_pair(x: str, y: str, pane_focused: bool = False) -> Optional[int]:
     """Map an XY porcelain status pair to a pastel colour pair,
     matching the action-menu's tree pane (delete > add > rename >
     modify). Returns None for plain rows that don't need an overlay."""
     pair = (x, y)
     if "U" in pair or pair == ("A", "A") or pair == ("D", "D"):
-        return PAIR_PASTEL_RED
+        return PAIR_PASTEL_RED_ACTIVE if pane_focused else PAIR_PASTEL_RED
     if "D" in pair:
-        return PAIR_PASTEL_RED
+        return PAIR_PASTEL_RED_ACTIVE if pane_focused else PAIR_PASTEL_RED
     if "A" in pair:
-        return PAIR_PASTEL_GREEN
+        return PAIR_PASTEL_GREEN_ACTIVE if pane_focused else PAIR_PASTEL_GREEN
     if "R" in pair:
-        return PAIR_PASTEL_BLUE
+        return PAIR_PASTEL_BLUE_ACTIVE if pane_focused else PAIR_PASTEL_BLUE
     if "M" in pair:
-        return PAIR_PASTEL_YELLOW
+        return PAIR_PASTEL_YELLOW_ACTIVE if pane_focused else PAIR_PASTEL_YELLOW
     return None
 
 
@@ -1033,10 +1068,22 @@ def _block_left_rows(
     if block.message:
         for line in _wrap_message_lines(block.message, message_cap, inner_w):
             rows.append((line, 0, False))
-    rows.append((f"  {block.push_summary}", curses.A_DIM, False))
+    push_line = f"  {block.push_summary}"
+    arrow = push_line.rfind("→ ")
+    if arrow != -1 and "yes" in push_line:
+        val_attr = curses.color_pair(PAIR_BRANCH) | curses.A_DIM
+        rows.append(([
+            (push_line[:arrow + 2], curses.A_DIM),
+            (push_line[arrow + 2:], val_attr),
+        ], curses.A_DIM, False))
+    else:
+        rows.append((push_line, curses.A_DIM, False))
     if block.siblings_summary:
-        rows.append((f"  sync: {block.siblings_summary}",
-                     curses.A_DIM, False))
+        val_attr = curses.color_pair(PAIR_BRANCH) | curses.A_DIM
+        rows.append(([
+            ("  sync: ", curses.A_DIM),
+            (block.siblings_summary, val_attr),
+        ], curses.A_DIM, False))
 
     if block.lfs_candidates:
         rows.append((
@@ -1054,6 +1101,23 @@ def _block_left_rows(
                 attr |= curses.A_REVERSE
             rows.append((text, attr, is_focused))
 
+    def append_then_run(sel) -> None:
+        is_focused = (panel_focus == "left" and focus >= 0
+                      and focusables[focus] == (block_idx, "then_run", sel))
+        indent = "        " if sel.after_workflow else "  "
+        label = "then run:" if sel.after_workflow else "then run after push:"
+        current = _then_run_current(sel) or "(none)"
+        text = f"{indent}{label} ‹ {current} ›"
+        if is_focused:
+            attr = curses.color_pair(PAIR_BRANCH) | curses.A_BOLD
+        else:
+            attr = curses.A_DIM
+        rows.append((text, attr, is_focused))
+
+    then_runs_by_wf = {
+        sel.after_workflow: sel
+        for sel in block.then_run_items if sel.after_workflow
+    }
     for tog in block.workflow_toggles:
         is_focused = (panel_focus == "left" and focus >= 0
                       and focusables[focus] == (block_idx, "toggle", tog))
@@ -1067,19 +1131,13 @@ def _block_left_rows(
         if is_focused:
             attr |= curses.A_REVERSE
         rows.append((text, attr, is_focused))
+        sel = then_runs_by_wf.get(tog.workflow_name)
+        if sel is not None:
+            append_then_run(sel)
 
     for sel in block.then_run_items:
-        is_focused = (panel_focus == "left" and focus >= 0
-                      and focusables[focus] == (block_idx, "then_run", sel))
-        indent = "        " if sel.after_workflow else "  "
-        label = "then run:" if sel.after_workflow else "then run after push:"
-        current = _then_run_current(sel) or "(none)"
-        text = f"{indent}{label} ‹ {current} ›"
-        if is_focused:
-            attr = curses.color_pair(PAIR_BRANCH) | curses.A_BOLD
-        else:
-            attr = curses.A_DIM
-        rows.append((text, attr, is_focused))
+        if not sel.after_workflow:
+            append_then_run(sel)
     return rows
 
 
@@ -1119,13 +1177,25 @@ def _draw_left_pane(stdscr, x: int, y: int, w: int, h: int,
         if idx >= len(rows):
             break
         text, attr = rows[idx]
-        safe_addstr(stdscr, y + i, x, text[:w], attr)
+        if isinstance(text, list):
+            cx = x
+            for seg_text, seg_attr in text:
+                avail = max(0, w - (cx - x))
+                if avail <= 0:
+                    break
+                safe_addstr(stdscr, y + i, cx, seg_text[:avail], seg_attr)
+                cx += len(seg_text)
+        else:
+            safe_addstr(stdscr, y + i, x, text[:w], attr)
 
 
 def _render_review_file_row(stdscr, y: int, x: int, w: int,
-                            fe: FileEntry, focused: bool) -> None:
+                            fe: FileEntry, focused: bool,
+                            pane_focused: bool = False) -> None:
     """Same shape as the action-menu's tree-row renderer — pastel
     overlay on the status code, green/red on the +ins/-del numbers."""
+    p_green = PAIR_PASTEL_GREEN_ACTIVE if pane_focused else PAIR_PASTEL_GREEN
+    p_red   = PAIR_PASTEL_RED_ACTIVE   if pane_focused else PAIR_PASTEL_RED
     code = "??" if fe.untracked else f"{fe.x}{fe.y}"
     stat_ins = f"+{fe.inserted}" if (fe.inserted or fe.deleted) else ""
     stat_del = f"-{fe.deleted}" if (fe.inserted or fe.deleted) else ""
@@ -1137,21 +1207,23 @@ def _render_review_file_row(stdscr, y: int, x: int, w: int,
         name = name[: pad - 1] + "…"
     name = name.ljust(pad)
     full = f"{left}{name} {stat}"
+    fill_attr = curses.color_pair(
+        PAIR_SB_FG_ACTIVE if pane_focused else PAIR_SB_FG)
     if focused:
-        safe_addstr(stdscr, y, x, full, curses.A_REVERSE)
+        safe_addstr(stdscr, y, x, full, fill_attr | curses.A_REVERSE)
         return
-    base = curses.A_DIM if fe.untracked else 0
+    base = fill_attr | curses.A_DIM if fe.untracked else fill_attr
     safe_addstr(stdscr, y, x, full, base)
     if not fe.untracked:
-        pair_id = _file_status_pair(fe.x, fe.y)
+        pair_id = _file_status_pair(fe.x, fe.y, pane_focused)
         if pair_id is not None:
             safe_addstr(stdscr, y, x + 1, code, curses.color_pair(pair_id))
     if stat:
         stat_x = x + len(left) + pad + 1
         safe_addstr(stdscr, y, stat_x, stat_ins,
-                    curses.color_pair(PAIR_PASTEL_GREEN))
+                    curses.color_pair(p_green))
         safe_addstr(stdscr, y, stat_x + len(stat_ins) + 1, stat_del,
-                    curses.color_pair(PAIR_PASTEL_RED))
+                    curses.color_pair(p_red))
 
 
 def _draw_right_pane(stdscr, x: int, y: int, w: int, h: int,
@@ -1162,10 +1234,18 @@ def _draw_right_pane(stdscr, x: int, y: int, w: int, h: int,
     the user can see at a glance which side ↑/↓ steers."""
     if block is None or w <= 0 or h <= 0:
         return
-    if panel_focus == "right":
-        header_attr = curses.A_BOLD | curses.color_pair(PAIR_SB_CYAN)
+    pane_focused = panel_focus == "right"
+    fill_pair = PAIR_SB_FG_ACTIVE if pane_focused else PAIR_SB_FG
+    fill_attr = curses.color_pair(fill_pair)
+    dim_attr = fill_attr | curses.A_DIM
+    fill = " " * w
+    scr_h, _ = stdscr.getmaxyx()
+    for fy in range(y, min(y + h, scr_h)):
+        safe_addstr(stdscr, fy, x, fill, fill_attr)
+    if pane_focused:
+        header_attr = curses.color_pair(PAIR_SB_CYAN_ACTIVE) | curses.A_BOLD
     else:
-        header_attr = curses.A_BOLD | curses.A_DIM
+        header_attr = fill_attr | curses.A_BOLD | curses.A_DIM
     if block.files_loading and not block.files:
         count_str = _review_spinner(state)
     else:
@@ -1181,10 +1261,10 @@ def _draw_right_pane(stdscr, x: int, y: int, w: int, h: int,
     if block.files_loading and not block.files:
         safe_addstr(stdscr, line, x + 2,
                     f"{_review_spinner(state)} loading files…",
-                    curses.A_DIM)
+                    dim_attr)
         return
     if not block.files:
-        safe_addstr(stdscr, line, x + 2, "(no changes)", curses.A_DIM)
+        safe_addstr(stdscr, line, x + 2, "(no changes)", dim_attr)
         return
 
     sel = block.file_selected
@@ -1200,18 +1280,19 @@ def _draw_right_pane(stdscr, x: int, y: int, w: int, h: int,
         if idx >= len(block.files):
             break
         fe = block.files[idx]
-        focused = panel_focus == "right" and idx == sel
-        _render_review_file_row(stdscr, line + slot, x, w, fe, focused)
+        focused = pane_focused and idx == sel
+        _render_review_file_row(stdscr, line + slot, x, w, fe, focused,
+                                pane_focused)
     if block.file_scroll > 0:
         msg = f"  ↑ {block.file_scroll} more above"
         safe_addstr(stdscr, line, x + max(0, w - len(msg) - 1),
-                    msg, curses.A_DIM)
+                    msg, dim_attr)
     end = min(len(block.files), block.file_scroll + list_h)
     if end < len(block.files):
         below = len(block.files) - end
         msg = f"  ↓ {below} more below"
         safe_addstr(stdscr, line + list_h - 1, x + max(0, w - len(msg) - 1),
-                    msg, curses.A_DIM)
+                    msg, dim_attr)
 
 
 def _review_hints(focusables: List[Tuple[int, str, object]],
@@ -1237,7 +1318,7 @@ def _review_hints(focusables: List[Tuple[int, str, object]],
         hints.append(Hint(KEY_ENTER, "execute commits"))
     else:  # right
         hints.append(Hint(KEY_UP_DOWN, "select file"))
-        hints.append(Hint(KEY_ENTER, "view diff"))
+        hints.append(Hint(KEY_TAB, "view diff"))
         hints.append(Hint(KEY_SHIFT_TAB, "back to repos"))
     hints.append(Hint(KEY_ESC, "back"))
     return hints
@@ -1277,15 +1358,6 @@ def draw_review(stdscr, state: State, blocks: List[ReviewBlock],
         safe_addstr(stdscr, 0, len("idlegit") + 3,
                     state.workspace_name, ws_attr)
 
-    # Review subtitle on row 2 (row 1 left blank to separate the
-    # workspace title from the screen-specific header).
-    safe_addstr(stdscr, 2, 0, "Review",
-                curses.A_BOLD | curses.color_pair(PAIR_HEADER))
-    sub = (f"{len(blocks)} target(s)  ·  "
-           f"auto-stage: {'on' if state.auto_stage else 'off'}  ·  "
-           f"auto-push: {'on' if state.auto_push else 'off'}")
-    safe_addstr(stdscr, 2, len("Review") + 3, sub, curses.A_DIM)
-
     body_top = 4
     body_h = max(1, h - body_top - 2)
     left_w = max(40, int(w * 0.55))
@@ -1293,6 +1365,22 @@ def draw_review(stdscr, state: State, blocks: List[ReviewBlock],
         left_w = max(20, w - 12)
     right_x = left_w + 1
     right_w = max(10, w - right_x - 1)
+
+    # Panel title row — "Review" on the left, "Changes" on the right,
+    # each cyan when its pane has focus and dim when it doesn't, matching
+    # the "Repositories" / "Tasks" header treatment on the main screen.
+    left_focused = panel_focus == "left"
+    right_focused = panel_focus == "right"
+    left_title_attr = (curses.color_pair(PAIR_BRANCH) | curses.A_BOLD
+                       if left_focused else curses.A_DIM | curses.A_BOLD)
+    right_title_attr = (curses.color_pair(PAIR_BRANCH) | curses.A_BOLD
+                        if right_focused else curses.A_DIM | curses.A_BOLD)
+    safe_addstr(stdscr, 2, 0, "Review", left_title_attr)
+    sub = (f"{len(blocks)} target(s)  ·  "
+           f"auto-stage: {'on' if state.auto_stage else 'off'}  ·  "
+           f"auto-push: {'on' if state.auto_push else 'off'}")
+    safe_addstr(stdscr, 2, len("Review") + 3, sub, curses.A_DIM)
+    safe_addstr(stdscr, 2, right_x + 1, "Changes", right_title_attr)
 
     rows, focused_row = _build_left_pane_rows(
         blocks, focusables, focus, panel_focus, left_w,
@@ -1508,6 +1596,11 @@ def handle_main_key(state: State, key: int) -> Optional[str]:
         return None
 
     if key == 9:  # Tab — open per-row action menu
+        cur = state.current_repo
+        cur_child = state.current_child
+        if (cur is not None and cur.refreshing) or \
+                (cur_child is not None and cur_child[1].refreshing):
+            return None  # action in flight — ignore until lock releases
         open_action_menu(state)
         return None
 
@@ -1644,6 +1737,16 @@ def _detached_review_preflight(stdscr, state: State) -> bool:
             t = state.tasks.add(f"{label}: cannot commit")
             state.tasks.update(t, "fail", msg or "recovery failed")
             return False
+        # Refresh the in-memory Repo so build_review_blocks sees the
+        # real branch name instead of the stale "(detached)" sentinel.
+        for repo in state.repos:
+            if repo.path == path:
+                refresh_repo_with_remote_state(repo)
+                break
+            for ref in repo.children:
+                if ref.kind == "submodule" and ref.nested_path == path:
+                    refresh_repo_with_remote_state(ref.repo)
+                    break
         # Loop back — the next iteration finds the next detached
         # target (if any) and runs the same flow.
 
@@ -1765,10 +1868,8 @@ def handle_confirm(stdscr, state: State) -> None:
                     cands = [c for b in blocks for c in b.lfs_candidates]
                     kick_off_workers(state, cands)
                     return  # async pipeline takes over the sidebar
-                # Right pane Enter → open the diff viewer for the
-                # focused file row. The viewer is a modal on top of
-                # the review screen; Enter / Esc inside the modal
-                # close it and we land back here on the same row.
+                continue
+            if key == 9:  # Tab — open diff viewer on the focused file row
                 bi = _focused_block_idx(focusables, focus)
                 if 0 <= bi < len(blocks):
                     block = blocks[bi]

@@ -19,9 +19,15 @@ from git_ops import (
     get_run_view, gh_available, git, link_siblings, list_branches,
     list_recent_runs, merge_remote_workflow_states, parse_github_slug,
     refresh_repo, safe_stage_all, signature_mtime, suggest_commit_message,
-    suggest_commit_message_at, sync_sibling, sync_subtree,
+    suggest_commit_message_at, sync_sibling, sync_subtree, is_safe_ref_arg,
     working_tree_signature,
+    MAX_PARALLEL_GIT_JOBS,
 )
+
+PROMPT_WAIT_SECONDS = 15 * 60
+MIN_ACTION_REFRESH_SECONDS = 0.35
+_detached_recovery_prompt_lock = threading.Lock()
+_align_heads_prompt_lock = threading.Lock()
 
 
 def refresh_repo_with_remote_state(repo: Repo) -> None:
@@ -430,6 +436,11 @@ def kick_off_action(state: State, action_id: str, *,
     its state dot renders as the global spinner glyph during that
     window, so it's obvious the row's state is in transition rather
     than the user wondering whether their keystroke registered."""
+    known_actions = {
+        "fetch", "pull", "push", "soft_reset", "switch_branch",
+        "branch_from_head", "ff_merge",
+    }
+    should_refresh = action_id in known_actions
     target_child = _find_child_at(target_parent, target_path)
     # Flip refreshing SYNCHRONOUSLY before returning so the very next
     # redraw shows the spinner — the daemon worker may not run for a
@@ -440,6 +451,7 @@ def kick_off_action(state: State, action_id: str, *,
         target_child.refreshing = True
 
     def worker() -> None:
+      started_at = time.monotonic()
       try:
         if action_id == "fetch":
             t = state.tasks.add(f"{target_label}: fetch")
@@ -448,8 +460,8 @@ def kick_off_action(state: State, action_id: str, *,
                 t, "ok" if rc == 0 else "fail",
                 "" if rc == 0 else first_line(err))
         elif action_id == "pull":
-            t = state.tasks.add(f"{target_label}: pull")
-            rc, _, err = git(target_path, ["pull"])
+            t = state.tasks.add(f"{target_label}: pull --ff-only")
+            rc, _, err = git(target_path, ["pull", "--ff-only"])
             state.tasks.update(
                 t, "ok" if rc == 0 else "fail",
                 "" if rc == 0 else first_line(err))
@@ -457,19 +469,35 @@ def kick_off_action(state: State, action_id: str, *,
             t = state.tasks.add(f"{target_label}: push")
             rc_b, b_out, _ = git(target_path, ["branch", "--show-current"])
             cur_branch = b_out.strip() if rc_b == 0 else ""
+            if cur_branch and not is_safe_ref_arg(cur_branch):
+                state.tasks.update(t, "fail", "unsafe current branch name")
+                return
             rc_u, u_out, _ = git(target_path, [
                 "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
             has_upstream = rc_u == 0 and bool(u_out.strip())
             if has_upstream:
-                rc, _, err = git(target_path, ["push"])
+                _, head_before, _ = git(target_path, ["rev-parse", "HEAD"])
+                rc_pull, _, pull_err = git(target_path, ["pull", "--ff-only"])
+                _, head_after, _ = git(target_path, ["rev-parse", "HEAD"])
+                if rc_pull != 0:
+                    t_pull = state.tasks.add(f"{target_label}: pull --ff-only")
+                    state.tasks.update(t_pull, "fail",
+                                       first_line(pull_err) or "cannot fast-forward")
+                    state.tasks.update(t, "fail", "skipped: cannot fast-forward")
+                else:
+                    if head_before.strip() != head_after.strip():
+                        t_pull = state.tasks.add(f"{target_label}: pull --ff-only")
+                        state.tasks.update(t_pull, "ok")
+                    rc, _, err = git(target_path, ["push"])
+                    state.tasks.update(t, "ok" if rc == 0 else "fail",
+                                       "" if rc == 0 else first_line(err))
             elif cur_branch:
                 rc, _, err = git(target_path, [
                     "push", "--set-upstream", "origin", cur_branch])
+                state.tasks.update(t, "ok" if rc == 0 else "fail",
+                                   "" if rc == 0 else first_line(err))
             else:
-                rc, err = 1, "no current branch"
-            state.tasks.update(
-                t, "ok" if rc == 0 else "fail",
-                "" if rc == 0 else first_line(err))
+                state.tasks.update(t, "fail", "no current branch")
         elif action_id == "soft_reset":
             if reset_count <= 0:
                 t = state.tasks.add(
@@ -485,6 +513,9 @@ def kick_off_action(state: State, action_id: str, *,
                 "" if rc == 0 else first_line(err))
         elif action_id == "switch_branch":
             t = state.tasks.add(f"{target_label}: checkout {branch_arg}")
+            if not is_safe_ref_arg(branch_arg):
+                state.tasks.update(t, "fail", "unsafe branch name")
+                return
             # Refuse the switch if HEAD has commits not on the chosen
             # branch — git would otherwise silently orphan them and
             # files unique to those commits would vanish from WT.
@@ -510,6 +541,9 @@ def kick_off_action(state: State, action_id: str, *,
             # the work as no longer at risk of being orphaned.
             t = state.tasks.add(
                 f"{target_label}: branch HEAD as {branch_arg}")
+            if not is_safe_ref_arg(branch_arg):
+                state.tasks.update(t, "fail", "unsafe branch name")
+                return
             rc, _, err = git(target_path, ["checkout", "-b", branch_arg])
             state.tasks.update(
                 t, "ok" if rc == 0 else "fail",
@@ -521,6 +555,9 @@ def kick_off_action(state: State, action_id: str, *,
             # for. The lack of `--no-ff` etc. keeps this strict.
             t = state.tasks.add(
                 f"{target_label}: merge --ff-only {branch_arg}")
+            if not is_safe_ref_arg(branch_arg):
+                state.tasks.update(t, "fail", "unsafe branch name")
+                return
             rc, _, err = git(target_path, [
                 "merge", "--ff-only", branch_arg])
             if rc == 0:
@@ -531,9 +568,20 @@ def kick_off_action(state: State, action_id: str, *,
                     first_line(err) or "not a fast-forward")
         else:
             return  # unknown action — nothing to do
-
-        _refresh_target_state(state, target_repo, target_parent)
+      except Exception as e:
+        t = state.tasks.add(f"{target_label}: failed")
+        state.tasks.update(t, "fail", first_line(str(e)))
       finally:
+        if should_refresh:
+            try:
+                _refresh_target_state(state, target_repo, target_parent)
+            except Exception as e:
+                t = state.tasks.add(f"{target_label}: refresh")
+                state.tasks.update(t, "fail", first_line(str(e)))
+            remaining = MIN_ACTION_REFRESH_SECONDS - (
+                time.monotonic() - started_at)
+            if remaining > 0:
+                time.sleep(remaining)
         # Always release the refreshing flags — even on early-return
         # / exception paths — so a row never gets stuck spinning.
         if target_repo is not None:
@@ -612,6 +660,16 @@ def commit_worker(state: State, repo: Repo, msg: str,
     publishing each step into the sidebar. After a successful push, kicks
     off GitHub Actions tracking for any workflows the user opted in to on
     the review screen."""
+    try:
+        _commit_worker_inner(state, repo, msg, lfs_cands)
+    except Exception as e:
+        name = state.task_repo_label(repo)
+        t = state.tasks.add(f"{name}: failed")
+        state.tasks.update(t, "fail", first_line(str(e)))
+
+
+def _commit_worker_inner(state: State, repo: Repo, msg: str,
+                         lfs_cands: List[LFSCandidate]) -> None:
     auto_stage = state.auto_stage
     auto_push = state.auto_push
     tasks = state.tasks
@@ -651,6 +709,23 @@ def commit_worker(state: State, repo: Repo, msg: str,
         t = tasks.add(f"{name}: recovered detached HEAD")
         tasks.update(t, "ok", "branch fast-forwarded to HEAD")
 
+    # Fast-forward before staging — once we have a local commit we'll be
+    # diverged and --ff-only will refuse. Pull also fetches, so we catch
+    # commits that arrived after the last refresh. Only surface a task
+    # when HEAD actually moved or the pull itself fails.
+    if repo.upstream:
+        _, head_before, _ = git(repo.path, ["rev-parse", "HEAD"])
+        rc_pull, _, pull_err = git(repo.path, ["pull", "--ff-only"])
+        _, head_after, _ = git(repo.path, ["rev-parse", "HEAD"])
+        if rc_pull != 0:
+            t_pull = tasks.add(f"{name}: pull --ff-only")
+            tasks.update(t_pull, "fail",
+                         first_line(pull_err) or "cannot fast-forward")
+            return
+        if head_before.strip() != head_after.strip():
+            t_pull = tasks.add(f"{name}: pull --ff-only")
+            tasks.update(t_pull, "ok")
+
     if auto_stage:
         t = tasks.add(f"{name}: stage all")
         ok, stage_err = safe_stage_all(repo.path)
@@ -676,11 +751,21 @@ def commit_worker(state: State, repo: Repo, msg: str,
         return
 
     push_task = tasks.add(f"{name}: push")
-    if repo.upstream:
+    rc_u, _, _ = git(repo.path, [
+        "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
+    if rc_u == 0:
         rc, _, err = git(repo.path, ["push"])
     else:
-        rc, _, err = git(repo.path, [
-            "push", "--set-upstream", "origin", repo.branch])
+        rc_b, b_out, _ = git(repo.path, ["branch", "--show-current"])
+        cur_branch = b_out.strip() if rc_b == 0 else ""
+        if cur_branch:
+            if not is_safe_ref_arg(cur_branch):
+                tasks.update(push_task, "fail", "unsafe current branch name")
+                return
+            rc, _, err = git(repo.path, [
+                "push", "--set-upstream", "origin", cur_branch])
+        else:
+            rc, err = 1, "no current branch"
     if rc != 0:
         tasks.update(push_task, "fail", first_line(err))
         return
@@ -724,6 +809,17 @@ def commit_worker_for_child(state: State, parent: Repo, ref: ChildRef,
     copy) so they all advance to the new commit. Workflow tracking is
     keyed off the canonical repo's track_workflow map, same as a top-level
     push."""
+    try:
+        _commit_worker_for_child_inner(state, parent, ref, msg)
+    except Exception as e:
+        name = (f"{state.task_repo_label(ref.repo)} "
+                f"(in {state.task_repo_label(parent)})")
+        t = state.tasks.add(f"{name}: failed")
+        state.tasks.update(t, "fail", first_line(str(e)))
+
+
+def _commit_worker_for_child_inner(state: State, parent: Repo,
+                                   ref: ChildRef, msg: str) -> None:
     auto_stage = state.auto_stage
     auto_push = state.auto_push
     tasks = state.tasks
@@ -788,6 +884,9 @@ def commit_worker_for_child(state: State, parent: Repo, ref: ChildRef,
     if has_upstream:
         rc, _, err = git(ref.nested_path, ["push"])
     else:
+        if not is_safe_ref_arg(nested_branch):
+            tasks.update(push_task, "fail", "unsafe current branch name")
+            return
         rc, _, err = git(ref.nested_path, [
             "push", "--set-upstream", "origin", nested_branch])
     if rc != 0:
@@ -834,15 +933,25 @@ def commit_worker_for_child(state: State, parent: Repo, ref: ChildRef,
 def kick_off_workers(state: State, candidates: List[LFSCandidate]) -> None:
     """Launch one worker thread per repo / nested-child with a queued
     message and a supervisor thread that silently re-fetches repo state
-    once everything finishes."""
+    once everything finishes.
+
+    Repos and child refs that are already locked (refreshing=True from a
+    concurrent kick_off_action) are skipped — their message is cleared so
+    it does not re-appear, but we do not attempt to commit on top of an
+    in-flight action. All repos/refs we do commit are locked synchronously
+    before any thread is spawned, and unlocked by the supervisor after
+    their individual refresh completes."""
     repo_plans: List[Tuple[Repo, str, List[LFSCandidate]]] = []
     for repo in state.repos:
         msg = repo.message.strip()
         if not msg:
             continue
+        repo.message = ""
+        if repo.refreshing:  # another action owns this repo — skip
+            continue
         repo_cands = [c for c in candidates if c.repo is repo]
         repo_plans.append((repo, msg, repo_cands))
-        repo.message = ""
+        repo.refreshing = True  # lock synchronously before spawning
 
     child_plans: List[Tuple[Repo, ChildRef, str]] = []
     for parent in state.repos:
@@ -852,11 +961,17 @@ def kick_off_workers(state: State, candidates: List[LFSCandidate]) -> None:
             msg = ref.message.strip()
             if not msg:
                 continue
-            child_plans.append((parent, ref, msg))
             ref.message = ""
+            if ref.refreshing:  # another action owns this child — skip
+                continue
+            child_plans.append((parent, ref, msg))
+            ref.refreshing = True  # lock synchronously before spawning
 
     if not repo_plans and not child_plans:
         return
+
+    locked_repos = {id(repo) for repo, _, _ in repo_plans}
+    locked_refs = {id(ref) for _, ref, _ in child_plans}
 
     workers: List[threading.Thread] = []
     for repo, msg, repo_cands in repo_plans:
@@ -882,7 +997,13 @@ def kick_off_workers(state: State, candidates: List[LFSCandidate]) -> None:
             w.join()
         for r in state.repos:
             refresh_repo(r)
+            if id(r) in locked_repos:
+                r.refreshing = False
         link_siblings(state.repos, state.subtrees)
+        for parent in state.repos:
+            for ref in parent.children:
+                if id(ref) in locked_refs:
+                    ref.refreshing = False
 
     threading.Thread(target=supervisor, daemon=True).start()
 
@@ -993,6 +1114,9 @@ def _push_winner(state: State, winner: SmartSyncCheckout,
     """Push the winner's branch (with `--set-upstream` fallback for
     branches that don't yet have one). Plain `git push`, never forced."""
     t = state.tasks.add(f"  ↳ align {name}: push {winner.label}")
+    if not is_safe_ref_arg(branch):
+        state.tasks.update(t, "fail", "unsafe branch name")
+        return False
     rc, _, err = git(winner.path, ["push"])
     if rc != 0:
         rc, _, err = git(
@@ -1066,6 +1190,8 @@ def _ff_branch_to_head(path: Path, branch: str) -> Tuple[bool, str]:
     change because HEAD's tree IS the new branch tip's tree.
 
     Returns (ok, message). Empty message on success."""
+    if not is_safe_ref_arg(branch):
+        return False, "unsafe branch name"
     rc, _, err = git(path, ["checkout", "-B", branch, "HEAD"])
     if rc != 0:
         return False, first_line(err) or "checkout -B failed"
@@ -1138,6 +1264,8 @@ def execute_detached_recovery(path: Path,
     -B <branch> HEAD` when branch is an ancestor of HEAD), defending
     against the divergent case so the caller can't accidentally turn
     a "user said yes" signal into orphaned commits."""
+    if not is_safe_ref_arg(target_branch):
+        return False, "unsafe branch name"
     if _head_is_ancestor_of(path, target_branch):
         rc, _, err = git(path, ["checkout", target_branch])
     elif _ref_is_ancestor_of_head(path, target_branch):
@@ -1185,20 +1313,24 @@ def _attempt_detached_recovery(state: State, path: Path,
     if rc == 0 and branch_out.strip():
         return True, "not detached"
 
-    prompt = _build_recovery_prompt(path, target_label, target_branch)
-    if prompt is None:
-        return False, "no recovery target branch available"
-    state.detached_recovery_prompt = prompt
-    prompt.result_event.wait()
+    with _detached_recovery_prompt_lock:
+        prompt = _build_recovery_prompt(path, target_label, target_branch)
+        if prompt is None:
+            return False, "no recovery target branch available"
+        state.detached_recovery_prompt = prompt
+        if not prompt.result_event.wait(PROMPT_WAIT_SECONDS):
+            if state.detached_recovery_prompt is prompt:
+                state.detached_recovery_prompt = None
+            return False, "recovery prompt timed out"
 
-    if prompt.chosen_action != "ff":
-        return False, "user cancelled recovery"
-    if not prompt.can_ff:
-        # Defensive — the modal's Enter handler shouldn't return "ff"
-        # when can_ff is False, but if it ever does we refuse rather
-        # than execute an unsafe operation.
-        return False, "auto-recovery not safe (divergent histories)"
-    return execute_detached_recovery(path, prompt.target_branch)
+        if prompt.chosen_action != "ff":
+            return False, "user cancelled recovery"
+        if not prompt.can_ff:
+            # Defensive — the modal's Enter handler shouldn't return "ff"
+            # when can_ff is False, but if it ever does we refuse rather
+            # than execute an unsafe operation.
+            return False, "auto-recovery not safe (divergent histories)"
+        return execute_detached_recovery(path, prompt.target_branch)
 
 
 def _switch_to_branch(state: State, c: SmartSyncCheckout,
@@ -1206,6 +1338,9 @@ def _switch_to_branch(state: State, c: SmartSyncCheckout,
     """Move a checkout onto a named branch. Git refuses if the WT has
     changes that would conflict with the new branch tip — non-destructive."""
     t = state.tasks.add(f"  ↳ align {name}: switch {c.label} → {branch}")
+    if not is_safe_ref_arg(branch):
+        state.tasks.update(t, "fail", "unsafe branch name")
+        return False
     rc, _, err = git(c.path, ["checkout", branch])
     if rc != 0:
         state.tasks.update(t, "fail", first_line(err))
@@ -1328,6 +1463,8 @@ def _try_ff_through_redundant_dirty(state: State, c: SmartSyncCheckout,
 
     Returns True/False/None where False means "let the caller warn-
     skip" and None means infrastructure error (same calling contract)."""
+    if not is_safe_ref_arg(winner_branch):
+        return False
     target_ref = f"origin/{winner_branch}"
     matches = _verify_dirty_matches_target(c, target_ref)
     if matches is not True:
@@ -1388,6 +1525,8 @@ def _try_detached_checkout_through_redundant_dirty(
     Cardinal rule: as in the FF sibling, idlegit NEVER calls `git stash
     drop` — the stash is preserved on every code path so no content can
     be lost to a wrong post-condition prediction."""
+    if not is_safe_ref_arg(winner_branch):
+        return False
     target_ref = f"origin/{winner_branch}"
     matches = _verify_dirty_matches_target(c, target_ref)
     if matches is not True:
@@ -1443,6 +1582,9 @@ def _stash_switch_pop_winner(state: State, winner: SmartSyncCheckout,
     stash list, so the user can recover with `git stash pop` manually."""
     t = state.tasks.add(
         f"  ↳ align {name}: switch {winner.label} → {branch}")
+    if not is_safe_ref_arg(branch):
+        state.tasks.update(t, "fail", "unsafe branch name")
+        return False
 
     # Refuse to switch if HEAD has commits that aren't on `branch` —
     # git would silently orphan them (rc=0 with a stderr warning)
@@ -1531,6 +1673,9 @@ def _align_loser_ff(state: State, c: SmartSyncCheckout,
     loser has local commits not in the winner. Both cases preserve
     the loser's state — the user resolves manually."""
     t = state.tasks.add(f"  ↳ align {name}: ff {c.label}")
+    if not is_safe_ref_arg(winner_branch):
+        state.tasks.update(t, "fail", "unsafe branch name")
+        return False
     rc, _, err = git(c.path, ["fetch", "origin", winner_branch])
     if rc != 0:
         state.tasks.update(t, "fail", first_line(err))
@@ -1568,6 +1713,9 @@ def _align_detached_loser(state: State, c: SmartSyncCheckout,
     `origin/<winner_branch>` — switching would orphan them and any
     files unique to those commits would vanish."""
     t = state.tasks.add(f"  ↳ align {name}: switch+sync {c.label}")
+    if not is_safe_ref_arg(winner_branch):
+        state.tasks.update(t, "fail", "unsafe branch name")
+        return False
     rc, _, err = git(c.path, ["fetch", "origin", winner_branch])
     if rc != 0:
         state.tasks.update(t, "fail", first_line(err))
@@ -1622,18 +1770,22 @@ def _open_align_heads_prompt_and_wait(state: State,
     from the smart-sync worker thread; the modal handler in the main
     loop signals `result_event`. The modal receives FULL display names
     (no `task_repo_label` pre-truncation) and lays them out itself."""
-    branches, _ = list_branches(winner.path)
-    parent_name = winner.parent.display_name if winner.parent else ""
-    prompt = AlignHeadsPrompt(
-        canonical_name=winner.canonical.display_name,
-        winner_parent_name=parent_name,
-        winner_sha=winner.head,
-        branches=branches,
-        selected=0,
-    )
-    state.align_heads_prompt = prompt
-    prompt.result_event.wait()
-    return prompt.chosen_branch or ""
+    with _align_heads_prompt_lock:
+        branches, _ = list_branches(winner.path)
+        parent_name = winner.parent.display_name if winner.parent else ""
+        prompt = AlignHeadsPrompt(
+            canonical_name=winner.canonical.display_name,
+            winner_parent_name=parent_name,
+            winner_sha=winner.head,
+            branches=branches,
+            selected=0,
+        )
+        state.align_heads_prompt = prompt
+        if not prompt.result_event.wait(PROMPT_WAIT_SECONDS):
+            if state.align_heads_prompt is prompt:
+                state.align_heads_prompt = None
+            return ""
+        return prompt.chosen_branch or ""
 
 
 def _align_canonical(state: State, canonical: Repo) -> Tuple[int, int]:
@@ -1833,6 +1985,12 @@ def kick_off_sync_siblings(state: State) -> None:
     work_count = len(canonicals_with_siblings) + len(subtree_items)
     header = state.tasks.add(f"smart-sync ({work_count})")
 
+    # Lock synchronously so the very next redraw shows spinners.
+    for canonical in canonicals_with_siblings:
+        canonical.refreshing = True
+    for _parent, ref in subtree_items:
+        ref.refreshing = True
+
     def worker() -> None:
         ok_total = 0
         fail_total = 0
@@ -1845,6 +2003,9 @@ def kick_off_sync_siblings(state: State) -> None:
                     f"  ↳ align {state.task_repo_label(canonical)}")
                 state.tasks.update(t, "fail", first_line(str(e)))
                 ok, fail = 0, 1
+            finally:
+                refresh_repo(canonical)
+                canonical.refreshing = False
             ok_total += ok
             fail_total += fail
 
@@ -1853,17 +2014,21 @@ def kick_off_sync_siblings(state: State) -> None:
                 f"  ⊕ {state.task_repo_label(ref.repo)} "
                 f"in {state.task_repo_label(parent)}")
             try:
-                prefix = str(ref.nested_path.relative_to(parent.path))
-            except ValueError:
-                prefix = ""
-            ok, msg = sync_subtree(
-                parent.path, prefix,
-                ref.repo.remote_url_raw or "", ref.repo.branch)
-            state.tasks.update(t, "ok" if ok else "fail", msg)
-            if ok:
-                ok_total += 1
-            else:
-                fail_total += 1
+                try:
+                    prefix = str(ref.nested_path.relative_to(parent.path))
+                except ValueError:
+                    prefix = ""
+                ok, msg = sync_subtree(
+                    parent.path, prefix,
+                    ref.repo.remote_url_raw or "", ref.repo.branch)
+                state.tasks.update(t, "ok" if ok else "fail", msg)
+                if ok:
+                    ok_total += 1
+                else:
+                    fail_total += 1
+            finally:
+                refresh_repo(parent)
+                ref.refreshing = False
 
         total = ok_total + fail_total
         if total == 0:
@@ -1876,8 +2041,8 @@ def kick_off_sync_siblings(state: State) -> None:
             state.tasks.update(
                 header, "warn", f"{ok_total} ok / {fail_total} failed")
 
-        # Refresh the model so main-screen dots reflect the new on-disk
-        # state without needing a follow-up Ctrl+R.
+        # Final full refresh + sibling-link rebuild to catch any repos
+        # not covered by the per-item refreshes above.
         for r in state.repos:
             refresh_repo(r)
         link_siblings(state.repos, state.subtrees)
@@ -1944,7 +2109,9 @@ def kick_off_inline_refresh(state: State) -> None:
             for folder in folders:
                 try:
                     discovered = discover_repos(folder)
-                except Exception:
+                except Exception as e:
+                    t = state.tasks.add(f"refresh {folder}")
+                    state.tasks.update(t, "warn", first_line(str(e)))
                     discovered = []
                 for r in discovered:
                     if r.path in seen_paths:
@@ -1952,17 +2119,15 @@ def kick_off_inline_refresh(state: State) -> None:
                     seen_paths.add(r.path)
                     fresh.append(r)
             fresh_by_path = {r.path: r for r in fresh}
-            kept = [r for r in state.repos if r.path in fresh_by_path]
-            state.repos[:] = kept
-
-            existing_paths = {r.path for r in state.repos}
+            kept_by_path = {r.path: r for r in state.repos
+                            if r.path in fresh_by_path}
+            next_repos: List[Repo] = []
             for r in fresh:
-                if r.path not in existing_paths:
-                    state.repos.append(r)
-            state.repos.sort(
+                next_repos.append(kept_by_path.get(r.path, r))
+            next_repos.sort(
                 key=lambda r: (r.rel != ".", r.rel.lower() if r.rel != "." else ""))
 
-            for r in state.repos:
+            for r in next_repos:
                 r.refreshing = True
 
             def refresh_one(r: Repo) -> None:
@@ -1971,10 +2136,16 @@ def kick_off_inline_refresh(state: State) -> None:
                 finally:
                     r.refreshing = False
 
-            if state.repos:
-                with ThreadPoolExecutor(max_workers=len(state.repos)) as ex:
-                    list(ex.map(refresh_one, state.repos))
-            link_siblings(state.repos, state.subtrees)
+            if next_repos:
+                max_workers = min(len(next_repos), MAX_PARALLEL_GIT_JOBS)
+                with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                    list(ex.map(refresh_one, next_repos))
+            link_siblings(next_repos, state.subtrees)
+
+            state.repos = next_repos
+            ws = state.active_workspace
+            if ws is not None:
+                ws.cached_repos = next_repos
 
             # `selected = -1` is the title-row workspace selector — keep
             # it as-is rather than clamping back into the body. Other
@@ -2042,7 +2213,9 @@ def switch_workspace(state: State, new_index: int) -> None:
         for folder in ws.folders:
             try:
                 discovered = discover_repos(folder)
-            except Exception:
+            except Exception as e:
+                t = state.tasks.add(f"switch {folder}")
+                state.tasks.update(t, "warn", first_line(str(e)))
                 discovered = []
             for r in discovered:
                 if r.path in seen_paths:

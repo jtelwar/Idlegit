@@ -12,6 +12,7 @@ from typing import List, Optional, Tuple
 
 from config import (
     TRUNCATION_MODES,
+    VERSION,
     WORKSPACE_OVERRIDE_TARGETS,
     WORKSPACE_OVERRIDE_TYPES,
     base_value_for_override,
@@ -491,9 +492,9 @@ def draw_workspace_menu(stdscr, state: State, sidebar_x: int) -> None:
         return
     n_rows = len(menu.rows)
     body_h = max(3, min(BODY_TARGET_ROWS, n_rows))
-    # blank-top (1) + title (1) + spacer (1) + body + spacer (1)
-    # + slack (1) + footer (1) + blank-bottom (1)
-    content_h = 1 + 1 + 1 + body_h + 1 + 1 + 1 + 1
+    # blank-top (1) + app-row (1) + blank (1) + title (1) + spacer (1)
+    # + body + spacer (1) + slack (1) + footer (1) + blank-bottom (1)
+    content_h = 1 + 1 + 1 + 1 + 1 + body_h + 1 + 1 + 1 + 1
     x, y, w, h = modal_geometry(stdscr, sidebar_x, MODAL_W, content_h)
     sb = curses.color_pair(PAIR_SB_FG)
     draw_modal_fill(stdscr, x, y, w, h, sb)
@@ -501,9 +502,14 @@ def draw_workspace_menu(stdscr, state: State, sidebar_x: int) -> None:
     inner_x = x + 2
     inner_w = w - 4
 
+    safe_addstr(stdscr, y + 1, inner_x, "idlegit",
+                curses.A_BOLD | curses.color_pair(PAIR_SB_CYAN))
+    safe_addstr(stdscr, y + 1, inner_x + len("idlegit"), f"  v{VERSION}",
+                curses.color_pair(PAIR_BRANCH) | curses.A_DIM)
+
     ws = state.active_workspace
     title = f"Workspace settings — {ws.name if ws else '(no workspace)'}"
-    safe_addstr(stdscr, y + 1, inner_x, title[:inner_w],
+    safe_addstr(stdscr, y + 3, inner_x, title[:inner_w],
                 curses.A_BOLD | curses.color_pair(PAIR_SB_CYAN))
 
     if menu.selected < menu.scroll:
@@ -522,7 +528,7 @@ def draw_workspace_menu(stdscr, state: State, sidebar_x: int) -> None:
         if idx >= n_rows:
             break
         row = menu.rows[idx]
-        line_y = y + 3 + i
+        line_y = y + 5 + i
         focused = (idx == menu.selected)
 
         if row.kind == "header":
@@ -576,11 +582,11 @@ def draw_workspace_menu(stdscr, state: State, sidebar_x: int) -> None:
                         sb | curses.A_DIM)
 
     if menu.scroll > 0:
-        safe_addstr(stdscr, y + 2, inner_x,
+        safe_addstr(stdscr, y + 4, inner_x,
                     f"↑ {menu.scroll} more above", sb | curses.A_DIM)
     if menu.scroll + body_h < n_rows:
         below = n_rows - (menu.scroll + body_h)
-        safe_addstr(stdscr, y + 3 + body_h, inner_x,
+        safe_addstr(stdscr, y + 5 + body_h, inner_x,
                     f"↓ {below} more below", sb | curses.A_DIM)
 
     _draw_menu_hints(stdscr, state, menu, y + h - 2, inner_x, inner_w,

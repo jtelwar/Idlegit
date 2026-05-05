@@ -21,6 +21,10 @@ TOOL_DIR = Path(__file__).resolve().parent
 CONFIG_FILE = TOOL_DIR / "idlegit.conf"
 WORKSPACES_FILE = TOOL_DIR / "idlegit.workspaces"
 
+VERSION = "0.1.0"
+_CONFIG_WARNINGS: List[str] = []
+_WORKSPACE_WARNINGS: List[str] = []
+
 DEFAULT_SUGGEST = 3
 DEFAULT_LFS_WARN_MB = 100  # GitHub rejects non-LFS pushes for blobs over 100 MB.
 DEFAULT_BRANCH_DISPLAY_MAX = 12
@@ -39,6 +43,8 @@ DEFAULT_TASK_NAME_DISPLAY_MAX = 16
 DEFAULT_TRUNCATION_MODE = "middle"
 TRUNCATION_MODES = ("start", "middle", "end")
 DEFAULT_MAX_VISIBLE_REPO_ROWS = 0  # 0 = use all available height
+DEFAULT_TASKS_MIN_WIDTH_PERCENT = 0.2
+DEFAULT_TASKS_MAX_WIDTH_PERCENT = 0.5
 DEFAULT_TRACK_ACTIONS = True
 DEFAULT_ACTIONS_POLL_SECONDS = 5.0
 DEFAULT_AUTO_REMOVE_COMPLETED_AFTER = -1.0  # <0 = never auto-remove
@@ -53,6 +59,27 @@ DEFAULT_MAX_COMMIT_MESSAGE_LENGTH_IN_REVIEW = 480
 DEFAULT_ALIGN_HEADS = True
 DEFAULT_AUTO_FF = True
 DEFAULT_PROMPT_FOR_BRANCH = True
+
+
+def _warn_config(message: str) -> None:
+    _CONFIG_WARNINGS.append(message)
+
+
+def _warn_workspace(message: str) -> None:
+    _WORKSPACE_WARNINGS.append(message)
+
+
+def get_load_warnings() -> List[str]:
+    """Warnings from the most recent config/workspace load.
+
+    Loaders keep returning conservative defaults so the app can start,
+    but callers can surface these messages instead of silently hiding
+    malformed files."""
+    return [*_CONFIG_WARNINGS, *_WORKSPACE_WARNINGS]
+
+
+def _clamp_percent(value: float) -> float:
+    return max(0.0, min(1.0, value))
 
 
 @dataclass
@@ -74,6 +101,8 @@ class Config:
     branch_truncation: str = DEFAULT_TRUNCATION_MODE
     task_name_truncation: str = DEFAULT_TRUNCATION_MODE
     max_visible_repo_rows: int = DEFAULT_MAX_VISIBLE_REPO_ROWS
+    tasks_min_width_percent: float = DEFAULT_TASKS_MIN_WIDTH_PERCENT
+    tasks_max_width_percent: float = DEFAULT_TASKS_MAX_WIDTH_PERCENT
     track_actions_default: bool = DEFAULT_TRACK_ACTIONS
     actions_poll_seconds: float = DEFAULT_ACTIONS_POLL_SECONDS
     auto_remove_completed_after: float = DEFAULT_AUTO_REMOVE_COMPLETED_AFTER
@@ -104,6 +133,8 @@ def load_config() -> Config:
     branch_truncation = DEFAULT_TRUNCATION_MODE
     task_name_truncation = DEFAULT_TRUNCATION_MODE
     max_visible_repo_rows = DEFAULT_MAX_VISIBLE_REPO_ROWS
+    tasks_min_width_percent = DEFAULT_TASKS_MIN_WIDTH_PERCENT
+    tasks_max_width_percent = DEFAULT_TASKS_MAX_WIDTH_PERCENT
     track_actions_default = DEFAULT_TRACK_ACTIONS
     actions_poll_seconds = DEFAULT_ACTIONS_POLL_SECONDS
     auto_remove_completed_after = DEFAULT_AUTO_REMOVE_COMPLETED_AFTER
@@ -112,6 +143,8 @@ def load_config() -> Config:
     default_align_heads = DEFAULT_ALIGN_HEADS
     default_auto_ff = DEFAULT_AUTO_FF
     default_prompt_for_branch = DEFAULT_PROMPT_FOR_BRANCH
+
+    _CONFIG_WARNINGS.clear()
 
     if CONFIG_FILE.exists():
         try:
@@ -147,6 +180,12 @@ def load_config() -> Config:
             max_visible_repo_rows = cp.getint(
                 "idlegit", "max_visible_repo_rows",
                 fallback=DEFAULT_MAX_VISIBLE_REPO_ROWS)
+            tasks_min_width_percent = cp.getfloat(
+                "idlegit", "tasks_min_width_percent",
+                fallback=DEFAULT_TASKS_MIN_WIDTH_PERCENT)
+            tasks_max_width_percent = cp.getfloat(
+                "idlegit", "tasks_max_width_percent",
+                fallback=DEFAULT_TASKS_MAX_WIDTH_PERCENT)
             track_actions_default = cp.getboolean(
                 "idlegit", "track_actions_default",
                 fallback=DEFAULT_TRACK_ACTIONS)
@@ -167,8 +206,8 @@ def load_config() -> Config:
             default_prompt_for_branch = cp.getboolean(
                 "idlegit", "default_prompt_for_branch",
                 fallback=DEFAULT_PROMPT_FOR_BRANCH)
-        except (configparser.Error, OSError, ValueError):
-            pass
+        except (configparser.Error, OSError, ValueError) as e:
+            _warn_config(f"{CONFIG_FILE.name}: using defaults ({e})")
 
     if name_truncation not in TRUNCATION_MODES:
         name_truncation = DEFAULT_TRUNCATION_MODE
@@ -192,6 +231,10 @@ def load_config() -> Config:
         branch_truncation=branch_truncation,
         task_name_truncation=task_name_truncation,
         max_visible_repo_rows=max(0, max_visible_repo_rows),
+        tasks_min_width_percent=_clamp_percent(tasks_min_width_percent),
+        tasks_max_width_percent=max(
+            _clamp_percent(tasks_min_width_percent),
+            _clamp_percent(tasks_max_width_percent)),
         track_actions_default=track_actions_default,
         actions_poll_seconds=max(0.5, actions_poll_seconds),
         auto_remove_completed_after=auto_remove_completed_after,
@@ -230,6 +273,8 @@ WORKSPACE_OVERRIDE_TYPES: "dict[str, str]" = {
     "branch_display_max": "int",
     "task_name_display_max": "int",
     "max_visible_repo_rows": "int",
+    "tasks_min_width_percent": "float",
+    "tasks_max_width_percent": "float",
     "lfs_warn_mb": "int",
     "actions_poll_seconds": "float",
     "auto_remove_completed_tasks_after_interval": "float",
@@ -258,6 +303,8 @@ WORKSPACE_OVERRIDE_TARGETS: "dict[str, str]" = {
     "branch_display_max": "branch_display_max",
     "task_name_display_max": "task_name_display_max",
     "max_visible_repo_rows": "max_visible_repo_rows",
+    "tasks_min_width_percent": "tasks_min_width_percent",
+    "tasks_max_width_percent": "tasks_max_width_percent",
     "lfs_warn_mb": "lfs_warn_bytes",
     "actions_poll_seconds": "actions_poll_seconds",
     "auto_remove_completed_tasks_after_interval": "auto_remove_completed_after",
@@ -316,6 +363,11 @@ def state_attr_value_from_override(key: str, value):
             return max(0, int(value)) * 1024 * 1024
         except (TypeError, ValueError):
             return 0
+    if key in ("tasks_min_width_percent", "tasks_max_width_percent"):
+        try:
+            return _clamp_percent(float(value))
+        except (TypeError, ValueError):
+            return 0.0
     return value
 
 
@@ -335,7 +387,11 @@ def _parse_folders_block(text: str, anchor: Path) -> List[Path]:
         p = Path(token).expanduser()
         if not p.is_absolute():
             p = anchor / p
-        resolved = p.resolve()
+        try:
+            resolved = p.resolve()
+        except (OSError, RuntimeError) as e:
+            _warn_workspace(f"workspace folder ignored: {p} ({e})")
+            continue
         if resolved in seen:
             continue
         seen.add(resolved)
@@ -353,12 +409,15 @@ def load_workspaces() -> "tuple[List[Workspace], int]":
     (idlegit.run) treats that as the signal to launch the creator
     wizard before the main UI takes over."""
     if not WORKSPACES_FILE.exists():
+        _WORKSPACE_WARNINGS.clear()
         return [], 0
 
     try:
+        _WORKSPACE_WARNINGS.clear()
         cp = configparser.ConfigParser(inline_comment_prefixes=(";",))
         cp.read(WORKSPACES_FILE)
-    except (configparser.Error, OSError):
+    except (configparser.Error, OSError) as e:
+        _warn_workspace(f"{WORKSPACES_FILE.name}: could not read ({e})")
         return [], 0
 
     # Optional top-level [idlegit] block carries cross-workspace
@@ -531,6 +590,8 @@ def apply_workspace_overrides(state, cfg: Config, ws: Workspace) -> None:
     state.branch_truncation = cfg.branch_truncation
     state.task_name_truncation = cfg.task_name_truncation
     state.max_visible_repo_rows = cfg.max_visible_repo_rows
+    state.tasks_min_width_percent = cfg.tasks_min_width_percent
+    state.tasks_max_width_percent = cfg.tasks_max_width_percent
     state.track_actions_default = cfg.track_actions_default
     state.actions_poll_seconds = cfg.actions_poll_seconds
     state.auto_remove_completed_after = cfg.auto_remove_completed_after

@@ -32,6 +32,12 @@ PAIR_SB_WARN = 16
 # Active-panel variant — same fg, but a slightly lighter bg so the panel
 # reads as "currently focused" without going as far as inverse video.
 PAIR_SB_FG_ACTIVE = 17
+# Active variants of each status colour: identical fg, sb_bg_active bg so
+# icons/labels rendered inside a focused panel don't punch holes in the fill.
+PAIR_SB_CYAN_ACTIVE = 22
+PAIR_SB_OK_ACTIVE = 23
+PAIR_SB_ERR_ACTIVE = 24
+PAIR_SB_WARN_ACTIVE = 25
 
 # Pastel pairs used inside dark-bg modals (action menu's bottom pane,
 # task detail) for diff stats, file-status codes, commit hashes/dates.
@@ -42,6 +48,11 @@ PAIR_PASTEL_GREEN = 18   # +ins  / Added file status
 PAIR_PASTEL_RED = 19     # -del  / Deleted file status / conflict
 PAIR_PASTEL_YELLOW = 20  # Modified status / commit sha
 PAIR_PASTEL_BLUE = 21    # Renamed status / commit relative-time
+# Active variants for the review pane's focused state.
+PAIR_PASTEL_GREEN_ACTIVE = 26
+PAIR_PASTEL_RED_ACTIVE = 27
+PAIR_PASTEL_YELLOW_ACTIVE = 28
+PAIR_PASTEL_BLUE_ACTIVE = 29
 
 
 def init_colors() -> None:
@@ -78,6 +89,10 @@ def init_colors() -> None:
     curses.init_pair(PAIR_SB_ERR, curses.COLOR_RED, sb_bg)
     curses.init_pair(PAIR_SB_WARN, curses.COLOR_YELLOW, sb_bg)
     curses.init_pair(PAIR_SB_FG_ACTIVE, curses.COLOR_WHITE, sb_bg_active)
+    curses.init_pair(PAIR_SB_CYAN_ACTIVE, curses.COLOR_CYAN, sb_bg_active)
+    curses.init_pair(PAIR_SB_OK_ACTIVE, curses.COLOR_GREEN, sb_bg_active)
+    curses.init_pair(PAIR_SB_ERR_ACTIVE, curses.COLOR_RED, sb_bg_active)
+    curses.init_pair(PAIR_SB_WARN_ACTIVE, curses.COLOR_YELLOW, sb_bg_active)
     # Pastel pairs — pulled from the xterm-256 soft-tone band where
     # available (151/174/179/109 are gentle on the eye against a dark
     # bg without the screaming primaries of the 16-colour set).
@@ -86,11 +101,19 @@ def init_colors() -> None:
         curses.init_pair(PAIR_PASTEL_RED, 174, sb_bg)
         curses.init_pair(PAIR_PASTEL_YELLOW, 179, sb_bg)
         curses.init_pair(PAIR_PASTEL_BLUE, 109, sb_bg)
+        curses.init_pair(PAIR_PASTEL_GREEN_ACTIVE, 151, sb_bg_active)
+        curses.init_pair(PAIR_PASTEL_RED_ACTIVE, 174, sb_bg_active)
+        curses.init_pair(PAIR_PASTEL_YELLOW_ACTIVE, 179, sb_bg_active)
+        curses.init_pair(PAIR_PASTEL_BLUE_ACTIVE, 109, sb_bg_active)
     else:
         curses.init_pair(PAIR_PASTEL_GREEN, curses.COLOR_GREEN, sb_bg)
         curses.init_pair(PAIR_PASTEL_RED, curses.COLOR_RED, sb_bg)
         curses.init_pair(PAIR_PASTEL_YELLOW, curses.COLOR_YELLOW, sb_bg)
         curses.init_pair(PAIR_PASTEL_BLUE, curses.COLOR_CYAN, sb_bg)
+        curses.init_pair(PAIR_PASTEL_GREEN_ACTIVE, curses.COLOR_GREEN, sb_bg_active)
+        curses.init_pair(PAIR_PASTEL_RED_ACTIVE, curses.COLOR_RED, sb_bg_active)
+        curses.init_pair(PAIR_PASTEL_YELLOW_ACTIVE, curses.COLOR_YELLOW, sb_bg_active)
+        curses.init_pair(PAIR_PASTEL_BLUE_ACTIVE, curses.COLOR_CYAN, sb_bg_active)
 
 
 def _state_color(*, error: str, merging: bool, ahead: int, behind: int,

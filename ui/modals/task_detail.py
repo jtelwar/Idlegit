@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 from typing import List, Optional
+from urllib.parse import urlparse
 
 from models import State, Task, TaskActionMenu, TaskActionMenuItem
 from git_ops import cancel_run
@@ -418,7 +419,11 @@ def _dispatch_action(state: State, item_id: str) -> None:
         return
 
     if item_id == "open_in_browser" and meta is not None and meta.run_url:
-        _open_in_browser(state, meta.run_url)
+        if _is_safe_browser_url(meta.run_url):
+            _open_in_browser(state, meta.run_url)
+        else:
+            t = state.tasks.add("open run URL")
+            state.tasks.update(t, "warn", "unsafe URL")
         # Modal stays open so user can pick another action afterwards.
         return
 
@@ -548,6 +553,11 @@ def _open_in_browser(state: State, url: str) -> None:
             state.tasks.update(t, "warn", f"{cmd} returned {rc}")
 
     threading.Thread(target=worker, daemon=True).start()
+
+
+def _is_safe_browser_url(url: str) -> bool:
+    parsed = urlparse(url)
+    return parsed.scheme in ("http", "https") and bool(parsed.netloc)
 
 
 __all__ = [

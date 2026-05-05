@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import List
 
 from models import DiffViewer, State
-from git_ops import git
+from git_ops import git_bounded_output
 
 from ..colors import (
     PAIR_PASTEL_GREEN, PAIR_PASTEL_RED, PAIR_PASTEL_YELLOW,
@@ -22,7 +22,7 @@ from ..geometry import (
     wrap_label_value,
 )
 from ..hints import (
-    KEY_ENTER, KEY_ESC, KEY_UP_DOWN, Hint, render_hints,
+    KEY_ESC, KEY_TAB, KEY_UP_DOWN, Hint, render_hints,
 )
 from ..sidebar import SPINNER_FRAMES
 
@@ -70,8 +70,13 @@ def _load_diff(viewer: DiffViewer) -> None:
             return
         if viewer.untracked:
             full = viewer.target_path / viewer.file_path
+            truncated = False
             try:
-                raw = full.read_bytes()[:_MAX_DIFF_BYTES]
+                with full.open("rb") as f:
+                    raw = f.read(_MAX_DIFF_BYTES + 1)
+                if len(raw) > _MAX_DIFF_BYTES:
+                    raw = raw[:_MAX_DIFF_BYTES]
+                    truncated = True
                 text = raw.decode("utf-8", errors="replace")
             except OSError as e:
                 text = f"(could not read file: {e})"
@@ -83,15 +88,20 @@ def _load_diff(viewer: DiffViewer) -> None:
             ]
             for ln in text.splitlines():
                 lines.append("+" + ln)
+            if truncated:
+                lines.append(f"... (truncated at {_MAX_DIFF_BYTES} bytes)")
         else:
-            rc, out, err = git(viewer.target_path, [
-                "diff", "HEAD", "--", viewer.file_path,
-            ])
+            rc, out, err, truncated = git_bounded_output(
+                viewer.target_path,
+                ["diff", "HEAD", "--", viewer.file_path],
+                _MAX_DIFF_BYTES)
             if rc != 0 and not out:
                 text = err.strip() or "(no diff available)"
                 lines = [text]
             else:
                 lines = out.splitlines() if out else ["(no diff)"]
+            if truncated:
+                lines.append(f"... (truncated at {_MAX_DIFF_BYTES} bytes)")
 
         if len(lines) > _MAX_DIFF_LINES:
             lines = lines[:_MAX_DIFF_LINES]
@@ -100,9 +110,13 @@ def _load_diff(viewer: DiffViewer) -> None:
 
         if viewer.cancel_event.is_set():
             return
-        viewer.lines = lines
+        with viewer.lock:
+            viewer.lines = lines
+            viewer.loading = False
     finally:
-        viewer.loading = False
+        if viewer.loading:
+            with viewer.lock:
+                viewer.loading = False
 
 
 def _diff_line_attr(line: str, sb: int) -> int:
@@ -128,7 +142,7 @@ def _diff_line_attr(line: str, sb: int) -> int:
 def _hints() -> List[Hint]:
     return [
         Hint(KEY_UP_DOWN, "scroll"),
-        Hint(KEY_ENTER, "close"),
+        Hint(KEY_TAB, "close"),
         Hint(KEY_ESC, "close"),
     ]
 
@@ -137,6 +151,9 @@ def draw_diff_viewer(stdscr, state: State, sidebar_x: int = 0) -> None:
     viewer = state.diff_viewer
     if viewer is None:
         return
+    with viewer.lock:
+        lines = list(viewer.lines)
+        loading = viewer.loading
 
     h, w = stdscr.getmaxyx()
     # Use the full available width (the review screen owns the whole
@@ -176,22 +193,22 @@ def draw_diff_viewer(stdscr, state: State, sidebar_x: int = 0) -> None:
     hint_y = y + box_h - pad_bottom - 1
     body_h = max(1, hint_y - line - 1)
 
-    if viewer.loading and not viewer.lines:
+    if loading and not lines:
         safe_addstr(stdscr, line, inner_x,
                     f"{_spinner_glyph(state)} loading diff…",
                     sb | curses.A_DIM)
     else:
         # Clamp scroll to the visible window.
-        max_scroll = max(0, len(viewer.lines) - body_h)
+        max_scroll = max(0, len(lines) - body_h)
         if viewer.scroll > max_scroll:
             viewer.scroll = max_scroll
         if viewer.scroll < 0:
             viewer.scroll = 0
         for i in range(body_h):
             idx = viewer.scroll + i
-            if idx >= len(viewer.lines):
+            if idx >= len(lines):
                 break
-            row = viewer.lines[idx]
+            row = lines[idx]
             safe_addstr(stdscr, line + i, inner_x,
                         end_truncate(row, inner_w),
                         _diff_line_attr(row, sb))
@@ -200,9 +217,9 @@ def draw_diff_viewer(stdscr, state: State, sidebar_x: int = 0) -> None:
             msg = f"  ↑ {viewer.scroll} more above"
             safe_addstr(stdscr, line, inner_x + max(0, inner_w - len(msg) - 1),
                         msg, sb | curses.A_DIM)
-        end = min(len(viewer.lines), viewer.scroll + body_h)
-        if end < len(viewer.lines):
-            below = len(viewer.lines) - end
+        end = min(len(lines), viewer.scroll + body_h)
+        if end < len(lines):
+            below = len(lines) - end
             msg = f"  ↓ {below} more below"
             safe_addstr(stdscr, line + body_h - 1,
                         inner_x + max(0, inner_w - len(msg) - 1),
@@ -216,7 +233,7 @@ def handle_diff_viewer_key(state: State, key: int) -> None:
     viewer = state.diff_viewer
     if viewer is None:
         return
-    if key in (10, 13, curses.KEY_ENTER, 27):
+    if key in (9, 10, 13, curses.KEY_ENTER, 27):
         viewer.cancel_event.set()
         state.diff_viewer = None
         return

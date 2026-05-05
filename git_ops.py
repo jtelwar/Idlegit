@@ -46,25 +46,91 @@ CONFLICT_CODES = frozenset({"DD", "AU", "UD", "UA", "DU", "AA", "UU"})
 MERGE_MARKER_FILES = ("MERGE_HEAD", "REBASE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD")
 MERGE_MARKER_DIRS = ("rebase-merge", "rebase-apply")
 
+DEFAULT_GIT_TIMEOUT_SECONDS = 120
+DEFAULT_GH_TIMEOUT_SECONDS = 60
+MAX_PARALLEL_GIT_JOBS = max(4, min(16, (os.cpu_count() or 4) * 2))
+
 
 # ---------- Subprocess + small helpers -------------------------------------
 
 
-def git(path: Path, args: List[str]) -> Tuple[int, str, str]:
+def _git_env() -> dict:
+    env = os.environ.copy()
+    # Background workers cannot answer credential prompts. Failing fast
+    # keeps the TUI from hanging behind a hidden git prompt.
+    env.setdefault("GIT_TERMINAL_PROMPT", "0")
+    env.setdefault("GCM_INTERACTIVE", "Never")
+    return env
+
+
+def git(path: Path, args: List[str],
+        timeout: float = DEFAULT_GIT_TIMEOUT_SECONDS) -> Tuple[int, str, str]:
     """Run git with `cwd=path`. Resilient to a missing/inaccessible cwd
     (returns rc=1 with the OSError message instead of raising) so the
     caller can treat it as any other git failure — important when a repo
-    folder is removed under us between refreshes."""
+    folder is removed under us between refreshes. Calls are bounded and
+    non-interactive so background workers can't hang forever behind a
+    credential prompt, hook, or stalled remote."""
     try:
         p = subprocess.run(
             ["git", *args],
             cwd=str(path),
             capture_output=True,
             text=True,
+            timeout=timeout,
+            env=_git_env(),
         )
     except OSError as e:
         return 1, "", str(e)
+    except subprocess.TimeoutExpired as e:
+        return 124, e.stdout or "", f"git timed out after {timeout:g}s"
     return p.returncode, p.stdout, p.stderr
+
+
+def git_bounded_output(path: Path, args: List[str],
+                       max_bytes: int,
+                       timeout: float = DEFAULT_GIT_TIMEOUT_SECONDS
+                       ) -> Tuple[int, str, str, bool]:
+    """Run git and capture at most `max_bytes` of stdout/stderr combined.
+
+    Used by viewer-style code where the full command output can be very
+    large. Returns (rc, out, err, truncated)."""
+    try:
+        p = subprocess.Popen(
+            ["git", *args],
+            cwd=str(path),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=_git_env(),
+        )
+        try:
+            out_b, err_b = p.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            out_b, err_b = p.communicate()
+            return 124, "", f"git timed out after {timeout:g}s", False
+    except OSError as e:
+        return 1, "", str(e), False
+
+    combined_len = len(out_b) + len(err_b)
+    truncated = combined_len > max_bytes
+    if truncated:
+        remaining = max_bytes
+        out_b = out_b[:remaining]
+        remaining -= len(out_b)
+        err_b = err_b[:max(0, remaining)]
+    out = out_b.decode("utf-8", errors="replace")
+    err = err_b.decode("utf-8", errors="replace")
+    return p.returncode, out, err, truncated
+
+
+def is_safe_ref_arg(ref: str) -> bool:
+    """True when `ref` is safe to pass as a git/gh positional ref.
+
+    argv-list subprocesses avoid shell injection, but git/gh can still
+    parse leading-dash refs as options in many positions. Refuse those
+    instead of trying to disambiguate every command's grammar."""
+    return bool(ref) and not ref.startswith("-")
 
 
 def first_line(text: str) -> str:
@@ -222,19 +288,25 @@ def discover_repos(workspace: Path) -> List[Repo]:
     script lives in is included if (and only if) it's also a git repo —
     handy for managing idlegit's own checkout from idlegit itself."""
     repos: List[Repo] = []
-    if (workspace / ".git").exists():
-        repos.append(Repo(rel=".", path=workspace))
+    try:
+        if (workspace / ".git").exists():
+            repos.append(Repo(rel=".", path=workspace.resolve()))
+    except OSError:
+        return repos
     try:
         children = sorted(workspace.iterdir(), key=lambda p: p.name.lower())
     except OSError:
         return repos
     for child in children:
-        if not child.is_dir():
+        try:
+            if not child.is_dir():
+                continue
+            if child.name.startswith("."):
+                continue
+            if (child / ".git").exists():
+                repos.append(Repo(rel=child.name, path=child.resolve()))
+        except OSError:
             continue
-        if child.name.startswith("."):
-            continue
-        if (child / ".git").exists():
-            repos.append(Repo(rel=child.name, path=child.resolve()))
     return repos
 
 
@@ -403,7 +475,8 @@ def _link_siblings_locked(repos: List[Repo],
                         break
 
     if submodule_refs:
-        with ThreadPoolExecutor(max_workers=len(submodule_refs)) as ex:
+        max_workers = min(len(submodule_refs), MAX_PARALLEL_GIT_JOBS)
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
             list(ex.map(_populate, submodule_refs))
 
     # Drift detection for shared synthetic canonicals: when multiple
@@ -526,6 +599,8 @@ def sync_sibling(sibling_path: Path, branch: str) -> Tuple[bool, str]:
     orphaned and any files unique to those commits vanish from the
     working tree. The user resolves manually (e.g. by branching from
     HEAD before re-running the sync)."""
+    if not is_safe_ref_arg(branch):
+        return False, f"unsafe branch name: {branch or '(empty)'}"
     rc, _, err = git(sibling_path, ["fetch", "origin"])
     if rc != 0:
         return False, f"fetch failed: {first_line(err)}"
@@ -663,8 +738,19 @@ def sync_subtree(parent_path: Path, prefix: str,
     nested files catch up with the source repo's branch tip. NOTE: this
     creates a (squashed) merge commit in the parent — subtrees inherently
     can't be synced without one."""
+    if not prefix:
+        return False, "subtree prefix is empty"
     if not source_url:
         return False, "source repo has no remote URL"
+    if source_url.startswith("-"):
+        return False, "source repo remote URL looks like an option"
+    if not is_safe_ref_arg(source_branch):
+        return False, f"unsafe source branch: {source_branch or '(empty)'}"
+    rc, status_out, _ = git(parent_path, ["status", "--porcelain=v1"])
+    if rc != 0:
+        return False, "parent status failed"
+    if status_out.strip():
+        return False, "parent has local changes"
     rc, _, err = git(parent_path, [
         "subtree", "pull", "--prefix=" + prefix,
         source_url, source_branch, "--squash",
@@ -714,7 +800,8 @@ def parse_github_slug(remote_url: Optional[str]) -> Optional[str]:
     return f"{m.group(1)}/{m.group(2)}"
 
 
-def gh(args: List[str]) -> Tuple[int, str, str]:
+def gh(args: List[str],
+       timeout: float = DEFAULT_GH_TIMEOUT_SECONDS) -> Tuple[int, str, str]:
     """Run `gh` with the given args. Mirrors `git()` — never raises; a
     missing CLI or OSError is reported as rc=1."""
     if _GH_PATH is None:
@@ -724,9 +811,13 @@ def gh(args: List[str]) -> Tuple[int, str, str]:
             [_GH_PATH, *args],
             capture_output=True,
             text=True,
+            timeout=timeout,
+            env=_git_env(),
         )
     except OSError as e:
         return 1, "", str(e)
+    except subprocess.TimeoutExpired as e:
+        return 124, e.stdout or "", f"gh timed out after {timeout:g}s"
     return p.returncode, p.stdout, p.stderr
 
 
@@ -1032,6 +1123,10 @@ def dispatch_workflow(slug: str, workflow_name: str,
     """Trigger a workflow_dispatch on the given branch. Surfaces the gh
     error (single line) if the workflow isn't dispatchable, the ref is
     invalid, or the user lacks permission."""
+    if not workflow_name or workflow_name.startswith("-"):
+        return False, "unsafe workflow name"
+    if not is_safe_ref_arg(ref):
+        return False, "unsafe workflow ref"
     rc, _, err = gh([
         "workflow", "run", workflow_name,
         "--repo", slug,

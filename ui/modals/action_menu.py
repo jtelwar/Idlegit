@@ -32,10 +32,11 @@ from ..geometry import (
     draw_modal_fill, end_truncate, modal_geometry, safe_addstr, truncate,
 )
 from ..hints import (
-    KEY_DOWN, KEY_ENTER, KEY_ESC, KEY_HOME, KEY_LEFT_RIGHT, KEY_UP_DOWN,
-    Hint, render_hints,
+    KEY_DOWN, KEY_ENTER, KEY_ESC, KEY_HOME, KEY_LEFT_RIGHT, KEY_TAB,
+    KEY_UP_DOWN, Hint, render_hints,
 )
 from ..sidebar import SPINNER_FRAMES
+from .diff_viewer import handle_diff_viewer_key, open_diff_viewer
 
 
 def _spinner_glyph(state: State) -> str:
@@ -56,6 +57,7 @@ def _hints_action_focus(menu: ActionMenu) -> list:
             reason = f" ({item.reason})" if item.reason else ""
             hints.append(Hint(KEY_ENTER, f"unavailable{reason}"))
     hints.append(Hint(KEY_DOWN, "into pane"))
+    hints.append(Hint(KEY_TAB, "close"))
     hints.append(Hint(KEY_ESC, "back"))
     return hints
 
@@ -65,12 +67,15 @@ def _hints_pane_focus(menu: ActionMenu) -> list:
     focus. Tab swap is presented as ←/→ to match how the existing UI
     handles the same physical motion."""
     other_tab = "commits" if menu.pane_tab == "tree" else "working tree"
-    return [
+    hints = [
         Hint(KEY_UP_DOWN, "select"),
         Hint(KEY_LEFT_RIGHT, f"switch to {other_tab}"),
-        Hint(KEY_HOME, "back to actions"),
-        Hint(KEY_ESC, "back"),
     ]
+    if menu.pane_tab == "tree" and menu.tree_selected > 0:
+        hints.append(Hint(KEY_TAB, "view diff"))
+    hints.append(Hint(KEY_HOME, "back to actions"))
+    hints.append(Hint(KEY_ESC, "back"))
+    return hints
 
 
 def _draw_action_hints(stdscr, menu: ActionMenu, y: int, x: int,
@@ -846,6 +851,12 @@ def handle_action_menu_key(state: State, key: int) -> None:
     if menu is None:
         return
 
+    # Diff viewer is a sub-modal of the action menu — route all keys to
+    # it while it's open; Tab and Esc both close it.
+    if state.diff_viewer is not None:
+        handle_diff_viewer_key(state, key)
+        return
+
     if key == 27:
         menu.cancel_event.set()
         state.action_menu = None
@@ -866,6 +877,11 @@ def handle_action_menu_key(state: State, key: int) -> None:
         return
 
     # ---- Action-items navigation ----
+    # Tab closes the menu when focus is on the action items (not the pane).
+    if key == 9:
+        menu.cancel_event.set()
+        state.action_menu = None
+        return
     if key == curses.KEY_UP and menu.items:
         menu.selected = (menu.selected - 1) % len(menu.items)
         return
@@ -924,13 +940,13 @@ def _handle_pane_key(state: State, menu: ActionMenu, key: int) -> None:
 
     # Selection ↔ "above filter row" returns to the action items.
     if menu.pane_tab == "tree":
-        _handle_tree_key(menu, key)
+        _handle_tree_key(state, menu, key)
     else:
         _handle_commits_key(menu, key)
     _maybe_prefetch(menu)
 
 
-def _handle_tree_key(menu: ActionMenu, key: int) -> None:
+def _handle_tree_key(state: State, menu: ActionMenu, key: int) -> None:
     files = _filtered_tree(menu)
     max_idx = len(files)  # 0 = filter, 1..len(files) = rows
     on_filter = (menu.tree_selected == 0)
@@ -944,6 +960,19 @@ def _handle_tree_key(menu: ActionMenu, key: int) -> None:
     if key == curses.KEY_DOWN:
         if menu.tree_selected < max_idx:
             menu.tree_selected += 1
+        return
+    if key == 9 and not on_filter:
+        # Tab on a file row opens the diff viewer.
+        idx = menu.tree_selected - 1
+        if 0 <= idx < len(files):
+            fe = files[idx]
+            open_diff_viewer(
+                state,
+                target_path=menu.target_path,
+                label=menu.target_label,
+                file_path=fe.path,
+                untracked=fe.untracked,
+            )
         return
     if on_filter and _is_typing_key(key):
         if key in (curses.KEY_BACKSPACE, 127, 8):

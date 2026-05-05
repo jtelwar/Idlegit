@@ -17,8 +17,8 @@ for _p in (str(_HERE.parent), str(_HERE)):
 import config  # noqa: E402
 from config import (  # noqa: E402
     Config, apply_workspace_overrides, base_value_for_override,
-    coerce_override_value, load_workspaces, save_workspaces,
-    state_attr_value_from_override,
+    coerce_override_value, get_load_warnings, load_config,
+    load_workspaces, save_workspaces, state_attr_value_from_override,
 )
 from models import (  # noqa: E402
     Repo, State, Workspace, WorkspaceCreator, WorkspaceDraft,
@@ -81,6 +81,32 @@ class TestOverrideCoercion(unittest.TestCase):
         self.assertIsNone(coerce_override_value("not_a_key", "value"))
 
 
+class TestConfigWarnings(unittest.TestCase):
+    def test_malformed_config_surfaces_warning_and_uses_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d) / "idlegit.conf"
+            tmp.write_text("[idlegit]\nsuggest_added = nope\n")
+            with mock.patch.object(config, "CONFIG_FILE", tmp):
+                cfg = load_config()
+
+        self.assertEqual(cfg.suggest_added, config.DEFAULT_SUGGEST)
+        self.assertTrue(any("using defaults" in w
+                            for w in get_load_warnings()))
+
+    def test_task_width_percentages_load_and_clamp(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d) / "idlegit.conf"
+            tmp.write_text(
+                "[idlegit]\n"
+                "tasks_min_width_percent = 0.25\n"
+                "tasks_max_width_percent = 2.0\n")
+            with mock.patch.object(config, "CONFIG_FILE", tmp):
+                cfg = load_config()
+
+        self.assertEqual(cfg.tasks_min_width_percent, 0.25)
+        self.assertEqual(cfg.tasks_max_width_percent, 1.0)
+
+
 class TestApplyWorkspaceOverrides(unittest.TestCase):
     def test_resets_state_to_base_then_applies_overrides(self) -> None:
         cfg = Config(
@@ -131,6 +157,11 @@ class TestBaseValueLookup(unittest.TestCase):
     def test_state_attr_translation_passthrough(self) -> None:
         self.assertEqual(
             state_attr_value_from_override("suggest_added", 7), 7)
+
+    def test_state_attr_translation_for_task_width_percent(self) -> None:
+        self.assertEqual(
+            state_attr_value_from_override("tasks_min_width_percent", 1.5),
+            1.0)
 
     def test_base_value_for_lfs_warn_mb_reads_bytes(self) -> None:
         cfg = Config(lfs_warn_bytes=100 * 1024 * 1024)
@@ -252,6 +283,44 @@ class TestWorkspacesFileRoundTrip(unittest.TestCase):
             with mock.patch.object(config, "WORKSPACES_FILE", tmp):
                 loaded, _ = load_workspaces()
         self.assertEqual([w.name for w in loaded], ["Good"])
+
+    def test_malformed_workspaces_file_surfaces_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d) / "idlegit.workspaces"
+            tmp.write_text("not a section\n")
+            with mock.patch.object(config, "WORKSPACES_FILE", tmp):
+                loaded, active_idx = load_workspaces()
+
+        self.assertEqual(loaded, [])
+        self.assertEqual(active_idx, 0)
+        self.assertTrue(any("could not read" in w
+                            for w in get_load_warnings()))
+
+    def test_bad_folder_line_is_skipped_without_losing_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            good = Path(d) / "good"
+            good.mkdir()
+            tmp = Path(d) / "idlegit.workspaces"
+            bad = Path(d) / "bad"
+            tmp.write_text(
+                "[workspace.W]\nfolders = "
+                f"{good}\n"
+                f"          {bad}\n")
+            with mock.patch.object(Path, "resolve",
+                                   autospec=True) as resolve:
+                def fake_resolve(path):
+                    if path == bad:
+                        raise OSError("denied")
+                    return path
+
+                resolve.side_effect = fake_resolve
+                with mock.patch.object(config, "WORKSPACES_FILE", tmp):
+                    loaded, _ = load_workspaces()
+
+        self.assertEqual(len(loaded), 1)
+        self.assertEqual(loaded[0].folders, [good])
+        self.assertTrue(any("workspace folder ignored" in w
+                            for w in get_load_warnings()))
 
 
 # ---------- State helpers --------------------------------------------------

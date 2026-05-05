@@ -11,6 +11,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 _HERE = Path(__file__).resolve().parent
 for _p in (str(_HERE.parent), str(_HERE)):
@@ -23,7 +24,7 @@ from _helpers import (  # noqa: E402
 from git_ops import (  # noqa: E402
     discover_repos, discover_workflows_local, find_lfs_warnings,
     link_siblings, refresh_repo, signature_mtime, suggest_commit_message,
-    working_tree_signature,
+    sync_subtree, working_tree_signature,
 )
 from models import Repo, SubtreeSpec  # noqa: E402
 
@@ -1574,6 +1575,121 @@ class TestFFMergeAction(_TempWorkspace):
         labels = " ".join(t.label + " " + t.message
                           for t in state.tasks.snapshot())
         self.assertIn("ff_merge", labels.replace("--ff-only", "ff_merge"))
+
+
+class TestGitOperationHardening(_TempWorkspace):
+    def test_manual_pull_uses_ff_only_and_refuses_divergence(self) -> None:
+        from workers import kick_off_action
+        from models import State
+
+        remote = make_repo(self.tmp, "remote")
+        _run(self.tmp, "git", "clone", str(remote), "r")
+        repo_path = self.tmp / "r"
+
+        write_file(remote, "remote.txt", "remote\n")
+        stage_and_commit(remote, "remote edit")
+        write_file(repo_path, "local.txt", "local\n")
+        stage_and_commit(repo_path, "local edit")
+        local_head = _run(repo_path, "git", "rev-parse", "HEAD").stdout.strip()
+
+        repo = Repo(rel="r", path=repo_path)
+        state = State(repos=[repo], workspace_name="test")
+        kick_off_action(
+            state, "pull",
+            target_label="r", target_path=repo_path,
+            target_repo=repo, target_parent=None)
+
+        for t in threading.enumerate():
+            if t.daemon and t is not threading.current_thread():
+                t.join(timeout=5.0)
+
+        self.assertEqual(
+            _run(repo_path, "git", "rev-parse", "HEAD").stdout.strip(),
+            local_head)
+        labels = " ".join(t.label + " " + t.message
+                          for t in state.tasks.snapshot())
+        self.assertIn("pull --ff-only", labels)
+
+    def test_option_like_branch_name_is_rejected_before_checkout(self) -> None:
+        from workers import kick_off_action
+        from models import State
+
+        repo_path = make_repo(self.tmp, "r")
+        head = _run(repo_path, "git", "rev-parse", "HEAD").stdout.strip()
+        repo = Repo(rel="r", path=repo_path)
+        state = State(repos=[repo], workspace_name="test")
+        kick_off_action(
+            state, "branch_from_head",
+            target_label="r", target_path=repo_path,
+            target_repo=repo, target_parent=None,
+            branch_arg="--bad")
+
+        for t in threading.enumerate():
+            if t.daemon and t is not threading.current_thread():
+                t.join(timeout=5.0)
+
+        self.assertEqual(
+            _run(repo_path, "git", "rev-parse", "HEAD").stdout.strip(),
+            head)
+        labels = " ".join(t.label + " " + t.message
+                          for t in state.tasks.snapshot())
+        self.assertIn("unsafe branch name", labels)
+
+    def test_sync_subtree_refuses_dirty_parent(self) -> None:
+        parent = make_repo(self.tmp, "parent")
+        write_file(parent, "dirty.txt", "dirty\n")
+
+        ok, msg = sync_subtree(parent, "vendor/lib", "https://example/lib.git",
+                               "main")
+
+        self.assertFalse(ok)
+        self.assertIn("local changes", msg)
+
+
+class TestPromptHardening(unittest.TestCase):
+    def test_detached_recovery_prompt_timeout_clears_slot(self) -> None:
+        import workers
+        from models import DetachedRecoveryPrompt, State
+
+        state = State(repos=[], workspace_name="test")
+        prompt = DetachedRecoveryPrompt(
+            target_label="r", head_sha="abc123",
+            target_branch="main", n_extra=1, can_ff=True)
+
+        with mock.patch.object(workers, "PROMPT_WAIT_SECONDS", 0.01), \
+                mock.patch.object(
+                    workers, "git",
+                    return_value=(0, "", "")), \
+                mock.patch.object(
+                    workers, "_build_recovery_prompt",
+                    return_value=prompt):
+            ok, msg = workers._attempt_detached_recovery(
+                state, Path("/tmp/repo"), "r")
+
+        self.assertFalse(ok)
+        self.assertIn("timed out", msg)
+        self.assertIsNone(state.detached_recovery_prompt)
+
+    def test_action_refusal_still_refreshes_target_state(self) -> None:
+        import workers
+        from models import Repo, State
+
+        repo = Repo(rel="r", path=Path("/tmp/repo"))
+        state = State(repos=[repo], workspace_name="test")
+
+        with mock.patch.object(workers, "MIN_ACTION_REFRESH_SECONDS", 0), \
+                mock.patch.object(workers, "_refresh_target_state") as refresh:
+            workers.kick_off_action(
+                state, "branch_from_head",
+                target_label="r", target_path=repo.path,
+                target_repo=repo, target_parent=None,
+                branch_arg="--bad")
+            for t in threading.enumerate():
+                if t.daemon and t is not threading.current_thread():
+                    t.join(timeout=5.0)
+
+        refresh.assert_called_once_with(state, repo, None)
+        self.assertFalse(repo.refreshing)
 
 
 if __name__ == "__main__":

@@ -440,6 +440,7 @@ class DiffViewer:
     loading: bool = True
     scroll: int = 0
     cancel_event: threading.Event = field(default_factory=threading.Event)
+    lock: threading.Lock = field(default_factory=threading.Lock)
 
 
 @dataclass
@@ -879,6 +880,8 @@ _DEFAULT_CHILD_NAME_DISPLAY_MAX = -1  # -1 = inherit from name_display_max
 _DEFAULT_TASK_NAME_DISPLAY_MAX = 16
 _DEFAULT_TRUNCATION_MODE = "middle"
 _DEFAULT_MAX_VISIBLE_REPO_ROWS = 0
+_DEFAULT_TASKS_MIN_WIDTH_PERCENT = 0.2
+_DEFAULT_TASKS_MAX_WIDTH_PERCENT = 0.5
 _DEFAULT_TRACK_ACTIONS = True
 _DEFAULT_ACTIONS_POLL_SECONDS = 5.0
 _DEFAULT_AUTO_REMOVE_COMPLETED_AFTER = -1.0
@@ -905,6 +908,8 @@ class State:
     branch_truncation: str = _DEFAULT_TRUNCATION_MODE
     task_name_truncation: str = _DEFAULT_TRUNCATION_MODE
     max_visible_repo_rows: int = _DEFAULT_MAX_VISIBLE_REPO_ROWS
+    tasks_min_width_percent: float = _DEFAULT_TASKS_MIN_WIDTH_PERCENT
+    tasks_max_width_percent: float = _DEFAULT_TASKS_MAX_WIDTH_PERCENT
     subtrees: List[SubtreeSpec] = field(default_factory=list)
     track_actions_default: bool = _DEFAULT_TRACK_ACTIONS
     actions_poll_seconds: float = _DEFAULT_ACTIONS_POLL_SECONDS

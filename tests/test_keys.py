@@ -14,8 +14,8 @@ for _p in (str(_HERE.parent), str(_HERE)):
         sys.path.insert(0, _p)
 
 from models import (  # noqa: E402
-    ActionMenu, ActionMenuItem, BranchPicker, CommitEntry, FileEntry, Repo,
-    ResetPrompt, State,
+    ActionMenu, ActionMenuItem, BranchNamePrompt, BranchPicker, CommitEntry,
+    FileEntry, Repo, ResetPrompt, State,
 )
 
 
@@ -23,10 +23,13 @@ from models import (  # noqa: E402
 # whole module under that condition rather than erroring out import.
 try:
     from ui import (  # noqa: E402
-        handle_action_menu_key, handle_branch_picker_key, handle_main_key,
-        handle_reset_prompt_key, handle_task_action_menu_key,
-        handle_task_panel_key, open_task_action_menu,
+        _split_remaining_width,
+        handle_action_menu_key, handle_branch_name_prompt_key,
+        handle_branch_picker_key, handle_main_key, handle_reset_prompt_key,
+        handle_task_action_menu_key, handle_task_panel_key,
+        open_task_action_menu,
     )
+    from ui.modals.task_detail import _is_safe_browser_url  # noqa: E402
     UI_AVAILABLE = True
 except Exception:  # pragma: no cover
     UI_AVAILABLE = False
@@ -72,6 +75,19 @@ class TestNavigation(unittest.TestCase):
         handle_main_key(s, curses.KEY_DOWN)  # → first body row (a)
         self.assertEqual(s.selected, 0)
         self.assertEqual(s.field_cursor, len("hello"))
+
+
+@unittest.skipUnless(UI_AVAILABLE, "ui module unavailable")
+class TestResponsiveLayout(unittest.TestCase):
+    def test_remaining_width_splits_evenly_by_default(self) -> None:
+        self.assertEqual(_split_remaining_width(50, 0.2, 0.5), (25, 25))
+
+    def test_task_width_clamps_to_configured_max(self) -> None:
+        self.assertEqual(_split_remaining_width(50, 0.2, 0.3), (35, 15))
+
+    def test_task_width_keeps_one_cell_for_message_field(self) -> None:
+        self.assertEqual(_split_remaining_width(1, 0.2, 1.0), (1, 0))
+        self.assertEqual(_split_remaining_width(2, 0.9, 1.0), (1, 1))
 
 
 @unittest.skipUnless(UI_AVAILABLE, "ui module unavailable")
@@ -539,6 +555,39 @@ class TestResetPromptHandler(unittest.TestCase):
         self.assertIsNone(s.reset_prompt)
         self.assertIsNone(s.action_menu)
 
+    def test_empty_enter_does_not_mean_reset_all(self) -> None:
+        s = _state(_make_repo("a"))
+        s.action_menu = ActionMenu(target_label="x", target_path=Path("/tmp/x"))
+        s.reset_prompt = self._prompt()
+        handle_reset_prompt_key(s, 10)
+        self.assertIsNotNone(s.reset_prompt)
+        self.assertIsNotNone(s.action_menu)
+
+
+@unittest.skipUnless(UI_AVAILABLE, "ui module unavailable")
+class TestBranchNamePromptHandler(unittest.TestCase):
+    def test_leading_dash_is_ignored(self) -> None:
+        s = _state(_make_repo("a"))
+        s.branch_name_prompt = BranchNamePrompt(
+            target_label="repo", target_path=Path("/tmp/repo"),
+            default_name="idlegit/wip")
+
+        handle_branch_name_prompt_key(s, ord("-"))
+
+        self.assertEqual(s.branch_name_prompt.typed, "")
+
+    def test_enter_rejects_option_like_default_name(self) -> None:
+        s = _state(_make_repo("a"))
+        s.action_menu = ActionMenu(target_label="x", target_path=Path("/tmp/x"))
+        s.branch_name_prompt = BranchNamePrompt(
+            target_label="repo", target_path=Path("/tmp/repo"),
+            default_name="--bad")
+
+        handle_branch_name_prompt_key(s, 10)
+
+        self.assertIsNotNone(s.branch_name_prompt)
+        self.assertIsNotNone(s.action_menu)
+
 
 @unittest.skipUnless(UI_AVAILABLE, "ui module unavailable")
 class TestBranchPickerHandler(unittest.TestCase):
@@ -618,6 +667,12 @@ class TestTaskActionMenu(unittest.TestCase):
         open_task_action_menu(s, t)
         self.assertEqual(
             self._ids(s), ["cancel_run", "open_in_browser", "close"])
+
+    def test_browser_open_allows_http_urls_only(self) -> None:
+        self.assertTrue(_is_safe_browser_url("https://example.com/runs/1"))
+        self.assertTrue(_is_safe_browser_url("http://example.com/runs/1"))
+        self.assertFalse(_is_safe_browser_url("file:///tmp/x"))
+        self.assertFalse(_is_safe_browser_url("javascript:alert(1)"))
 
     def test_running_run_with_pending_then_run_child(self) -> None:
         # Parent run task has a pending placeholder child — the modal

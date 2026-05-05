@@ -11,8 +11,11 @@ from models import State
 from git_ops import format_time_ago
 
 from .colors import (
-    PAIR_SB_CYAN, PAIR_SB_ERR, PAIR_SB_FG, PAIR_SB_FG_ACTIVE,
-    PAIR_SB_OK, PAIR_SB_WARN,
+    PAIR_SB_CYAN, PAIR_SB_CYAN_ACTIVE,
+    PAIR_SB_ERR, PAIR_SB_ERR_ACTIVE,
+    PAIR_SB_FG, PAIR_SB_FG_ACTIVE,
+    PAIR_SB_OK, PAIR_SB_OK_ACTIVE,
+    PAIR_SB_WARN, PAIR_SB_WARN_ACTIVE,
 )
 from .geometry import safe_addstr
 from .hints import KEY_CTRL_R, KEY_SHIFT_TAB, Hint, render_hints
@@ -58,13 +61,15 @@ def draw_sidebar(stdscr, state: State, x: int, w: int) -> None:
         return
     h, _ = stdscr.getmaxyx()
     focused = state.focused_panel == "tasks"
-    # When this panel has focus, fill with a slightly-lighter
-    # background pair so the user can see at a glance which side ↑/↓
-    # is steering. Cell-specific colour pairs (icons, etc.) keep their
-    # normal dark bg — only the empty space between rows brightens.
-    sb = curses.color_pair(PAIR_SB_FG)
     fill_attr = curses.color_pair(
         PAIR_SB_FG_ACTIVE if focused else PAIR_SB_FG)
+    # When focused, every text colour pair must use sb_bg_active so icons
+    # and labels don't punch holes in the lighter fill background.
+    sb = fill_attr
+    c_cyan = PAIR_SB_CYAN_ACTIVE if focused else PAIR_SB_CYAN
+    c_ok = PAIR_SB_OK_ACTIVE if focused else PAIR_SB_OK
+    c_err = PAIR_SB_ERR_ACTIVE if focused else PAIR_SB_ERR
+    c_warn = PAIR_SB_WARN_ACTIVE if focused else PAIR_SB_WARN
 
     # Leave the very top row at the default terminal background so the
     # title row (`idlegit · …`) reads as one continuous strip instead of
@@ -79,7 +84,7 @@ def draw_sidebar(stdscr, state: State, x: int, w: int) -> None:
     # Header carries the panel's focus accent — bright cyan when
     # focused, dim white otherwise. Same treatment as the
     # "Repositories" header in `draw_main`.
-    header_attr = (curses.color_pair(PAIR_SB_CYAN) | curses.A_BOLD if focused
+    header_attr = (curses.color_pair(c_cyan) | curses.A_BOLD if focused
                    else sb | curses.A_DIM | curses.A_BOLD)
 
     if not items:
@@ -130,7 +135,7 @@ def draw_sidebar(stdscr, state: State, x: int, w: int) -> None:
         safe_addstr(stdscr, header_y, rx, count_str, sb | curses.A_DIM)
         up_x = rx + len(count_str) + 1
         down_x = up_x + 1
-        on_attr = curses.color_pair(PAIR_SB_CYAN) | curses.A_BOLD
+        on_attr = curses.color_pair(c_cyan) | curses.A_BOLD
         off_attr = sb | curses.A_DIM
         safe_addstr(stdscr, header_y, up_x, "↑",
                     on_attr if has_more_above else off_attr)
@@ -148,16 +153,16 @@ def draw_sidebar(stdscr, state: State, x: int, w: int) -> None:
         if y + span > body_max_y:
             break
         if t.status == "running":
-            icon, color = spinner, PAIR_SB_CYAN
+            icon, color = spinner, c_cyan
         elif t.status == "pending":
             # Clock face — task is queued, waiting on something else.
-            icon, color = "◷", PAIR_SB_CYAN
+            icon, color = "◷", c_cyan
         elif t.status == "ok":
-            icon, color = "✓", PAIR_SB_OK
+            icon, color = "✓", c_ok
         elif t.status == "fail":
-            icon, color = "✗", PAIR_SB_ERR
+            icon, color = "✗", c_err
         else:  # warn
-            icon, color = "⚠", PAIR_SB_WARN
+            icon, color = "⚠", c_warn
 
         elapsed = max(0.0, now - t.started_at)
         time_tag = format_time_ago(elapsed)
@@ -175,15 +180,15 @@ def draw_sidebar(stdscr, state: State, x: int, w: int) -> None:
 
         if is_selected:
             safe_addstr(stdscr, y, x, "▸",
-                        curses.color_pair(PAIR_SB_CYAN) | curses.A_BOLD)
+                        curses.color_pair(c_cyan) | curses.A_BOLD)
         safe_addstr(stdscr, y, x + 1, icon, curses.color_pair(color))
         if is_selected:
-            label_attr = curses.color_pair(PAIR_SB_CYAN) | curses.A_BOLD
+            label_attr = curses.color_pair(c_cyan) | curses.A_BOLD
         elif t.status == "pending":
             # Subtle cyan + dim so the "↪ then run: …" placeholder reads
             # as a chained follow-up rather than another regular running
             # row — matches the cyan icon in the gutter.
-            label_attr = curses.color_pair(PAIR_SB_CYAN) | curses.A_DIM
+            label_attr = curses.color_pair(c_cyan) | curses.A_DIM
         elif t.status == "running":
             label_attr = sb
         else:
