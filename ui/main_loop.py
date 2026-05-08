@@ -1,0 +1,573 @@
+"""Keyboard routing for the main surface and the review (confirm) sub-loop."""
+from __future__ import annotations
+
+import curses
+from typing import Optional
+
+from models import State
+from workers import (
+    _build_recovery_prompt,
+    execute_detached_recovery,
+    kick_off_bulk_suggest,
+    kick_off_suggest_for,
+    kick_off_workers,
+    refresh_repo_with_remote_state,
+)
+from .colors import PAIR_WARN
+from .geometry import safe_addstr
+from .main_screen import _focused_message_holder, draw_main
+from .modals import (
+    draw_diff_viewer,
+    handle_detached_recovery_prompt_key,
+    handle_diff_viewer_key,
+    open_action_menu,
+    open_diff_viewer,
+    open_task_action_menu,
+    open_workspace_menu,
+    open_workspaces_picker,
+)
+from .review import (
+    _collect_review_focusables,
+    _focused_block_idx,
+    build_review_blocks,
+    cycle_then_run,
+    draw_review,
+    kick_off_review_files_load,
+)
+from .sidebar import SPINNER_FRAMES
+
+
+def _reset_field_cursor(state: State) -> None:
+    """Park the cursor at the end of the focused row's message — runs after
+    every selection change so each field starts in a familiar place."""
+    holder = _focused_message_holder(state)
+    state.field_cursor = len(holder.message) if holder is not None else 0
+
+
+def _clamp_task_selection(state: State) -> None:
+    """Keep state.task_selected within the current task list and within
+    the visible window. Called after navigation + after the task list
+    mutates (additions, removals, prunes)."""
+    n = len(state.tasks.snapshot())
+    if n == 0:
+        state.task_selected = 0
+        state.task_scroll = 0
+        return
+    state.task_selected = max(0, min(state.task_selected, n - 1))
+
+
+def handle_task_panel_key(state: State, key: int) -> Optional[str]:
+    """Key handling while the task panel has focus. Returns the same
+    action sentinels as handle_main_key so the main loop's outer dispatch
+    keeps working without special cases."""
+    items = state.tasks.snapshot()
+    n = len(items)
+
+    if key == curses.KEY_BTAB or key == 27:
+        # Shift+Tab toggles back; Esc also returns focus to the repo list
+        # rather than triggering a quit.
+        state.focused_panel = "repos"
+        return None
+
+    if key in (18, curses.KEY_F5):
+        return "refresh"
+    if key == 19:
+        return "sync"
+
+    if n == 0:
+        return None
+
+    if key == curses.KEY_UP:
+        state.task_selected = max(0, state.task_selected - 1)
+        return None
+    if key == curses.KEY_DOWN:
+        state.task_selected = min(n - 1, state.task_selected + 1)
+        return None
+    if key == curses.KEY_PPAGE:
+        state.task_selected = max(0, state.task_selected - 10)
+        return None
+    if key == curses.KEY_NPAGE:
+        state.task_selected = min(n - 1, state.task_selected + 10)
+        return None
+    if key == curses.KEY_HOME:
+        state.task_selected = 0
+        return None
+    if key == curses.KEY_END:
+        state.task_selected = n - 1
+        return None
+
+    if key == 9:  # Tab — open the task-detail modal on the focused row
+        if 0 <= state.task_selected < n:
+            open_task_action_menu(state, items[state.task_selected])
+        return None
+
+    if key in (10, 13, curses.KEY_ENTER):
+        # Enter on a finished task removes it. `running` AND `pending`
+        # rows are both kept so the user can't accidentally drop
+        # something mid-flight — `pending` is the chained-then-run
+        # placeholder waiting on a parent run to land, and dropping it
+        # would silently cancel the queued follow-up.
+        if 0 <= state.task_selected < n:
+            t = items[state.task_selected]
+            if t.status not in ("running", "pending"):
+                state.tasks.remove(t)
+                _clamp_task_selection(state)
+        return None
+    return None
+
+
+def _cycle_workspace(state: State, direction: int) -> Optional[str]:
+    """Cycle the active workspace by `direction` (+1 / -1) and trigger
+    the synchronous discover + apply-overrides + async-refresh switch.
+    Returns "switch-workspace" so the main loop can re-derive the OSC
+    terminal title; returns None when there are fewer than two
+    workspaces (cycling would be a no-op)."""
+    if len(state.workspaces) < 2:
+        return None
+    n = len(state.workspaces)
+    new_idx = (state.active_workspace_index + direction) % n
+    # Imported lazily — workers depends on git_ops which is fine at
+    # module load, but keeping the import local mirrors how other key
+    # handlers in this file pull worker entry points on demand.
+    from workers import switch_workspace
+    switch_workspace(state, new_idx)
+    return "switch-workspace"
+
+
+def handle_main_key(state: State, key: int) -> Optional[str]:
+    if key == curses.KEY_RESIZE:
+        return None
+
+    # Shift+Tab toggles between repo list and task panel. We handle it
+    # before the focus dispatch below so it works from either side.
+    if key == curses.KEY_BTAB:
+        state.focused_panel = (
+            "tasks" if state.focused_panel == "repos" else "repos")
+        if state.focused_panel == "tasks":
+            _clamp_task_selection(state)
+        return None
+
+    if state.focused_panel == "tasks":
+        return handle_task_panel_key(state, key)
+
+    if key in (18, curses.KEY_F5):  # Ctrl+R or F5 — refresh state, prune tasks
+        return "refresh"
+    if key == 19:  # Ctrl+S — fetch + checkout every tracked sibling
+        return "sync"
+
+    # Title row navigation (selected = -2). Tab opens the workspaces
+    # picker (global switcher); ←/→ are no-ops here since cycling
+    # belongs to the workspace switcher row below.
+    if state.on_title_row:
+        if key == curses.KEY_UP:
+            # Wrap to the bottom of the body — same feel as the
+            # workspace row used to have before it had a row above it.
+            state.selected = max(-2, state.total_rows - 1)
+            _reset_field_cursor(state)
+            return None
+        if key == curses.KEY_DOWN:
+            state.selected = -1
+            _reset_field_cursor(state)
+            return None
+        if key == 9:  # Tab — opens the workspaces picker
+            open_workspaces_picker(state)
+            return None
+        if key == 27:
+            return "confirm-quit" if state.has_messages else "quit"
+        return None
+
+    # Workspace switcher row navigation (selected = -1). ←/→ cycles
+    # workspaces; Tab opens the workspace settings modal (was Enter).
+    if state.on_workspace_row:
+        if key == curses.KEY_UP:
+            state.selected = -2  # up to the title row
+            _reset_field_cursor(state)
+            return None
+        if key == curses.KEY_DOWN:
+            state.selected = 0
+            _reset_field_cursor(state)
+            return None
+        if key == curses.KEY_LEFT:
+            return _cycle_workspace(state, -1)
+        if key == curses.KEY_RIGHT:
+            return _cycle_workspace(state, +1)
+        if key == 9:  # Tab — opens the workspace settings modal
+            open_workspace_menu(state)
+            return None
+        if key == 27:
+            return "confirm-quit" if state.has_messages else "quit"
+        return None
+
+    if key == curses.KEY_UP:
+        if state.selected == 0:
+            # Up from the first body row lands on the workspace row.
+            state.selected = -1
+        else:
+            state.selected = (state.selected - 1) % state.total_rows
+        _reset_field_cursor(state)
+        return None
+    if key == curses.KEY_DOWN:
+        state.selected = (state.selected + 1) % state.total_rows
+        _reset_field_cursor(state)
+        return None
+
+    if key in (10, 13, curses.KEY_ENTER):
+        if state.has_messages:
+            return "confirm"
+        return None
+
+    if key == 9:  # Tab — open per-row action menu
+        cur = state.current_repo
+        cur_child = state.current_child
+        if (cur is not None and cur.refreshing) or \
+                (cur_child is not None and cur_child[1].refreshing):
+            return None  # action in flight — ignore until lock releases
+        open_action_menu(state)
+        return None
+
+    target_message_holder = _focused_message_holder(state)
+
+    if key == 27:
+        if target_message_holder is not None and target_message_holder.refreshing:
+            return "confirm-quit" if state.has_messages else "quit"
+        if target_message_holder is not None and target_message_holder.message:
+            target_message_holder.message = ""
+            state.field_cursor = 0
+            return None
+        return "confirm-quit" if state.has_messages else "quit"
+
+    if target_message_holder is None:
+        return None  # subtree row or otherwise non-editable
+
+    if target_message_holder.refreshing:
+        return None  # message retained but not editable until refresh finishes
+
+    msg = target_message_holder.message
+    cur = max(0, min(state.field_cursor, len(msg)))
+
+    if key == curses.KEY_LEFT:
+        if not msg:
+            kick_off_suggest_for(state, target_message_holder)
+            return None
+        state.field_cursor = max(0, cur - 1)
+        return None
+    if key == curses.KEY_SLEFT and not msg:
+        kick_off_bulk_suggest(state)
+        return None
+
+    if key == curses.KEY_RIGHT:
+        state.field_cursor = min(len(msg), cur + 1)
+        return None
+    if key == curses.KEY_HOME or key == 1:  # Home or Ctrl+A
+        state.field_cursor = 0
+        return None
+    if key == curses.KEY_END or key == 5:  # End or Ctrl+E
+        state.field_cursor = len(msg)
+        return None
+
+    if key in (curses.KEY_BACKSPACE, 127, 8):
+        if cur > 0:
+            target_message_holder.message = msg[: cur - 1] + msg[cur:]
+            state.field_cursor = cur - 1
+        return None
+    if key == curses.KEY_DC:  # forward delete
+        if cur < len(msg):
+            target_message_holder.message = msg[:cur] + msg[cur + 1:]
+        return None
+    if 32 <= key < 127:
+        target_message_holder.message = msg[:cur] + chr(key) + msg[cur:]
+        state.field_cursor = cur + 1
+        return None
+    return None
+
+
+# ---------- Confirm sub-loop + quit confirmation --------------------------
+
+
+def ensure_cursor_visible(line_index: int, scroll: int, body_h: int) -> int:
+    """Return a new scroll value that keeps line_index on-screen."""
+    if line_index < scroll:
+        return line_index
+    if line_index >= scroll + body_h:
+        return max(0, line_index - body_h + 1)
+    return scroll
+
+
+def confirm_quit(stdscr, state: State) -> bool:
+    """Show a 'Quit and discard N message(s)? [y/N]' prompt at the bottom of
+    the main screen. Returns True if the user confirms, False to cancel."""
+    draw_main(stdscr, state)
+    h, _ = stdscr.getmaxyx()
+    n = sum(1 for r in state.repos if r.message.strip())
+    plural = "" if n == 1 else "s"
+    prompt = f"Quit and discard {n} commit message{plural}? [y/N]"
+    try:
+        stdscr.move(h - 1, 0)
+        stdscr.clrtoeol()
+    except curses.error:
+        pass
+    safe_addstr(stdscr, h - 1, 2, prompt,
+                curses.color_pair(PAIR_WARN) | curses.A_BOLD)
+    curses.curs_set(0)
+    stdscr.refresh()
+    while True:
+        try:
+            key = stdscr.getch()
+        except KeyboardInterrupt:
+            return True
+        if key == -1:
+            continue
+        if key in (ord("y"), ord("Y")):
+            return True
+        if key in (ord("n"), ord("N"), 27, 10, 13, curses.KEY_ENTER):
+            return False
+
+
+def _detached_review_preflight(stdscr, state: State) -> bool:
+    """Pop the recovery modal for every detached-HEAD repo / submodule
+    child that has a queued commit message, BEFORE the review screen
+    draws. Returns True when the review can proceed (every detached
+    target either got fast-forwarded or wasn't on the commit list);
+    False if the user cancelled any prompt — in which case the review
+    is aborted and the cursor goes back to the main panel.
+
+    Without this preflight, a detached canonical row got past review
+    all the way to `commit_worker` before the recovery modal popped,
+    which felt like idlegit was "about to push on origin/(detached)"
+    even though the commit_worker guard would still have caught it.
+    Surfacing the modal at review time matches the user's mental
+    model of "I just told it to commit; ask now"."""
+    while True:
+        target = _next_detached_review_target(state)
+        if target is None:
+            return True
+        path, label = target
+        prompt = _build_recovery_prompt(path, label)
+        if prompt is None:
+            # No recovery branch available — surface a one-shot warn
+            # task and abort the review so commit_worker doesn't try
+            # to push a (detached) refspec.
+            t = state.tasks.add(f"{label}: cannot commit")
+            state.tasks.update(
+                t, "fail",
+                "detached HEAD with no recoverable target branch")
+            return False
+        state.detached_recovery_prompt = prompt
+        if not _drive_modal_until_closed(stdscr, state,
+                                         "detached_recovery_prompt"):
+            return False
+        if prompt.chosen_action != "ff":
+            return False
+        ok, msg = execute_detached_recovery(path, prompt.target_branch)
+        if not ok:
+            t = state.tasks.add(f"{label}: cannot commit")
+            state.tasks.update(t, "fail", msg or "recovery failed")
+            return False
+        # Refresh the in-memory Repo so build_review_blocks sees the
+        # real branch name instead of the stale "(detached)" sentinel.
+        for repo in state.repos:
+            if repo.path == path:
+                refresh_repo_with_remote_state(repo)
+                break
+            for ref in repo.children:
+                if ref.kind == "submodule" and ref.nested_path == path:
+                    refresh_repo_with_remote_state(ref.repo)
+                    break
+        # Loop back — the next iteration finds the next detached
+        # target (if any) and runs the same flow.
+
+
+def _next_detached_review_target(state: State):
+    """Return `(path, label)` for the next detached commit target with
+    a queued message, or None when none remain. Walks top-level repos
+    first, then submodule children — so the modal sequence is stable
+    and predictable."""
+    from git_ops import git
+    for repo in state.repos:
+        if not repo.message.strip():
+            continue
+        rc, out, _ = git(repo.path, ["branch", "--show-current"])
+        if rc == 0 and not out.strip():
+            return repo.path, repo.display_name
+    for parent in state.repos:
+        for child in parent.children:
+            if child.kind != "submodule" or not child.message.strip():
+                continue
+            rc, out, _ = git(child.nested_path, ["branch", "--show-current"])
+            if rc == 0 and not out.strip():
+                label = (f"↳ {child.repo.display_name} "
+                         f"in {parent.display_name}")
+                return child.nested_path, label
+    return None
+
+
+def _drive_modal_until_closed(stdscr, state: State, slot: str) -> bool:
+    """Inner event loop that draws the main UI plus whichever modal
+    `state.<slot>` is set to, dispatching keys to the matching
+    handler until the modal clears its slot. Used by the review-
+    screen preflight to surface a `DetachedRecoveryPrompt` from the
+    main thread (workers use `result_event` instead).
+
+    Returns True when the modal closed normally; False on a Ctrl+C
+    interrupt (caller treats this as a cancel)."""
+    handler = {
+        "detached_recovery_prompt": handle_detached_recovery_prompt_key,
+    }[slot]
+    while getattr(state, slot) is not None:
+        draw_main(stdscr, state)
+        stdscr.refresh()
+        try:
+            key = stdscr.getch()
+        except KeyboardInterrupt:
+            setattr(state, slot, None)
+            return False
+        if key == curses.KEY_RESIZE:
+            continue
+        handler(state, key)
+    return True
+
+
+def handle_confirm(stdscr, state: State) -> None:
+    """Two-panel review screen.
+
+    Left pane = per-target blocks (header + message + push summary +
+    LFS warnings + workflow toggles + then-runs). ↑/↓ navigates
+    across blocks; Space toggles LFS / workflow rows; ←/→ cycles a
+    then-run target.
+
+    Right pane = working-tree files for the block of the currently-
+    focused row (loaded asynchronously, with a spinner placeholder
+    until `query_working_tree` lands). Shift+Tab toggles focus
+    between the panes; in the right pane ↑/↓ navigates the file
+    list and Enter opens the diff modal — a sub-modal of this inner
+    loop, drawn on top of the review screen with its keys handled
+    here so Enter / Esc close it without leaving review.
+
+    Enter from the left pane runs the commits — the async pipeline
+    takes over the sidebar from there. Esc backs out without
+    committing."""
+    if not _detached_review_preflight(stdscr, state):
+        return
+    blocks = build_review_blocks(state)
+    if not blocks:
+        return
+    kick_off_review_files_load(blocks)
+
+    focusables = _collect_review_focusables(blocks)
+    focus = 0 if focusables else -1
+    panel_focus = "left"
+    scroll = 0
+
+    try:
+        while True:
+            anim = any(b.files_loading or b.suggesting for b in blocks) or (
+                state.diff_viewer is not None and state.diff_viewer.loading)
+            stdscr.timeout(100 if anim else 1000)
+            scroll = draw_review(stdscr, state, blocks, focusables,
+                                 focus, panel_focus, scroll)
+            if state.diff_viewer is not None:
+                draw_diff_viewer(stdscr, state)
+                stdscr.refresh()
+            try:
+                key = stdscr.getch()
+            except KeyboardInterrupt:
+                return
+            if key == -1:
+                if anim:
+                    state.spinner_frame = (
+                        state.spinner_frame + 1) % len(SPINNER_FRAMES)
+                continue
+            if key == curses.KEY_RESIZE:
+                continue
+
+            # Diff modal owns key handling while it's open. Enter / Esc
+            # both close it (per the user-specified gesture); arrow /
+            # page keys scroll the diff body.
+            if state.diff_viewer is not None:
+                handle_diff_viewer_key(state, key)
+                continue
+
+            if key == 27:  # Esc
+                return
+            if key in (10, 13, curses.KEY_ENTER):
+                if panel_focus == "left":
+                    kick_off_workers(state, blocks)
+                    return  # async pipeline takes over the sidebar
+                continue
+            if key == 9:  # Tab — only meaningful in the right (Changes) pane
+                # No-op when the user is on the left review pane: there's
+                # no file selection there, so opening the diff viewer
+                # would either pick a stale right-pane row or land on an
+                # empty list. The hint footer only advertises Tab on the
+                # right pane, but a stray Tab from the left used to fire
+                # this branch and pop a half-empty viewer.
+                if panel_focus != "right":
+                    continue
+                bi = _focused_block_idx(focusables, focus)
+                if 0 <= bi < len(blocks):
+                    block = blocks[bi]
+                    if (not block.files_loading and block.files
+                            and 0 <= block.file_selected < len(block.files)):
+                        fe = block.files[block.file_selected]
+                        open_diff_viewer(
+                            state,
+                            target_path=block.target_path,
+                            label=block.label,
+                            file_path=fe.path,
+                            untracked=fe.untracked,
+                        )
+                continue
+            if key == curses.KEY_BTAB:
+                panel_focus = "right" if panel_focus == "left" else "left"
+                continue
+
+            if panel_focus == "left":
+                if key == ord(" ") and 0 <= focus < len(focusables):
+                    _, kind, obj = focusables[focus]
+                    if kind == "lfs":
+                        obj.track = not obj.track
+                    elif kind == "toggle":
+                        on = obj.repo.track_workflow.get(
+                            obj.workflow_name, False)
+                        obj.repo.track_workflow[obj.workflow_name] = not on
+                    # Space on a suggest / then-run row is a no-op
+                    # (use ← for suggest, ←/→ for then-run).
+                    continue
+                if (key in (curses.KEY_LEFT, curses.KEY_RIGHT)
+                        and 0 <= focus < len(focusables)):
+                    _, kind, obj = focusables[focus]
+                    if kind == "then_run":
+                        cycle_then_run(
+                            obj, -1 if key == curses.KEY_LEFT else 1)
+                    elif kind == "suggest" and key == curses.KEY_LEFT:
+                        # Re-suggest the commit message scoped to the
+                        # block's currently-checked files. Lazy import
+                        # to keep workers off the main_loop import
+                        # cycle.
+                        from workers import kick_off_review_suggest
+                        kick_off_review_suggest(state, obj)
+                    continue
+                if key == curses.KEY_UP and focus > 0:
+                    focus -= 1
+                elif (key == curses.KEY_DOWN
+                        and focus < len(focusables) - 1):
+                    focus += 1
+            else:  # panel_focus == "right"
+                bi = _focused_block_idx(focusables, focus)
+                if 0 <= bi < len(blocks):
+                    block = blocks[bi]
+                    n = len(block.files)
+                    if key == curses.KEY_UP and block.file_selected > 0:
+                        block.file_selected -= 1
+                    elif (key == curses.KEY_DOWN
+                            and block.file_selected < n - 1):
+                        block.file_selected += 1
+                    elif key == ord(" ") and 0 <= block.file_selected < n:
+                        # Toggle the staged-for-commit checkbox. Pipeline
+                        # reads block.staged_paths at commit dispatch.
+                        fe = block.files[block.file_selected]
+                        cur = block.staged_paths.get(fe.path, False)
+                        block.staged_paths[fe.path] = not cur
+    finally:
+        for b in blocks:
+            b.cancel_event.set()

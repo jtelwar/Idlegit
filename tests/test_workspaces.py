@@ -15,13 +15,16 @@ for _p in (str(_HERE.parent), str(_HERE)):
         sys.path.insert(0, _p)
 
 import config  # noqa: E402
+from _helpers import (  # noqa: E402
+    make_repo_model as _make_repo, make_state as _state,
+)
 from config import (  # noqa: E402
     Config, apply_workspace_overrides, base_value_for_override,
     coerce_override_value, get_load_warnings, load_config,
     load_workspaces, save_workspaces, state_attr_value_from_override,
 )
 from models import (  # noqa: E402
-    Repo, State, Workspace, WorkspaceCreator, WorkspaceDraft,
+    State, Workspace, WorkspaceCreator, WorkspaceDraft,
     WorkspaceMenu,
 )
 
@@ -43,14 +46,6 @@ try:
     UI_AVAILABLE = True
 except Exception:  # pragma: no cover
     UI_AVAILABLE = False
-
-
-def _make_repo(rel: str = "r") -> Repo:
-    return Repo(rel=rel, path=Path(f"/tmp/{rel}"))
-
-
-def _state(*repos: Repo, **kwargs) -> State:
-    return State(repos=list(repos), workspace_name="ws", **kwargs)
 
 
 # ---------- Config loader / overrides -------------------------------------
@@ -465,11 +460,11 @@ class TestWorkspaceRowKeys(unittest.TestCase):
         handle_main_key(s, curses.KEY_DOWN)
         self.assertEqual(s.selected, 0)
 
-    def test_up_from_workspace_row_wraps_to_last_body_row(self) -> None:
+    def test_up_from_workspace_row_lands_on_title_row(self) -> None:
         s = self._state_two_ws()
         handle_main_key(s, curses.KEY_UP)
-        # 1 repo, no toggle rows → last index = 0
-        self.assertEqual(s.selected, 0)
+        # New 3-level nav: workspace row Up → title row at -2.
+        self.assertEqual(s.selected, -2)
 
     def test_left_right_cycle_workspace_calls_switch(self) -> None:
         s = self._state_two_ws()
@@ -491,16 +486,18 @@ class TestWorkspaceRowKeys(unittest.TestCase):
             handle_main_key(s, curses.KEY_LEFT)
             self.assertEqual(m.call_count, 0)
 
-    def test_space_opens_workspace_menu(self) -> None:
+    def test_tab_opens_workspace_menu(self) -> None:
         s = self._state_two_ws()
         self.assertIsNone(s.workspace_menu)
-        handle_main_key(s, ord(" "))
+        handle_main_key(s, 9)  # Tab
         self.assertIsNotNone(s.workspace_menu)
 
-    def test_enter_opens_workspace_menu(self) -> None:
+    def test_enter_no_op_on_workspace_row(self) -> None:
+        # Tab now opens settings; Enter on the workspace row does
+        # nothing (no per-row commit-pipeline target here).
         s = self._state_two_ws()
         handle_main_key(s, 10)
-        self.assertIsNotNone(s.workspace_menu)
+        self.assertIsNone(s.workspace_menu)
 
 
 # ---------- Workspace creator modal ---------------------------------------
@@ -626,12 +623,15 @@ class TestWorkspaceMenuOverrides(unittest.TestCase):
 
 
 @unittest.skipUnless(UI_AVAILABLE, "ui module unavailable")
-class TestWorkspaceRowTab(unittest.TestCase):
-    def test_tab_on_workspace_row_opens_picker(self) -> None:
+class TestTitleRowTab(unittest.TestCase):
+    def test_tab_on_title_row_opens_picker(self) -> None:
+        # Picker now lives one nav level up — Tab on the Idlegit title
+        # (selected = -2) opens the workspaces global switcher;
+        # Tab on the workspace row (-1) opens the settings menu instead.
         ws_a = Workspace(name="A", folders=[Path("/a")])
         ws_b = Workspace(name="B", folders=[Path("/b")])
         s = _state(_make_repo("r"), workspaces=[ws_a, ws_b])
-        s.selected = -1
+        s.selected = -2
         self.assertIsNone(s.workspaces_picker)
         handle_main_key(s, 9)  # Tab
         self.assertIsNotNone(s.workspaces_picker)

@@ -15,8 +15,11 @@ for _p in (str(_HERE.parent), str(_HERE)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+from _helpers import (  # noqa: E402
+    make_repo_model as _make_repo, make_state as _state,
+)
 from models import (  # noqa: E402
-    Repo, State, Workspace, WorkspaceCreator, WorkspaceDraft, WorkspaceMenu,
+    State, Workspace, WorkspaceCreator, WorkspaceDraft, WorkspaceMenu,
     WorkspacesPicker,
 )
 
@@ -48,14 +51,6 @@ def _pairs(hints):
     assertions — the dataclass equality is fine but tuples diff
     nicer in failure output."""
     return [(h.keys, h.action) for h in hints]
-
-
-def _make_repo(rel: str = "r") -> Repo:
-    return Repo(rel=rel, path=Path(f"/tmp/{rel}"))
-
-
-def _state(*repos: Repo, **kwargs) -> State:
-    return State(repos=list(repos), workspace_name="ws", **kwargs)
 
 
 # ---------- Framework primitives -----------------------------------------

@@ -278,6 +278,14 @@ def refresh_repo(repo: Repo) -> None:
                 sub_path = (repo.path / path_str.strip()).resolve()
                 repo.nested_subs.append((canonicalize_url(url_out.strip()), sub_path))
 
+    # Nothing staged/untracked to commit — drop any queued message so the
+    # UI doesn't keep showing an orphaned draft after refresh (Ctrl+R,
+    # post-commit refresh, etc.). Skip while merge machinery is active —
+    # the tree can look oddly quiet mid-merge without losing the need for
+    # a eventual commit message.
+    if not repo.error and not repo.is_dirty and not repo.merging:
+        repo.message = ""
+
 
 # ---------- Discovery + linkage --------------------------------------------
 
@@ -389,6 +397,14 @@ def _link_siblings_locked(repos: List[Repo],
     # Dedup at this stage too (paranoia + belt-and-braces): if a stale
     # `.gitmodules` somehow has the same submodule listed twice (same
     # URL + same path), only one ChildRef is produced.
+    prev_submodule_msg: Dict[Tuple[int, str], str] = {}
+    for parent in repos:
+        for old in parent.children:
+            if old.kind == "submodule":
+                prev_submodule_msg[
+                    (id(parent), str(old.nested_path.resolve()))
+                ] = old.message
+
     submodule_refs: List[ChildRef] = []
     for parent in repos:
         if parent.rel == ".":
@@ -411,7 +427,11 @@ def _link_siblings_locked(repos: List[Repo],
             if target is parent:
                 continue
             new_siblings[id(target)].append((parent, sub_path))
-            ref = ChildRef(repo=target, nested_path=sub_path, kind="submodule")
+            nk = (id(parent), str(sub_path.resolve()))
+            prev_msg = prev_submodule_msg.get(nk, "")
+            ref = ChildRef(
+                repo=target, nested_path=sub_path, kind="submodule",
+                message=prev_msg)
             new_children[id(parent)].append(ref)
             submodule_refs.append(ref)
 
@@ -478,6 +498,10 @@ def _link_siblings_locked(repos: List[Repo],
         max_workers = min(len(submodule_refs), MAX_PARALLEL_GIT_JOBS)
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
             list(ex.map(_populate, submodule_refs))
+
+    for ref in submodule_refs:
+        if not ref.dirty and not ref.merging:
+            ref.message = ""
 
     # Drift detection for shared synthetic canonicals: when multiple
     # parents reference the same untracked submodule URL, treat the
@@ -1282,6 +1306,46 @@ def load_commits(path: Path, skip: int, count: int) -> Tuple[
     return rows, len(rows) < count
 
 
+def list_remotes(path: Path) -> List[Tuple[str, str]]:
+    """Return [(name, url), ...] for every remote configured on the repo,
+    in `git remote` order (which is usually configured order). Each
+    remote appears once — `git remote -v` lists fetch + push variants;
+    we keep the fetch URL since that's what the user typically edits."""
+    rc, out, _ = git(path, ["remote"])
+    if rc != 0:
+        return []
+    names = [ln.strip() for ln in out.splitlines() if ln.strip()]
+    result: List[Tuple[str, str]] = []
+    for name in names:
+        rc2, url, _ = git(path, ["remote", "get-url", name])
+        result.append((name, url.strip() if rc2 == 0 else ""))
+    return result
+
+
+def clone_repo(url: str, dest: Path, branch: str = "",
+               recurse_submodules: bool = True) -> Tuple[bool, str]:
+    """Run `git clone` into `dest`. `dest` must not already exist (or
+    must be empty) — git refuses on a non-empty target. Returns
+    (ok, message); message is the first non-empty stderr line on
+    failure, or "" on success."""
+    if not url or url.startswith("-"):
+        return False, "remote URL looks like an option"
+    args = ["clone"]
+    if branch:
+        if not is_safe_ref_arg(branch):
+            return False, "branch name looks like an option"
+        args.extend(["--branch", branch])
+    if recurse_submodules:
+        args.append("--recurse-submodules")
+    args.extend(["--", url, str(dest)])
+    # Run from the parent dir so a relative dest resolves predictably.
+    parent = dest.parent if dest.parent.exists() else Path.cwd()
+    rc, _, err = git(parent, args, timeout=600)
+    if rc == 0:
+        return True, ""
+    return False, first_line(err)
+
+
 def list_branches(path: Path) -> Tuple[List[str], str]:
     """Return (sorted unique branch names, current_branch). Local branches
     listed first; remote-tracking branches without a local counterpart
@@ -1317,6 +1381,50 @@ def list_branches(path: Path) -> Tuple[List[str], str]:
 
     remote_only = [b for b in remote_only if b not in have_local]
     return locals_seen + remote_only, current
+
+
+def list_stashes(path: Path) -> List[Tuple[str, str]]:
+    """Return [(ref, message), ...] for every stash entry. `ref` is
+    the stable form `stash@{N}` so the apply action gets a positional
+    target that survives between calls; `message` is the
+    human-friendly "On <branch>: <subject>" line.
+
+    Empty list when there are no stashes (or the repo predates the
+    `refs/stash` ref so `git stash list` returns nothing). Failures
+    are coerced to an empty list — same shape as `list_branches`."""
+    rc, out, _ = git(path, ["stash", "list", "--format=%gd%x09%gs"])
+    if rc != 0:
+        return []
+    rows: List[Tuple[str, str]] = []
+    for line in out.splitlines():
+        line = line.rstrip()
+        if not line:
+            continue
+        parts = line.split("\t", 1)
+        ref = parts[0].strip()
+        msg = parts[1] if len(parts) > 1 else ""
+        if not ref:
+            continue
+        rows.append((ref, msg))
+    return rows
+
+
+def list_remote_tracking_refs(path: Path) -> List[str]:
+    """Return remote-tracking refs in their full form (e.g.
+    `origin/main`, `upstream/dev`). Used by the set-upstream picker —
+    `git branch --set-upstream-to=` wants the qualified ref, so we
+    keep the prefix here rather than stripping it the way
+    `list_branches` does."""
+    rc, out, _ = git(path, ["branch", "-r", "--format=%(refname:short)"])
+    if rc != 0:
+        return []
+    refs: List[str] = []
+    for line in out.splitlines():
+        ref = line.strip()
+        if not ref or ref.endswith("/HEAD"):
+            continue
+        refs.append(ref)
+    return sorted(refs)
 
 
 # ---------- Commit-message suggestion --------------------------------------
@@ -1475,6 +1583,28 @@ def suggest_commit_message_at(path: Path, *,
         return ""
     return _format_suggestion(
         _collect_changes_at(path, staged, unstaged, untracked, auto_stage),
+        max_added, max_updated, max_deleted)
+
+
+def suggest_commit_message_for_paths(
+        path: Path, paths: List[str], *,
+        max_added: int, max_updated: int, max_deleted: int) -> str:
+    """Like `suggest_commit_message_at`, but restricted to a specific
+    set of paths — the files the user has checked on the review
+    screen. Every checked file is treated as headed for the index at
+    commit time (auto_stage semantics) regardless of its current x/y
+    state, so the suggestion describes the commit that would actually
+    land. Returns '' on failure or if there's nothing to suggest."""
+    staged, unstaged, untracked, conflicts = _scan_path_status(path)
+    if conflicts:
+        return ""
+    paths_set = set(paths)
+    staged = [(s, p) for (s, p) in staged if p in paths_set]
+    unstaged = [(s, p) for (s, p) in unstaged if p in paths_set]
+    untracked = [p for p in untracked if p in paths_set]
+    return _format_suggestion(
+        _collect_changes_at(path, staged, unstaged, untracked,
+                            auto_stage=True),
         max_added, max_updated, max_deleted)
 
 

@@ -11,7 +11,7 @@ from typing import Iterable, List, Optional, Tuple
 
 from models import (
     AlignHeadsPrompt, ChildRef, DetachedRecoveryPrompt, LFSCandidate,
-    Repo, SmartSyncCheckout, State,
+    Repo, ReviewBlock, SmartSyncCheckout, State,
     Task,
 )
 from git_ops import (
@@ -19,7 +19,8 @@ from git_ops import (
     get_run_view, gh_available, git, link_siblings, list_branches,
     list_recent_runs, merge_remote_workflow_states, parse_github_slug,
     refresh_repo, safe_stage_all, signature_mtime, suggest_commit_message,
-    suggest_commit_message_at, sync_sibling, sync_subtree, is_safe_ref_arg,
+    suggest_commit_message_at, suggest_commit_message_for_paths,
+    sync_sibling, sync_subtree, is_safe_ref_arg,
     working_tree_signature,
     MAX_PARALLEL_GIT_JOBS,
 )
@@ -438,7 +439,9 @@ def kick_off_action(state: State, action_id: str, *,
     than the user wondering whether their keystroke registered."""
     known_actions = {
         "fetch", "pull", "push", "soft_reset", "switch_branch",
-        "branch_from_head", "ff_merge",
+        "branch_from_head", "create_branch", "ff_merge",
+        "rename_branch", "set_upstream",
+        "stash_create", "stash_apply",
     }
     should_refresh = action_id in known_actions
     target_child = _find_child_at(target_parent, target_path)
@@ -548,6 +551,20 @@ def kick_off_action(state: State, action_id: str, *,
             state.tasks.update(
                 t, "ok" if rc == 0 else "fail",
                 "" if rc == 0 else first_line(err))
+        elif action_id == "create_branch":
+            # Create a new branch off the current HEAD and switch to
+            # it. Same `git checkout -b <name>` plumbing as
+            # branch_from_head — distinct action_id so the task label
+            # reads naturally when the user wasn't actually detached.
+            t = state.tasks.add(
+                f"{target_label}: create branch {branch_arg}")
+            if not is_safe_ref_arg(branch_arg):
+                state.tasks.update(t, "fail", "unsafe branch name")
+                return
+            rc, _, err = git(target_path, ["checkout", "-b", branch_arg])
+            state.tasks.update(
+                t, "ok" if rc == 0 else "fail",
+                "" if rc == 0 else first_line(err))
         elif action_id == "ff_merge":
             # Fast-forward-only merge: refuses on its own if a real
             # merge commit would be needed, so divergent histories
@@ -566,6 +583,62 @@ def kick_off_action(state: State, action_id: str, *,
                 state.tasks.update(
                     t, "fail",
                     first_line(err) or "not a fast-forward")
+        elif action_id == "rename_branch":
+            # `git branch -m <newname>` renames the *current* branch in
+            # place — only touches refs, no commits orphaned. Refuses
+            # on detached HEAD via git's own error. Cardinal-rule safe.
+            t = state.tasks.add(
+                f"{target_label}: rename branch → {branch_arg}")
+            if not is_safe_ref_arg(branch_arg):
+                state.tasks.update(t, "fail", "unsafe branch name")
+                return
+            rc, _, err = git(target_path, ["branch", "-m", branch_arg])
+            state.tasks.update(
+                t, "ok" if rc == 0 else "fail",
+                "" if rc == 0 else first_line(err))
+        elif action_id == "set_upstream":
+            # `git branch --set-upstream-to=<ref>` only edits config,
+            # never touches refs or commits. `branch_arg` is the fully
+            # qualified remote-tracking ref (e.g. origin/main).
+            t = state.tasks.add(
+                f"{target_label}: upstream → {branch_arg}")
+            if not is_safe_ref_arg(branch_arg):
+                state.tasks.update(t, "fail", "unsafe ref name")
+                return
+            rc, _, err = git(target_path, [
+                "branch", f"--set-upstream-to={branch_arg}"])
+            state.tasks.update(
+                t, "ok" if rc == 0 else "fail",
+                "" if rc == 0 else first_line(err))
+        elif action_id == "stash_create":
+            # `git stash push` saves working-tree changes to a new
+            # stash entry. Cardinal-rule safe: the entry preserves
+            # both index and worktree state, and our pipeline never
+            # calls `stash drop` / `pop` so nothing is destroyed.
+            t = state.tasks.add(f"{target_label}: stash push")
+            rc, _, err = git(target_path, ["stash", "push"])
+            if rc != 0:
+                state.tasks.update(t, "fail", first_line(err))
+            else:
+                state.tasks.update(t, "ok", "")
+        elif action_id == "stash_apply":
+            # `git stash apply <ref>` reapplies the stash without
+            # dropping it — the entry stays around, so an apply that
+            # silently drops content can be re-attempted. Pop (apply
+            # + drop) is intentionally NOT supported here; that's a
+            # cardinal-rule violation.
+            t = state.tasks.add(
+                f"{target_label}: stash apply {branch_arg}")
+            # branch_arg is `stash@{N}` — protect against shell-style
+            # tricks even though git's argv parsing makes them moot.
+            if not branch_arg or branch_arg.startswith("-"):
+                state.tasks.update(t, "fail", "unsafe stash ref")
+                return
+            rc, _, err = git(target_path,
+                             ["stash", "apply", "--", branch_arg])
+            state.tasks.update(
+                t, "ok" if rc == 0 else "fail",
+                "" if rc == 0 else first_line(err))
         else:
             return  # unknown action — nothing to do
       except Exception as e:
@@ -592,6 +665,145 @@ def kick_off_action(state: State, action_id: str, *,
     threading.Thread(target=worker, daemon=True).start()
 
 
+# ---------- Remotes batch-apply ------------------------------------------
+
+
+def _compute_remote_ops(rows) -> List[Tuple]:
+    """Diff a RemotesModal.rows list against original_* and return a
+    flat list of git-remote sub-operations to run, in safe order:
+    removes first (so a rename can reuse the freed name), then renames
+    (so set-url can target the new name), then set-urls, then adds.
+
+    Each tuple is shape-tagged: ("remove", name), ("rename", old, new),
+    ("set_url", name, new_url), ("add", name, url)."""
+    ops: List[Tuple] = []
+    for row in rows:
+        if row.is_new:
+            if row.to_delete:
+                continue  # cancelled before apply
+            if row.name and row.url:
+                ops.append(("add", row.name, row.url))
+            continue
+        if row.to_delete:
+            ops.append(("remove", row.original_name))
+            continue
+        if row.name and row.name != row.original_name:
+            ops.append(("rename", row.original_name, row.name))
+        # After rename, set-url targets the new name; both rename and
+        # set-url emitted means the set-url runs against the renamed
+        # remote, which is what `git remote rename` leaves on disk.
+        if row.url and row.url != row.original_url:
+            ops.append(("set_url", row.name or row.original_name, row.url))
+    return _order_remote_ops(ops)
+
+
+def _order_remote_ops(ops: List[Tuple]) -> List[Tuple]:
+    """Group by op kind so removes free names before renames, renames
+    settle before set-urls, and adds run last (lowest risk of
+    colliding with anything else)."""
+    by_kind = {"remove": [], "rename": [], "set_url": [], "add": []}
+    for op in ops:
+        by_kind.setdefault(op[0], []).append(op)
+    return (by_kind["remove"] + by_kind["rename"]
+            + by_kind["set_url"] + by_kind["add"])
+
+
+def kick_off_remote_changes(state: State, modal_rows,
+                            target_label: str, target_path: Path,
+                            target_repo: Optional[Repo]) -> int:
+    """Apply pending remote changes from the modal as a single batched
+    sidebar task. Returns the number of operations dispatched (0 means
+    "nothing to do" — caller can skip the confirmation prompt). Each
+    op runs sequentially in the same daemon thread so a rename
+    completes before its follow-up set-url fires."""
+    ops = _compute_remote_ops(modal_rows)
+    if not ops:
+        return 0
+
+    plural = "" if len(ops) == 1 else "s"
+    t = state.tasks.add(
+        f"{target_label}: applying {len(ops)} remote change{plural}")
+
+    def worker() -> None:
+        try:
+            for op in ops:
+                if op[0] == "remove":
+                    _, name = op
+                    if not is_safe_ref_arg(name):
+                        state.tasks.update(t, "fail",
+                                           f"unsafe remote name: {name}")
+                        return
+                    rc, _, err = git(target_path,
+                                     ["remote", "remove", name])
+                elif op[0] == "rename":
+                    _, old, new = op
+                    if not is_safe_ref_arg(old) or not is_safe_ref_arg(new):
+                        state.tasks.update(t, "fail",
+                                           f"unsafe remote name: {old}/{new}")
+                        return
+                    rc, _, err = git(target_path,
+                                     ["remote", "rename", old, new])
+                elif op[0] == "set_url":
+                    _, name, url = op
+                    if not is_safe_ref_arg(name) or not url \
+                            or url.startswith("-"):
+                        state.tasks.update(t, "fail",
+                                           f"unsafe url for {name}")
+                        return
+                    rc, _, err = git(target_path,
+                                     ["remote", "set-url", name, url])
+                elif op[0] == "add":
+                    _, name, url = op
+                    if not is_safe_ref_arg(name) or not url \
+                            or url.startswith("-"):
+                        state.tasks.update(t, "fail",
+                                           f"unsafe url for {name}")
+                        return
+                    rc, _, err = git(target_path,
+                                     ["remote", "add", name, url])
+                else:
+                    continue
+                if rc != 0:
+                    state.tasks.update(t, "fail", first_line(err))
+                    return
+            state.tasks.update(t, "ok", "")
+        finally:
+            # Re-query the repo so its remote_url cache reflects the
+            # new origin URL (if origin was touched). Best-effort.
+            if target_repo is not None:
+                refresh_repo_with_remote_state(target_repo)
+
+    threading.Thread(target=worker, daemon=True).start()
+    return len(ops)
+
+
+# ---------- Clone --------------------------------------------------------
+
+
+def kick_off_clone(state: State, url: str, dest: Path, branch: str,
+                   recurse_submodules: bool,
+                   on_done=None) -> None:
+    """Run `git clone` in a daemon thread, publishing progress to the
+    sidebar. `on_done` is called with `(ok, message)` once the clone
+    settles, on the worker thread — caller wires it up to refresh the
+    workspace's repo list and close the modal."""
+    from git_ops import clone_repo
+    label = dest.name or "clone"
+    t = state.tasks.add(f"{label}: clone")
+
+    def worker() -> None:
+        ok, msg = clone_repo(url, dest, branch=branch,
+                             recurse_submodules=recurse_submodules)
+        state.tasks.update(t, "ok" if ok else "fail", msg)
+        if on_done is not None:
+            try:
+                on_done(ok, msg)
+            except Exception:
+                pass
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
 # ---------- Async commit-message suggestion -------------------------------
 
 
@@ -605,7 +817,7 @@ def _suggest_into_repo(state: State, repo: Repo) -> None:
             max_deleted=state.suggest_deleted,
             auto_stage=state.auto_stage,
         )
-        if result:
+        if result and not repo.refreshing:
             repo.message = result
     finally:
         repo.suggesting = False
@@ -621,7 +833,7 @@ def _suggest_into_child(state: State, child: ChildRef) -> None:
             max_deleted=state.suggest_deleted,
             auto_stage=state.auto_stage,
         )
-        if result:
+        if result and not child.refreshing:
             child.message = result
     finally:
         child.suggesting = False
@@ -630,6 +842,8 @@ def _suggest_into_child(state: State, child: ChildRef) -> None:
 def kick_off_suggest_for(state: State, target) -> None:
     """Run a single suggestion in a background thread; UI shows a spinner
     in the field meanwhile via target.suggesting."""
+    if getattr(target, "refreshing", False):
+        return
     if isinstance(target, Repo):
         threading.Thread(
             target=_suggest_into_repo, args=(state, target), daemon=True).start()
@@ -642,26 +856,96 @@ def kick_off_bulk_suggest(state: State) -> None:
     """For every dirty row with an empty message, kick off a background
     suggestion. Each row animates independently."""
     for repo in state.repos:
-        if repo.is_dirty and not repo.message.strip() and not repo.suggesting:
+        if (repo.is_dirty and not repo.message.strip() and not repo.suggesting
+                and not repo.refreshing):
             kick_off_suggest_for(state, repo)
     for parent in state.repos:
         for child in parent.children:
             if (child.kind == "submodule" and child.dirty
-                    and not child.message.strip() and not child.suggesting):
+                    and not child.message.strip() and not child.suggesting
+                    and not child.refreshing):
                 kick_off_suggest_for(state, child)
 
 
 # ---------- Commit pipelines ----------------------------------------------
 
 
+def _apply_staging_plan(target_path: Path,
+                        staged_paths: "dict[str, bool]"
+                        ) -> Tuple[bool, str]:
+    """Bring the index in line with the user's per-file checkbox state.
+    `git add` for paths checked True; `git restore --staged` for paths
+    checked False. Both forms are passed explicit `--` paths and use
+    git plumbing that's idempotent for already-correct entries
+    (re-staging an already-staged path is a no-op, same for restoring
+    an already-unstaged path). Returns (ok, error_msg) — ok=False on
+    the first command failure, with the message ready for sidebar
+    display."""
+    if not staged_paths:
+        return True, ""
+    to_stage = sorted(p for p, on in staged_paths.items() if on)
+    to_unstage = sorted(p for p, on in staged_paths.items() if not on)
+    if to_unstage:
+        rc, _, err = git(target_path,
+                         ["restore", "--staged", "--"] + to_unstage)
+        if rc != 0:
+            return False, first_line(err)
+    if to_stage:
+        rc, _, err = git(target_path, ["add", "--"] + to_stage)
+        if rc != 0:
+            return False, first_line(err)
+    return True, ""
+
+
+def kick_off_review_suggest(state: State, block: ReviewBlock) -> None:
+    """Spawn a daemon worker that re-runs commit-message suggestion for
+    a review block, scoped to the files the user has currently checked
+    in the right pane. Result is written to BOTH the block's `message`
+    (so the review screen shows it immediately) and the underlying
+    repo / child's message (so backing out of the review preserves it,
+    matching the main-screen suggest semantics)."""
+    if block.suggesting or block.merging:
+        return
+    block.suggesting = True
+
+    def worker() -> None:
+        try:
+            paths = [p for p, on in block.staged_paths.items() if on]
+            if not paths:
+                return
+            result = suggest_commit_message_for_paths(
+                block.target_path, paths,
+                max_added=state.suggest_added,
+                max_updated=state.suggest_updated,
+                max_deleted=state.suggest_deleted,
+            )
+            if not result:
+                return
+            block.message = result
+            if block.target_repo is not None:
+                block.target_repo.message = result
+            elif block.target_child is not None:
+                block.target_child.message = result
+        finally:
+            block.suggesting = False
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
 def commit_worker(state: State, repo: Repo, msg: str,
-                  lfs_cands: List[LFSCandidate]) -> None:
+                  lfs_cands: List[LFSCandidate],
+                  staged_paths: Optional["dict[str, bool]"] = None) -> None:
     """Run the full stage / commit / push / sync pipeline for one repo,
     publishing each step into the sidebar. After a successful push, kicks
     off GitHub Actions tracking for any workflows the user opted in to on
-    the review screen."""
+    the review screen.
+
+    `staged_paths` (when provided) overrides the auto_stage default —
+    only paths checked True end up in the index, anything checked
+    False is unstaged before commit. None means "fall back to legacy
+    auto_stage semantics" for callers that haven't been ported yet."""
     try:
-        _commit_worker_inner(state, repo, msg, lfs_cands)
+        _commit_worker_inner(state, repo, msg, lfs_cands, staged_paths)
     except Exception as e:
         name = state.task_repo_label(repo)
         t = state.tasks.add(f"{name}: failed")
@@ -669,7 +953,9 @@ def commit_worker(state: State, repo: Repo, msg: str,
 
 
 def _commit_worker_inner(state: State, repo: Repo, msg: str,
-                         lfs_cands: List[LFSCandidate]) -> None:
+                         lfs_cands: List[LFSCandidate],
+                         staged_paths: Optional["dict[str, bool]"] = None
+                         ) -> None:
     auto_stage = state.auto_stage
     auto_push = state.auto_push
     tasks = state.tasks
@@ -726,7 +1012,18 @@ def _commit_worker_inner(state: State, repo: Repo, msg: str,
             t_pull = tasks.add(f"{name}: pull --ff-only")
             tasks.update(t_pull, "ok")
 
-    if auto_stage:
+    # Staging: per-file plan when the review screen handed us a
+    # staged_paths dict (the new path); fall back to legacy auto_stage
+    # semantics when the dict is None (older callers / tests).
+    if staged_paths is not None:
+        if any(staged_paths.values()):
+            t = tasks.add(f"{name}: stage")
+            ok, stage_err = _apply_staging_plan(repo.path, staged_paths)
+            if not ok:
+                tasks.update(t, "fail", stage_err)
+                return
+            tasks.update(t, "ok")
+    elif auto_stage:
         t = tasks.add(f"{name}: stage all")
         ok, stage_err = safe_stage_all(repo.path)
         if not ok:
@@ -800,7 +1097,9 @@ def _commit_worker_inner(state: State, repo: Repo, msg: str,
 
 
 def commit_worker_for_child(state: State, parent: Repo, ref: ChildRef,
-                            msg: str) -> None:
+                            msg: str,
+                            staged_paths: Optional["dict[str, bool]"] = None
+                            ) -> None:
     """Run the stage / commit / push pipeline against `ref.nested_path` —
     the working tree of a nested submodule checkout inside `parent`.
 
@@ -808,9 +1107,12 @@ def commit_worker_for_child(state: State, parent: Repo, ref: ChildRef,
     checked out (the canonical top-level repo + every other parent's nested
     copy) so they all advance to the new commit. Workflow tracking is
     keyed off the canonical repo's track_workflow map, same as a top-level
-    push."""
+    push.
+
+    `staged_paths` mirrors `commit_worker` — review-screen per-file
+    checkbox state, or None to fall back to legacy auto_stage."""
     try:
-        _commit_worker_for_child_inner(state, parent, ref, msg)
+        _commit_worker_for_child_inner(state, parent, ref, msg, staged_paths)
     except Exception as e:
         name = (f"{state.task_repo_label(ref.repo)} "
                 f"(in {state.task_repo_label(parent)})")
@@ -819,7 +1121,9 @@ def commit_worker_for_child(state: State, parent: Repo, ref: ChildRef,
 
 
 def _commit_worker_for_child_inner(state: State, parent: Repo,
-                                   ref: ChildRef, msg: str) -> None:
+                                   ref: ChildRef, msg: str,
+                                   staged_paths: Optional["dict[str, bool]"]
+                                   = None) -> None:
     auto_stage = state.auto_stage
     auto_push = state.auto_push
     tasks = state.tasks
@@ -852,7 +1156,15 @@ def _commit_worker_for_child_inner(state: State, parent: Repo,
                          "recovery succeeded but branch lookup failed")
             return
 
-    if auto_stage:
+    if staged_paths is not None:
+        if any(staged_paths.values()):
+            t = tasks.add(f"{name}: stage")
+            ok, stage_err = _apply_staging_plan(ref.nested_path, staged_paths)
+            if not ok:
+                tasks.update(t, "fail", stage_err)
+                return
+            tasks.update(t, "ok")
+    elif auto_stage:
         t = tasks.add(f"{name}: stage all")
         ok, stage_err = safe_stage_all(ref.nested_path)
         if not ok:
@@ -930,10 +1242,16 @@ def _commit_worker_for_child_inner(state: State, parent: Repo,
         tasks.update(t, "ok" if ok else "fail", sync_msg)
 
 
-def kick_off_workers(state: State, candidates: List[LFSCandidate]) -> None:
+def kick_off_workers(state: State, blocks: List[ReviewBlock]) -> None:
     """Launch one worker thread per repo / nested-child with a queued
     message and a supervisor thread that silently re-fetches repo state
     once everything finishes.
+
+    `blocks` carries the review-screen-built per-target info (LFS
+    candidates, per-file checkbox state). Each block's `target_repo`
+    or `target_child` identifies which on-state row it belongs to;
+    we look those up at dispatch time and feed them through to the
+    matching worker.
 
     Repos and child refs that are already locked (refreshing=True from a
     concurrent kick_off_action) are skipped — their message is cleared so
@@ -941,7 +1259,15 @@ def kick_off_workers(state: State, candidates: List[LFSCandidate]) -> None:
     in-flight action. All repos/refs we do commit are locked synchronously
     before any thread is spawned, and unlocked by the supervisor after
     their individual refresh completes."""
-    repo_plans: List[Tuple[Repo, str, List[LFSCandidate]]] = []
+    # Index blocks by their target so we can pull per-block info
+    # (LFS cands, staged_paths) at dispatch time without re-walking.
+    repo_blocks = {id(b.target_repo): b for b in blocks
+                   if b.target_repo is not None and b.target_child is None}
+    child_blocks = {id(b.target_child): b for b in blocks
+                    if b.target_child is not None}
+
+    repo_plans: List[Tuple[Repo, str, List[LFSCandidate],
+                           "dict[str, bool]"]] = []
     for repo in state.repos:
         msg = repo.message.strip()
         if not msg:
@@ -949,11 +1275,14 @@ def kick_off_workers(state: State, candidates: List[LFSCandidate]) -> None:
         repo.message = ""
         if repo.refreshing:  # another action owns this repo — skip
             continue
-        repo_cands = [c for c in candidates if c.repo is repo]
-        repo_plans.append((repo, msg, repo_cands))
+        block = repo_blocks.get(id(repo))
+        repo_cands = list(block.lfs_candidates) if block else []
+        staged = dict(block.staged_paths) if block else {}
+        repo_plans.append((repo, msg, repo_cands, staged))
         repo.refreshing = True  # lock synchronously before spawning
 
-    child_plans: List[Tuple[Repo, ChildRef, str]] = []
+    child_plans: List[Tuple[Repo, ChildRef, str,
+                            "dict[str, bool]"]] = []
     for parent in state.repos:
         for ref in parent.children:
             if ref.kind != "submodule":
@@ -964,29 +1293,31 @@ def kick_off_workers(state: State, candidates: List[LFSCandidate]) -> None:
             ref.message = ""
             if ref.refreshing:  # another action owns this child — skip
                 continue
-            child_plans.append((parent, ref, msg))
+            block = child_blocks.get(id(ref))
+            staged = dict(block.staged_paths) if block else {}
+            child_plans.append((parent, ref, msg, staged))
             ref.refreshing = True  # lock synchronously before spawning
 
     if not repo_plans and not child_plans:
         return
 
-    locked_repos = {id(repo) for repo, _, _ in repo_plans}
-    locked_refs = {id(ref) for _, ref, _ in child_plans}
+    locked_repos = {id(repo) for repo, _, _, _ in repo_plans}
+    locked_refs = {id(ref) for _, ref, _, _ in child_plans}
 
     workers: List[threading.Thread] = []
-    for repo, msg, repo_cands in repo_plans:
+    for repo, msg, repo_cands, staged in repo_plans:
         w = threading.Thread(
             target=commit_worker,
-            args=(state, repo, msg, repo_cands),
+            args=(state, repo, msg, repo_cands, staged),
             daemon=True,
         )
         w.start()
         workers.append(w)
 
-    for parent, ref, msg in child_plans:
+    for parent, ref, msg, staged in child_plans:
         w = threading.Thread(
             target=commit_worker_for_child,
-            args=(state, parent, ref, msg),
+            args=(state, parent, ref, msg, staged),
             daemon=True,
         )
         w.start()

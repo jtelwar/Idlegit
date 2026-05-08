@@ -19,6 +19,12 @@ from .branch_name_prompt import (
 from .branch_picker import (
     draw_branch_picker, handle_branch_picker_key, open_branch_picker,
 )
+from .clone import (
+    draw_clone_modal, handle_clone_modal_key, open_clone_modal,
+)
+from .remotes import (
+    draw_remotes_modal, handle_remotes_modal_key, open_remotes_modal,
+)
 from .detached_recovery_prompt import (
     draw_detached_recovery_prompt, handle_detached_recovery_prompt_key,
     open_detached_recovery_prompt,
@@ -57,6 +63,8 @@ __all__ = [
     "draw_branch_name_prompt", "handle_branch_name_prompt_key",
     "open_branch_name_prompt",
     "draw_branch_picker", "handle_branch_picker_key", "open_branch_picker",
+    "draw_clone_modal", "handle_clone_modal_key", "open_clone_modal",
+    "draw_remotes_modal", "handle_remotes_modal_key", "open_remotes_modal",
     "draw_detached_recovery_prompt", "handle_detached_recovery_prompt_key",
     "open_detached_recovery_prompt",
     "draw_diff_viewer", "handle_diff_viewer_key", "open_diff_viewer",

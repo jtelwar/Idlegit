@@ -9,8 +9,8 @@ from workers import kick_off_manual_dispatch
 
 from ..colors import PAIR_SB_CYAN, PAIR_SB_FG
 from ..geometry import (
-    draw_modal_fill, end_truncate, modal_geometry, safe_addstr,
-    wrap_label_value,
+    clamp_scroll, draw_modal_fill, draw_scroll_overflow, end_truncate,
+    modal_geometry, safe_addstr, wrap_label_value,
 )
 from ..hints import (
     KEY_ENTER, KEY_ESC, KEY_UP_DOWN, Hint, render_hints,
@@ -146,14 +146,10 @@ def draw_workflow_picker(stdscr, state: State, sidebar_x: int) -> None:
                      _hints(picker), attr=sb | curses.A_DIM)
         return
 
-    if picker.selected < picker.scroll:
-        picker.scroll = picker.selected
-    elif picker.selected >= picker.scroll + visible_rows:
-        picker.scroll = picker.selected - visible_rows + 1
-    picker.scroll = max(0, min(
-        picker.scroll, max(0, len(picker.workflows) - visible_rows)))
-
     n = len(picker.workflows)
+    picker.scroll = clamp_scroll(
+        picker.selected, picker.scroll, n, visible_rows)
+
     end = min(n, picker.scroll + visible_rows)
     for slot in range(visible_rows):
         idx = picker.scroll + slot
@@ -162,15 +158,12 @@ def draw_workflow_picker(stdscr, state: State, sidebar_x: int) -> None:
         row_y = line + slot
 
         if slot == 0 and picker.scroll > 0:
-            msg = f"  ↑ {picker.scroll} more above"
-            safe_addstr(stdscr, row_y, inner_x,
-                        end_truncate(msg, inner_w), sb | curses.A_DIM)
+            draw_scroll_overflow(stdscr, row_y, inner_x, inner_w,
+                                 picker.scroll, "up", sb | curses.A_DIM)
             continue
         if slot == visible_rows - 1 and end < n:
-            below = n - end + 1
-            msg = f"  ↓ {below} more below"
-            safe_addstr(stdscr, row_y, inner_x,
-                        end_truncate(msg, inner_w), sb | curses.A_DIM)
+            draw_scroll_overflow(stdscr, row_y, inner_x, inner_w,
+                                 n - end + 1, "down", sb | curses.A_DIM)
             continue
 
         wf = picker.workflows[idx]

@@ -12,15 +12,11 @@ for _p in (str(_HERE.parent), str(_HERE)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+from _helpers import make_repo_model as _make_repo  # noqa: E402
 from models import (  # noqa: E402
     ChildRef, Repo, State, SubtreeSpec, TaskMetadata, Tasks, WorkflowInfo,
     WorkflowToggle,
 )
-
-
-def _make_repo(rel: str = "myrepo", **kwargs) -> Repo:
-    """Tiny Repo factory — no filesystem needed; the path is a phantom."""
-    return Repo(rel=rel, path=Path(f"/tmp/{rel}"), **kwargs)
 
 
 class TestRepoBasics(unittest.TestCase):

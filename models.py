@@ -487,6 +487,17 @@ class ReviewBlock:
     # they Shift+Tab back to the left side.
     file_selected: int = 0
     file_scroll: int = 0
+    # Per-file "should this end up in the index for the commit?" flag.
+    # Populated by the file loader once `files` lands. Defaults derive
+    # from `auto_stage`: True → every change checked; False → only
+    # already-staged paths (x != " ") checked. Space in the right
+    # pane toggles this; the commit pipeline reads this dict to drive
+    # `git add` / `git restore --staged` calls per path.
+    staged_paths: "dict[str, bool]" = field(default_factory=dict)
+    # True while a re-suggest worker is in flight for this block —
+    # the message line in the left pane shows a spinner-prefixed
+    # "generating…" cue, mirroring the main-screen suggest indicator.
+    suggesting: bool = False
     # Set by the review's Esc / Enter handler so the file-loader
     # worker drops its result on the floor instead of mutating a
     # block the user has already moved on from.
@@ -499,11 +510,34 @@ class ReviewBlock:
 @dataclass
 class ActionMenuItem:
     """One row in the Tab-context-menu. `enabled=False` greys it out and
-    Enter is a no-op; `reason` (if any) appears next to the label."""
+    Enter is a no-op; `reason` (if any) appears next to the label.
+
+    `has_submenu` flags items that open a nested action list — the
+    renderer paints a right-pointing chevron in the focus-arrow
+    column (always visible, dimmed when not focused). `is_back` is
+    the synthetic top-of-submenu "back" row that pops the submenu
+    stack. `is_separator` renders a dim divider line and is skipped
+    by the navigation cursor."""
     id: str
     label: str
     enabled: bool = True
     reason: str = ""
+    has_submenu: bool = False
+    is_back: bool = False
+    is_separator: bool = False
+
+
+@dataclass
+class ActionSubmenuFrame:
+    """One level of submenu navigation in the action menu. Pushed onto
+    the menu's submenu_stack when the user enters; popped when the
+    "back" row or Left arrow fires. `name` is an internal id (used by
+    handlers to dispatch dynamically-built submenus); `label` is the
+    user-facing breadcrumb segment."""
+    name: str
+    label: str
+    items: List["ActionMenuItem"] = field(default_factory=list)
+    selected: int = 0
 
 
 @dataclass
@@ -548,6 +582,55 @@ class ActionMenu:
     state_pair: int = 0
     items: List[ActionMenuItem] = field(default_factory=list)
     selected: int = 0
+    # Submenu navigation as a stack of frames — empty = on the main
+    # menu, top-of-stack = currently visible submenu. Push a frame
+    # when entering (Right / Enter on a has_submenu opener); pop on
+    # Left or "back". Each frame keeps its own selected index so
+    # returning lands where you left off. Supports arbitrary depth
+    # (main → branch, main → stashes → stash@{0}, …).
+    submenu_stack: List[ActionSubmenuFrame] = field(default_factory=list)
+    # Cached branch_meta dict from the last state-load — used by
+    # dynamic submenu builders (re-build when loader refreshes, or
+    # when entering a submenu mid-session). Not user-facing.
+    cached_meta: dict = field(default_factory=dict)
+    # Stash count rendered in the main-menu "stashes (N)" opener
+    # label. Queried once at open time; stays stale until reopen
+    # since `git stash list` would be wasteful to re-run on every
+    # state refresh.
+    stash_count: int = 0
+    # Cached stash list for the Stashes submenu. Each entry is
+    # (ref, message) — ref is a stable form like "stash@{0}", message
+    # is the human "On main: WIP foo" line returned by `git stash
+    # list`. Loaded when the user enters the submenu.
+    stashes: "list[tuple[str, str]]" = field(default_factory=list)
+    # Cached remotes list for the Remotes submenu. Each entry is
+    # (name, url). Loaded when the user enters the submenu and
+    # whenever a remote is renamed/added/removed via the inline
+    # editor so the rebuilt frame reflects the new state.
+    remotes_list: "list[tuple[str, str]]" = field(default_factory=list)
+    remote_count: int = 0
+    # ---- Inline edit state ----------------------------------------
+    # Set when an item activates an inline editable field — Enter on
+    # a remote row enters rename mode, "new remote" runs through
+    # name → url → confirm. While `edit_field` is non-empty,
+    # keystrokes go to the buffer instead of nav. `edit_target_id`
+    # is the item id that was activated (e.g. "remote:origin"); the
+    # handler reads it to know what to apply on confirm.
+    edit_field: str = ""        # "" / "rename_remote" / "add_remote_name"
+                                # / "add_remote_url"
+    edit_typed: str = ""
+    edit_pre_value: str = ""
+    edit_target_id: str = ""
+    edit_extra: "dict[str, str]" = field(default_factory=dict)
+    # ---- Confirm prompt overlay ----------------------------------
+    # Set when an inline edit completes and the user needs to
+    # confirm before the worker fires. Renders as a y/N strip
+    # below the items. `confirm_action` is one of "rename_remote",
+    # "remove_remote", "add_remote"; `confirm_args` carries the
+    # args needed to dispatch.
+    confirm_message: str = ""
+    confirm_action: str = ""
+    confirm_args: "dict[str, str]" = field(default_factory=dict)
     # Bottom pane — focus + tab state.
     pane_focus: bool = False  # True: arrow keys drive the pane, not items.
     pane_tab: str = "tree"    # "tree" | "commits"
@@ -594,17 +677,94 @@ class BranchPicker:
     target_child: Optional[ChildRef] = None
     branches: List[str] = field(default_factory=list)
     current: str = ""
+    # selected = -1 is the "Create new branch" input row at the top
+    # (switch mode only); 0..len(branches)-1 picks an existing branch.
     selected: int = 0
     scroll: int = 0
     mode: str = "switch"
+    # Buffer for the "Create new branch" input row. Populated as the
+    # user types while focused on selected = -1.
+    create_typed: str = ""
+
+
+@dataclass
+class RemoteRow:
+    """One row in the RemotesModal — represents either an existing remote
+    (loaded via `list_remotes`) or a pending-add row created in the
+    session. Edits accumulate in `name` / `url` and are diffed against
+    `original_*` on close to compute the actual git operations to run.
+
+    `to_delete` flags an existing remote for removal on apply; pressing
+    D on a freshly-added row removes it from the list outright (no
+    pending-delete state to track since nothing exists on disk yet)."""
+    original_name: str = ""   # "" iff this is a session-added row
+    original_url: str = ""
+    name: str = ""
+    url: str = ""
+    to_delete: bool = False
+    is_new: bool = False
+
+
+@dataclass
+class RemotesModal:
+    """Modal for managing the focused repo's remotes (action menu →
+    "remotes…"). Edits stay local until the user closes the modal,
+    at which point a confirmation prompt summarises pending changes
+    and the apply pipeline runs them as a single batched task."""
+    target_label: str
+    target_path: Path
+    target_repo: Optional[Repo] = None
+    target_parent: Optional[Repo] = None
+    target_child: Optional[ChildRef] = None
+    rows: List[RemoteRow] = field(default_factory=list)
+    # 0..len(rows)-1 = remote rows; len(rows) = "+ Add new remote"
+    # placeholder; -1 left unused (no top sentinel here).
+    selected: int = 0
+    scroll: int = 0
+    # Edit mode: "" = nav mode; "name" or "url" = the field on the
+    # focused row that's currently being typed into. Pre-edit value is
+    # stashed so Esc can revert.
+    edit_field: str = ""
+    edit_pre_value: str = ""
+    # Confirmation overlay state — True while the "Apply N change(s)?"
+    # prompt is up. The prompt eats keys until Y/N/Esc.
+    confirming: bool = False
+
+
+@dataclass
+class CloneModal:
+    """Modal for cloning a remote into the active workspace. Opened
+    from the workspace menu's "+ Clone repository…" row. Tracks all
+    four field buffers and the focused row; the path field gets a
+    discover_repos-style live check (idle while the user types, fires
+    once 250ms after the last edit) so the user sees whether the
+    target dir already has a repo before pressing Enter."""
+    workspace_name: str
+    # Folders configured for the active workspace — used to build the
+    # default destination path when the user types just a name.
+    workspace_folders: List[Path] = field(default_factory=list)
+    url: str = ""
+    dest_text: str = ""
+    branch: str = ""
+    recurse_submodules: bool = True
+    # Focused field index: 0 = url, 1 = dest, 2 = branch, 3 = recurse,
+    # 4 = "Clone" button row.
+    selected: int = 0
+    edit_field: str = ""   # "" / "url" / "dest" / "branch"
+    edit_pre_value: str = ""
+    # Last-clicked Clone status — set by the worker so the modal can
+    # show "(cloning…)" / "(failed: …)" inline. None = idle.
+    cloning: bool = False
+    error: str = ""
 
 
 @dataclass
 class BranchNamePrompt:
-    """Sub-modal for typing a new branch name — used by the action
-    menu's "Save HEAD to new branch…" item to recover a detached HEAD
-    by parking its commits on a fresh branch. Cardinal-rule safe:
-    creating a ref never destroys content."""
+    """Sub-modal for typing a branch name — both for the action menu's
+    "Save HEAD to new branch…" recovery flow (mode "save_head", the
+    detached-HEAD case) and for "Rename branch…" (mode "rename", the
+    on-a-branch case). Cardinal-rule safe in both modes: branch
+    creation and `git branch -m` only touch refs."""
     target_label: str
     target_path: Path
     target_repo: Optional[Repo] = None
@@ -613,6 +773,10 @@ class BranchNamePrompt:
     typed: str = ""           # user's typed text (empty → use default_name)
     default_name: str = ""    # placeholder shown when typed is empty
     head_sha: str = ""        # short sha rendered in the subtitle
+    # "save_head" → create new branch at HEAD (detached recovery);
+    # "rename"   → rename the current branch.
+    mode: str = "save_head"
+    current_branch: str = ""  # rendered in the subtitle for "rename"
 
 
 @dataclass
@@ -934,13 +1098,13 @@ class State:
     # know what value to restore. Optional because legacy callers (and
     # most tests) instantiate State without going through load_config.
     base_config: Optional[object] = None
-    # `selected = -1` is the title-row "workspace" pseudo-row; values
-    # 0..total_rows-1 index into the repos+children body. Up from 0
-    # lands on the workspace row; ←/→ there cycles `active_workspace_index`,
-    # Space/Enter opens the workspace-overrides modal. (Older builds
-    # had a 3-toggle row at indices 0..2; those moved into the workspace
-    # menu's COMMIT / SMART-SYNC sections, freeing the body to start
-    # at index 0.)
+    # Two pseudo-rows above the body:
+    #   selected = -2 — Idlegit title row (Tab opens workspaces picker).
+    #   selected = -1 — workspace switcher (←/→ cycles workspaces;
+    #                   Tab opens the workspace settings menu).
+    #   0..total_rows-1 — repos + submodule/subtree children body.
+    # Up from 0 lands on -1; Up from -1 lands on -2; Up from -2 wraps
+    # to the bottom of the body.
     selected: int = 0
     body_scroll: int = 0  # how many body rows are scrolled past the top
     # Commit-pipeline toggles. Configured exclusively via the workspace
@@ -984,6 +1148,8 @@ class State:
     workspace_menu: Optional["WorkspaceMenu"] = None
     workspace_creator: Optional["WorkspaceCreator"] = None
     workspaces_picker: Optional["WorkspacesPicker"] = None
+    remotes_modal: Optional[RemotesModal] = None
+    clone_modal: Optional[CloneModal] = None
 
     @property
     def active_workspace(self) -> Optional[Workspace]:
@@ -1007,9 +1173,17 @@ class State:
 
     @property
     def on_workspace_row(self) -> bool:
-        """True when the title-row workspace selector is focused. Up from
-        toggle 0 lands here; Down from here returns to toggle 0."""
+        """True when the workspace switcher row (above the body, below
+        the title) is focused. Up from body row 0 lands here; Up from
+        here goes to the title row; Down from here returns to body 0."""
         return self.selected == -1
+
+    @property
+    def on_title_row(self) -> bool:
+        """True when the Idlegit title row is focused — the topmost
+        navigation level. Tab here opens the workspaces picker; Up
+        wraps to the bottom of the body."""
+        return self.selected == -2
 
     def selectable_rows(self) -> List[Tuple]:
         """Flat selectable body list: ('repo', repo, None) and

@@ -4,7 +4,7 @@
 # nested [workspace.<name>.subtree.<sub>] sections.
 
 [idlegit]
-active_workspace = idlegit
+active_workspace = Upskill.Health
 
 [workspace.Elwaudio]
 folders = /Users/joel/Workspace/Elwaudio

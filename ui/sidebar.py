@@ -72,7 +72,7 @@ def draw_sidebar(stdscr, state: State, x: int, w: int) -> None:
     c_warn = PAIR_SB_WARN_ACTIVE if focused else PAIR_SB_WARN
 
     # Leave the very top row at the default terminal background so the
-    # title row (`idlegit · …`) reads as one continuous strip instead of
+    # title row (`Idlegit · …`) reads as one continuous strip instead of
     # being clipped by the sidebar panel.
     fill = " " * w
     for y in range(1, h):

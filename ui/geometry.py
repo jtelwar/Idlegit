@@ -151,3 +151,30 @@ def draw_modal_fill(stdscr, x: int, y: int, w: int, h: int, sb: int) -> None:
     fill = " " * w
     for row in range(y, y + h):
         safe_addstr(stdscr, row, x, fill, sb)
+
+
+def clamp_scroll(selected: int, scroll: int, n_items: int,
+                 visible_rows: int) -> int:
+    """Return a new scroll offset that keeps `selected` on-screen and
+    never leaves trailing empty rows under the cursor (i.e. the bottom
+    edge stops at the last item, not past it). Returns 0 when the list
+    is empty or the viewport has no rows."""
+    if n_items <= 0 or visible_rows <= 0:
+        return 0
+    if selected < scroll:
+        scroll = selected
+    elif selected >= scroll + visible_rows:
+        scroll = selected - visible_rows + 1
+    return max(0, min(scroll, max(0, n_items - visible_rows)))
+
+
+def draw_scroll_overflow(stdscr, y: int, x: int, w: int, count: int,
+                         direction: str, attr: int) -> None:
+    """Render '  ↑ N more above' or '  ↓ N more below' at (y, x), end-
+    truncated to width `w`. The leading 2-space pad mirrors the row
+    indent of the item rows this indicator replaces in scrollable
+    pickers (branch_picker, workflow_picker, align_heads_prompt)."""
+    arrow = "↑" if direction == "up" else "↓"
+    where = "above" if direction == "up" else "below"
+    msg = f"  {arrow} {count} more {where}"
+    safe_addstr(stdscr, y, x, end_truncate(msg, w), attr)

@@ -1,16 +1,24 @@
 """Defaults, the Config dataclass, and the conf-file loaders.
 
-Configuration lives in two files:
+Configuration lives in two files under the per-user state directory
+(`USER_STATE_DIR`, overridable via IDLEGIT_CONFIG_DIR):
   - idlegit.conf — global defaults (display, suggestion, LFS, action
     polling…). Restart idlegit to pick up edits.
   - idlegit.workspaces — one or more named workspaces, each with its own
     folder list, optional setting overrides, and optional subtree
     declarations. Workspaces are switchable at runtime via the title-row
     selector; the workspace-overrides modal persists changes back here.
+
+On first run after an upgrade, files previously kept next to the
+application (``TOOL_DIR``) are copied into ``USER_STATE_DIR`` if the new
+location is still empty for that file.
 """
 from __future__ import annotations
 
 import configparser
+import os
+import shutil
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List
@@ -18,14 +26,67 @@ from typing import List
 from models import SubtreeSpec, Workspace
 
 TOOL_DIR = Path(__file__).resolve().parent
-CONFIG_FILE = TOOL_DIR / "idlegit.conf"
-WORKSPACES_FILE = TOOL_DIR / "idlegit.workspaces"
 
-VERSION = "0.1.0"
+
+def user_state_dir() -> Path:
+    """Directory for ``idlegit.conf`` and ``idlegit.workspaces``.
+
+    Override with the ``IDLEGIT_CONFIG_DIR`` environment variable (any
+    platform). Otherwise:
+
+    - **macOS:** ``~/Library/Application Support/idlegit``
+    - **Windows:** ``%APPDATA%\\idlegit`` (or ``%USERPROFILE%\\AppData\\Roaming\\idlegit``)
+    - **Other (Linux, etc.):** ``$XDG_CONFIG_HOME/idlegit`` or ``~/.config/idlegit``
+    """
+    override = os.environ.get("IDLEGIT_CONFIG_DIR", "").strip()
+    if override:
+        return Path(override).expanduser().resolve()
+    home = Path.home()
+    if sys.platform == "darwin":
+        return (home / "Library" / "Application Support" / "idlegit").resolve()
+    if sys.platform == "win32":
+        appdata = os.environ.get("APPDATA", "").strip()
+        if appdata:
+            return (Path(appdata) / "idlegit").resolve()
+        return (home / "AppData" / "Roaming" / "idlegit").resolve()
+    xdg = os.environ.get("XDG_CONFIG_HOME", "").strip()
+    if xdg:
+        return (Path(xdg) / "idlegit").resolve()
+    return (home / ".config" / "idlegit").resolve()
+
+
+USER_STATE_DIR = user_state_dir()
+CONFIG_FILE = USER_STATE_DIR / "idlegit.conf"
+WORKSPACES_FILE = USER_STATE_DIR / "idlegit.workspaces"
+
+
+def _migrate_if_missing(dest: Path) -> None:
+    """Copy ``idlegit.conf`` / ``idlegit.workspaces`` from next to the
+    application into ``dest`` if the user has no file there yet."""
+    legacy = TOOL_DIR / dest.name
+    if dest.exists() or not legacy.exists():
+        return
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(legacy, dest)
+
+
+def _ensure_config_ready() -> None:
+    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _migrate_if_missing(CONFIG_FILE)
+
+
+def _ensure_workspaces_file_ready() -> None:
+    WORKSPACES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _migrate_if_missing(WORKSPACES_FILE)
+
+
+VERSION = "0.5.2"
+# Shown in the curses UI title row, modals, and terminal title (OSC).
+APP_DISPLAY_NAME = "Idlegit"
 _CONFIG_WARNINGS: List[str] = []
 _WORKSPACE_WARNINGS: List[str] = []
 
-DEFAULT_SUGGEST = 3
+DEFAULT_SUGGEST = 5
 DEFAULT_LFS_WARN_MB = 100  # GitHub rejects non-LFS pushes for blobs over 100 MB.
 DEFAULT_BRANCH_DISPLAY_MAX = 12
 DEFAULT_NAME_DISPLAY_MAX = 40
@@ -145,6 +206,7 @@ def load_config() -> Config:
     default_prompt_for_branch = DEFAULT_PROMPT_FOR_BRANCH
 
     _CONFIG_WARNINGS.clear()
+    _ensure_config_ready()
 
     if CONFIG_FILE.exists():
         try:
@@ -408,6 +470,7 @@ def load_workspaces() -> "tuple[List[Workspace], int]":
     ([], 0) when the file is missing or malformed — the caller
     (idlegit.run) treats that as the signal to launch the creator
     wizard before the main UI takes over."""
+    _ensure_workspaces_file_ready()
     if not WORKSPACES_FILE.exists():
         _WORKSPACE_WARNINGS.clear()
         return [], 0
@@ -449,7 +512,8 @@ def load_workspaces() -> "tuple[List[Workspace], int]":
             # Workspace without a folders entry is meaningless — skip
             # rather than producing a silently-empty workspace.
             continue
-        folders = _parse_folders_block(folders_raw, TOOL_DIR)
+        folders = _parse_folders_block(
+            folders_raw, WORKSPACES_FILE.parent)
         if not folders:
             continue
         overrides: dict = {}
@@ -554,6 +618,7 @@ def save_workspaces(workspaces: List[Workspace],
     # Write atomically: stage a sibling file and rename. Stops a partial
     # write from leaving the user with a half-truncated file if we crash
     # or get interrupted between the open and the close.
+    _ensure_workspaces_file_ready()
     tmp = WORKSPACES_FILE.with_suffix(WORKSPACES_FILE.suffix + ".tmp")
     with tmp.open("w", encoding="utf-8") as fh:
         fh.write("# idlegit workspaces. Each [workspace.<name>] section "

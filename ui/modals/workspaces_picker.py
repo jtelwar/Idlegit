@@ -8,7 +8,9 @@ import curses
 from models import State, WorkspacesPicker
 
 from ..colors import PAIR_BRANCH, PAIR_OK, PAIR_SB_CYAN, PAIR_SB_FG
-from ..geometry import draw_modal_fill, modal_geometry, safe_addstr, truncate
+from ..geometry import (
+    clamp_scroll, draw_modal_fill, modal_geometry, safe_addstr, truncate,
+)
 from ..hints import (
     KEY_ENTER, KEY_ESC, KEY_UP_DOWN, Hint, render_hints,
 )
@@ -96,11 +98,7 @@ def draw_workspaces_picker(stdscr, state: State, sidebar_x: int) -> None:
     safe_addstr(stdscr, y + 1, inner_x, "Workspaces"[:inner_w],
                 curses.A_BOLD | curses.color_pair(PAIR_SB_CYAN))
 
-    if picker.selected < picker.scroll:
-        picker.scroll = picker.selected
-    elif picker.selected >= picker.scroll + body_h:
-        picker.scroll = picker.selected - body_h + 1
-    picker.scroll = max(0, min(picker.scroll, max(0, n - body_h)))
+    picker.scroll = clamp_scroll(picker.selected, picker.scroll, n, body_h)
 
     # Reserve a column on the right for the "(active)" tag + folder
     # count, leaving the rest for the workspace name. The path summary
@@ -167,7 +165,7 @@ def handle_workspaces_picker_key(state: State, key: int) -> None:
     if picker is None:
         return
 
-    if key == 27:
+    if key in (27, 9):  # Esc or Tab — both close the modal
         state.workspaces_picker = None
         return
 

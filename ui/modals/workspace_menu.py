@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 from config import (
+    APP_DISPLAY_NAME,
     TRUNCATION_MODES,
     VERSION,
     WORKSPACE_OVERRIDE_TARGETS,
@@ -58,6 +59,8 @@ def _hints_nav_mode(state, menu: WorkspaceMenu) -> list:
                                   "(can't remove last folder)"))
         elif row.kind == "add_folder":
             hints.append(Hint(KEY_ENTER, "type a new folder path"))
+        elif row.kind == "clone":
+            hints.append(Hint(KEY_ENTER, "open clone dialog"))
         elif row.kind == "bool":
             hints.append(Hint(KEY_SPACE, "toggle"))
             hints.append(Hint(KEY_BACKSPACE, "clear override"))
@@ -162,6 +165,8 @@ def _build_rows(ws: Workspace) -> List[WorkspaceMenuRow]:
             label=f"folder {i + 1}", attr_name=str(i), kind="folder"))
     rows.append(WorkspaceMenuRow(
         label="+ Add folder…", attr_name="", kind="add_folder"))
+    rows.append(WorkspaceMenuRow(
+        label="+ Clone repository…", attr_name="", kind="clone"))
     rows.extend(_OVERRIDE_ROWS)
     return rows
 
@@ -502,9 +507,9 @@ def draw_workspace_menu(stdscr, state: State, sidebar_x: int) -> None:
     inner_x = x + 2
     inner_w = w - 4
 
-    safe_addstr(stdscr, y + 1, inner_x, "idlegit",
+    safe_addstr(stdscr, y + 1, inner_x, APP_DISPLAY_NAME,
                 curses.A_BOLD | curses.color_pair(PAIR_SB_CYAN))
-    safe_addstr(stdscr, y + 1, inner_x + len("idlegit"), f"  v{VERSION}",
+    safe_addstr(stdscr, y + 1, inner_x + len(APP_DISPLAY_NAME), f"  v{VERSION}",
                 curses.color_pair(PAIR_BRANCH) | curses.A_DIM)
 
     ws = state.active_workspace
@@ -544,7 +549,7 @@ def draw_workspace_menu(stdscr, state: State, sidebar_x: int) -> None:
                              menu, row, focused, sb)
             continue
 
-        if row.kind == "add_folder":
+        if row.kind in ("add_folder", "clone"):
             prefix = "→ " if focused else "  "
             text = (prefix + row.label).ljust(inner_w)[:inner_w]
             attr = (curses.color_pair(PAIR_BRANCH) | curses.A_BOLD
@@ -687,7 +692,7 @@ def handle_workspace_menu_key(state: State, key: int) -> None:
         _handle_edit_key(state, menu, key)
         return
 
-    if key == 27:
+    if key in (27, 9):  # Esc or Tab — both close the modal
         state.workspace_menu = None
         return
     if not menu.rows:
@@ -746,6 +751,13 @@ def handle_workspace_menu_key(state: State, key: int) -> None:
     if row.kind == "add_folder":
         if key in (10, 13, curses.KEY_ENTER, ord(" ")):
             _enter_edit_mode(menu, "")
+            return
+        return
+
+    if row.kind == "clone":
+        if key in (10, 13, curses.KEY_ENTER, ord(" ")):
+            from .clone import open_clone_modal
+            open_clone_modal(state)
             return
         return
 

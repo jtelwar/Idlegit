@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-idlegit — interactive git multi-repo manager.
+Idlegit — interactive git multi-repo manager.
 
 Scans a workspace for git repos (the workspace itself if it is one, plus
 immediate child folders that contain .git) and lets you commit/push them
@@ -11,9 +11,9 @@ This file is just the entry point — the real code lives in:
     models.py    dataclasses (Repo, ChildRef, State, Task, Tasks, ActionMenu, …)
     git_ops.py   git subprocess wrappers, discovery, sync, suggest, LFS
     workers.py   background pipelines (kick_off_*) for commits, sync, refresh
-    ui.py        curses rendering, modal openers/handlers, main key handler
+    ui/          curses UI (package: main_screen, review, main_loop, modals, …)
 
-See idlegit.conf for runtime configuration; see README.md for the keymap.
+See README.md for config locations and the keymap.
 """
 from __future__ import annotations
 
@@ -23,6 +23,7 @@ import termios
 import time
 
 from config import (
+    APP_DISPLAY_NAME,
     apply_workspace_overrides,
     load_config,
     load_workspaces,
@@ -39,8 +40,10 @@ from ui import (
     handle_align_heads_prompt_key,
     handle_branch_name_prompt_key,
     handle_branch_picker_key,
+    handle_clone_modal_key,
     handle_confirm,
     handle_detached_recovery_prompt_key,
+    handle_remotes_modal_key,
     handle_main_key,
     handle_reset_prompt_key,
     handle_task_action_menu_key,
@@ -118,7 +121,7 @@ def _run_workspace_creator_subloop(stdscr, cfg, startup_warnings=None):
                  "Add one or more folder paths to scan for git repos.")
     open_workspace_creator(
         state,
-        title="Welcome to idlegit",
+        title="Welcome to Idlegit",
         intro=intro)
     stdscr.timeout(100)
     while state.workspace_creator is not None:
@@ -129,7 +132,7 @@ def _run_workspace_creator_subloop(stdscr, cfg, startup_warnings=None):
         tick_creator_checks(state)
         stdscr.erase()
         h, w = stdscr.getmaxyx()
-        title = "idlegit"
+        title = "Idlegit"
         safe_addstr(stdscr, 1, max(2, (w - len(title)) // 2), title,
                     curses.A_BOLD | curses.color_pair(PAIR_HEADER))
         sidebar_x, _ = sidebar_geometry(w)
@@ -211,7 +214,7 @@ def run(stdscr, cfg, workspaces, initial_active_idx: int = 0,
     refresh_all_workspaces(stdscr, workspace_repos, cfg.name_display_max,
                            cfg.name_truncation, active_index=active_idx)
 
-    title = f"idlegit · {active_ws.name}" if active_ws.name else "idlegit"
+    title = f"Idlegit · {active_ws.name}" if active_ws.name else "Idlegit"
     # Re-emit immediately after curses owns the terminal: VS Code's
     # integrated terminal (and a few others) overwrite the title with
     # the running-process name once the alt-screen comes up.
@@ -291,8 +294,8 @@ def run(stdscr, cfg, workspaces, initial_active_idx: int = 0,
                     pass
                 ws = state.active_workspace
                 if ws is not None:
-                    title = (f"idlegit · {ws.name}"
-                             if ws.name else "idlegit")
+                    title = (f"Idlegit · {ws.name}"
+                             if ws.name else "Idlegit")
         action_menu_loading = (
             state.action_menu is not None
             and (state.action_menu.state_loading
@@ -365,8 +368,18 @@ def run(stdscr, cfg, workspaces, initial_active_idx: int = 0,
         if state.detached_recovery_prompt is not None:
             handle_detached_recovery_prompt_key(state, key)
             continue
+        # Sub-modal of action_menu — must dispatch before action_menu so
+        # the modal on top owns key handling while it's open.
+        if state.remotes_modal is not None:
+            handle_remotes_modal_key(state, key)
+            continue
         if state.action_menu is not None:
             handle_action_menu_key(state, key)
+            continue
+        # Sub-modal of workspace_menu — same precedence rule as remotes
+        # vs action_menu.
+        if state.clone_modal is not None:
+            handle_clone_modal_key(state, key)
             continue
         if state.workspace_menu is not None:
             handle_workspace_menu_key(state, key)
@@ -400,7 +413,7 @@ def run(stdscr, cfg, workspaces, initial_active_idx: int = 0,
             # OSC re-emit loop above picks the new name up next tick.
             ws = state.active_workspace
             if ws is not None:
-                title = f"idlegit · {ws.name}" if ws.name else "idlegit"
+                title = f"Idlegit · {ws.name}" if ws.name else "Idlegit"
             continue
         if action == "confirm":
             stdscr.timeout(-1)  # confirm sub-loop wants blocking input
@@ -457,7 +470,8 @@ def main() -> int:
 
     title_name = (workspaces[initial_active_idx].name
                   if workspaces else "")
-    _set_terminal_title(f"idlegit · {title_name}" if title_name else "idlegit")
+    _set_terminal_title(
+        f"{APP_DISPLAY_NAME} · {title_name}" if title_name else APP_DISPLAY_NAME)
     try:
         curses.wrapper(
             lambda stdscr: run(

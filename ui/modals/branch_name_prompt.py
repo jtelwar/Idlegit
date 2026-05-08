@@ -40,39 +40,71 @@ def _hints(prompt: BranchNamePrompt) -> list:
     name = prompt.typed or prompt.default_name
     if not name or name.startswith("-"):
         return [Hint(KEY_ESC, "back")]
+    if prompt.mode == "rename":
+        action = (f"rename {prompt.current_branch} → {name}"
+                  if prompt.current_branch and name != prompt.current_branch
+                  else f"rename to {name}")
+    else:
+        action = f"create branch {name} at HEAD"
     return [
         Hint("a-z, 0-9, /-_.", "type name"),
         Hint(KEY_BACKSPACE, "delete char"),
-        Hint(KEY_ENTER, f"create branch {name} at HEAD"),
+        Hint(KEY_ENTER, action),
         Hint(KEY_ESC, "back"),
     ]
 
 
-def open_branch_name_prompt(state: State) -> None:
-    """Install the prompt onto state. Default branch name is
+def open_branch_name_prompt(state: State, mode: str = "save_head") -> None:
+    """Install the prompt onto state.
+
+    `mode == "save_head"` (default): default branch name is
     `idlegit/wip-<sha8>` so even a panicked Enter is recoverable —
     every detached-HEAD save lands on a predictable namespace the
-    user can grep / clean up later (`git branch -D idlegit/wip-*`)."""
+    user can grep / clean up later (`git branch -D idlegit/wip-*`).
+
+    `mode == "rename"`: pre-fills the typed buffer with the current
+    branch name so the user starts from the existing value and
+    edits, rather than retyping from scratch."""
     menu = state.action_menu
     if menu is None:
         return
     rc, head_out, _ = git(menu.target_path, ["rev-parse", "HEAD"])
     sha = head_out.strip() if rc == 0 else ""
     sha8 = sha[:8] if sha else "head"
-    state.branch_name_prompt = BranchNamePrompt(
-        target_label=menu.target_label,
-        target_path=menu.target_path,
-        target_repo=menu.target_repo,
-        target_parent=menu.target_parent,
-        target_child=menu.target_child,
-        default_name=f"idlegit/wip-{sha8}",
-        head_sha=sha,
-    )
+    rc, branch_out, _ = git(menu.target_path,
+                            ["branch", "--show-current"])
+    current = branch_out.strip() if rc == 0 else ""
+    if mode == "rename":
+        state.branch_name_prompt = BranchNamePrompt(
+            target_label=menu.target_label,
+            target_path=menu.target_path,
+            target_repo=menu.target_repo,
+            target_parent=menu.target_parent,
+            target_child=menu.target_child,
+            typed=current,
+            default_name=current,
+            head_sha=sha,
+            mode="rename",
+            current_branch=current,
+        )
+    else:
+        state.branch_name_prompt = BranchNamePrompt(
+            target_label=menu.target_label,
+            target_path=menu.target_path,
+            target_repo=menu.target_repo,
+            target_parent=menu.target_parent,
+            target_child=menu.target_child,
+            default_name=f"idlegit/wip-{sha8}",
+            head_sha=sha,
+            mode="save_head",
+            current_branch=current,
+        )
 
 
 def _title_lines(prompt: BranchNamePrompt, inner_w: int) -> "list[str]":
-    return wrap_label_value("Save HEAD to new branch",
-                            prompt.target_label, inner_w)
+    label = ("Rename branch" if prompt.mode == "rename"
+             else "Save HEAD to new branch")
+    return wrap_label_value(label, prompt.target_label, inner_w)
 
 
 def draw_branch_name_prompt(stdscr, state: State, sidebar_x: int) -> None:
@@ -110,14 +142,21 @@ def draw_branch_name_prompt(stdscr, state: State, sidebar_x: int) -> None:
         line += 1
     line += blank_after_title
 
-    sha8 = prompt.head_sha[:8] if prompt.head_sha else "(unknown)"
+    if prompt.mode == "rename":
+        subtitle = (f"current: {prompt.current_branch}"
+                    if prompt.current_branch else "current: (unknown)")
+    else:
+        sha8 = prompt.head_sha[:8] if prompt.head_sha else "(unknown)"
+        subtitle = f"detached at {sha8}"
     safe_addstr(stdscr, line, inner_x,
-                end_truncate(f"detached at {sha8}", inner_w),
+                end_truncate(subtitle, inner_w),
                 sb | curses.A_DIM)
     line += 1
 
+    label = ("Rename to:" if prompt.mode == "rename"
+             else "New branch name:")
     safe_addstr(stdscr, line, inner_x,
-                end_truncate("New branch name:", inner_w),
+                end_truncate(label, inner_w),
                 sb | curses.A_DIM)
     line += 1
 
@@ -149,8 +188,19 @@ def handle_branch_name_prompt_key(state: State, key: int) -> None:
         name = prompt.typed.strip() or prompt.default_name
         if not name or name.startswith("-"):
             return
+        if prompt.mode == "rename":
+            # Rename of the current branch is a no-op when the new
+            # name matches what we already have — silently swallow it
+            # rather than emitting a sidebar fail line.
+            if name == prompt.current_branch:
+                state.branch_name_prompt = None
+                state.action_menu = None
+                return
+            action_id = "rename_branch"
+        else:
+            action_id = "branch_from_head"
         kick_off_action(
-            state, "branch_from_head",
+            state, action_id,
             target_label=prompt.target_label,
             target_path=prompt.target_path,
             target_repo=prompt.target_repo,

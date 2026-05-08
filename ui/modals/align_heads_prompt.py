@@ -12,8 +12,8 @@ from models import AlignHeadsPrompt, State
 
 from ..colors import PAIR_BRANCH, PAIR_SB_CYAN, PAIR_SB_FG
 from ..geometry import (
-    draw_modal_fill, end_truncate, modal_geometry, safe_addstr,
-    wrap_label_value,
+    clamp_scroll, draw_modal_fill, draw_scroll_overflow, end_truncate,
+    modal_geometry, safe_addstr, wrap_label_value,
 )
 from ..hints import KEY_ENTER, KEY_ESC, KEY_UP_DOWN, Hint, render_hints
 
@@ -83,19 +83,8 @@ def _adjust_scroll(prompt: AlignHeadsPrompt, visible_rows: int) -> None:
     """Clamp `prompt.scroll` so the selected branch is visible. Also
     clamps the bottom edge so the list never scrolls past the last
     branch (no trailing empty rows under the cursor)."""
-    n = len(prompt.branches)
-    if n == 0 or visible_rows <= 0:
-        prompt.scroll = 0
-        return
-    if prompt.selected < prompt.scroll:
-        prompt.scroll = prompt.selected
-    elif prompt.selected >= prompt.scroll + visible_rows:
-        prompt.scroll = prompt.selected - visible_rows + 1
-    max_scroll = max(0, n - visible_rows)
-    if prompt.scroll > max_scroll:
-        prompt.scroll = max_scroll
-    if prompt.scroll < 0:
-        prompt.scroll = 0
+    prompt.scroll = clamp_scroll(prompt.selected, prompt.scroll,
+                                 len(prompt.branches), visible_rows)
 
 
 def draw_align_heads_prompt(stdscr, state: State, sidebar_x: int) -> None:
@@ -192,15 +181,13 @@ def draw_align_heads_prompt(stdscr, state: State, sidebar_x: int) -> None:
             # Replace the topmost visible row with "↑ N more" when we're
             # scrolled past the start; same for the bottom.
             if slot == 0 and prompt.scroll > 0:
-                msg = f"  ↑ {prompt.scroll} more above"
-                safe_addstr(stdscr, row_y, inner_x,
-                            end_truncate(msg, inner_w), sb | curses.A_DIM)
+                draw_scroll_overflow(stdscr, row_y, inner_x, inner_w,
+                                     prompt.scroll, "up", sb | curses.A_DIM)
                 continue
             if slot == visible_rows - 1 and end < n:
-                remaining = n - end + 1
-                msg = f"  ↓ {remaining} more below"
-                safe_addstr(stdscr, row_y, inner_x,
-                            end_truncate(msg, inner_w), sb | curses.A_DIM)
+                draw_scroll_overflow(stdscr, row_y, inner_x, inner_w,
+                                     n - end + 1, "down",
+                                     sb | curses.A_DIM)
                 continue
 
             branch = prompt.branches[i]

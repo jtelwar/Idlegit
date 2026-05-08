@@ -13,9 +13,12 @@ for _p in (str(_HERE.parent), str(_HERE)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+from _helpers import (  # noqa: E402
+    make_repo_model as _make_repo, make_state as _state,
+)
 from models import (  # noqa: E402
     ActionMenu, ActionMenuItem, BranchNamePrompt, BranchPicker, CommitEntry,
-    FileEntry, Repo, ResetPrompt, State,
+    FileEntry, ResetPrompt, State,
 )
 
 
@@ -33,18 +36,6 @@ try:
     UI_AVAILABLE = True
 except Exception:  # pragma: no cover
     UI_AVAILABLE = False
-
-
-def _make_repo(rel: str = "r", **kwargs) -> Repo:
-    return Repo(rel=rel, path=Path(f"/tmp/{rel}"), **kwargs)
-
-
-def _state(*repos: Repo, selected: int = 0, **kwargs) -> State:
-    # Default selected=0: first repo row. The old toggle row (auto-
-    # stage / auto-push / align-heads) moved into the workspace menu;
-    # body rows now start at index 0.
-    return State(repos=list(repos), workspace_name="ws",
-                 selected=selected, **kwargs)
 
 
 @unittest.skipUnless(UI_AVAILABLE, "ui module unavailable")

@@ -14,8 +14,8 @@ import threading
 from typing import List, Optional
 
 from models import (
-    ActionMenu, ActionMenuItem, ChildRef, CommitEntry, FileEntry,
-    Repo, State,
+    ActionMenu, ActionMenuItem, ActionSubmenuFrame, ChildRef,
+    CommitEntry, FileEntry, Repo, State,
 )
 from git_ops import (
     gh_available, load_commits, parse_github_slug, query_target_state,
@@ -32,8 +32,8 @@ from ..geometry import (
     draw_modal_fill, end_truncate, modal_geometry, safe_addstr, truncate,
 )
 from ..hints import (
-    KEY_DOWN, KEY_ENTER, KEY_ESC, KEY_HOME, KEY_LEFT_RIGHT, KEY_TAB,
-    KEY_UP_DOWN, Hint, render_hints,
+    KEY_DOWN, KEY_ENTER, KEY_ESC, KEY_HOME, KEY_LEFT, KEY_LEFT_RIGHT,
+    KEY_RIGHT, KEY_TAB, KEY_UP_DOWN, Hint, render_hints,
 )
 from ..sidebar import SPINNER_FRAMES
 from .diff_viewer import handle_diff_viewer_key, open_diff_viewer
@@ -47,16 +47,41 @@ def _spinner_glyph(state: State) -> str:
 
 def _hints_action_focus(menu: ActionMenu) -> list:
     """Footer hints when the action items list has focus. Enter's
-    description names the focused item; disabled items show why."""
+    description names the focused item; disabled items show why.
+    Submenu rows show Right/Left navigation hints (Down-into-pane is
+    swapped out when in a submenu since the bottom pane is owned by
+    the top level only)."""
+    items = _current_items(menu)
+    selected = _current_selected(menu)
     hints = [Hint(KEY_UP_DOWN, "select")]
-    if 0 <= menu.selected < len(menu.items):
-        item = menu.items[menu.selected]
-        if item.enabled:
+    if 0 <= selected < len(items):
+        item = items[selected]
+        if item.is_back:
+            parent = "main menu"
+            if len(menu.submenu_stack) >= 2:
+                parent = menu.submenu_stack[-2].label
+            hints.append(Hint(KEY_ENTER, f"back to {parent}"))
+        elif item.id.startswith("remote:"):
+            # Remote rows have three actions on shortcut keys —
+            # Enter (set URL) is the most common, R renames, D
+            # deletes (with confirm).
+            hints.append(Hint(KEY_ENTER, "edit url"))
+            hints.append(Hint("r", "rename"))
+            hints.append(Hint("d", "delete"))
+        elif item.has_submenu:
+            hints.append(Hint(KEY_RIGHT, f"open {item.label} menu"))
+            hints.append(Hint(KEY_ENTER, f"open {item.label} menu"))
+        elif item.enabled:
             hints.append(Hint(KEY_ENTER, item.label))
         else:
             reason = f" ({item.reason})" if item.reason else ""
             hints.append(Hint(KEY_ENTER, f"unavailable{reason}"))
-    hints.append(Hint(KEY_DOWN, "into pane"))
+    if _in_submenu(menu):
+        parent = (menu.submenu_stack[-2].label
+                  if len(menu.submenu_stack) >= 2 else "main menu")
+        hints.append(Hint(KEY_LEFT, f"back to {parent}"))
+    else:
+        hints.append(Hint(KEY_DOWN, "into pane"))
     hints.append(Hint(KEY_TAB, "close"))
     hints.append(Hint(KEY_ESC, "back"))
     return hints
@@ -81,8 +106,39 @@ def _hints_pane_focus(menu: ActionMenu) -> list:
 def _draw_action_hints(stdscr, menu: ActionMenu, y: int, x: int,
                        w: int, attr: int) -> None:
     """Single call site keeps render_hints visibly used so the
-    autoformatter doesn't strip it from the import block on subsequent
-    edits."""
+    autoformatter doesn't strip it from the import block on
+    subsequent edits. Confirm prompts and inline edit modes paint
+    their own footer text instead of the regular hint list."""
+    if menu.confirm_message:
+        # Bold yellow strip — same treatment the standalone remotes
+        # modal's confirm row uses, so the confirm UX reads the same
+        # everywhere.
+        from ..colors import PAIR_WARN
+        text = menu.confirm_message
+        safe_addstr(stdscr, y, x,
+                    text[:max(0, w)],
+                    curses.color_pair(PAIR_WARN) | curses.A_BOLD)
+        return
+    if menu.edit_field:
+        from ..hints import KEY_BACKSPACE
+        if menu.edit_field == "rename_remote":
+            verb = "rename"
+        elif menu.edit_field == "set_url_remote":
+            verb = "set url"
+        elif menu.edit_field == "add_remote_name":
+            verb = "next: enter URL"
+        elif menu.edit_field == "add_remote_url":
+            verb = "add remote"
+        else:
+            verb = "save"
+        hints = [
+            Hint("type", "edit"),
+            Hint(KEY_BACKSPACE, "delete char"),
+            Hint(KEY_ENTER, verb),
+            Hint(KEY_ESC, "cancel"),
+        ]
+        render_hints(stdscr, y, x, w, hints, attr=attr)
+        return
     hints = (_hints_pane_focus(menu) if menu.pane_focus
              else _hints_action_focus(menu))
     render_hints(stdscr, y, x, w, hints, attr=attr)
@@ -145,19 +201,18 @@ def _run_workflow_reason(workflows_repo: Optional[Repo]) -> str:
     return "no workflows in this repo"
 
 
-def _build_items(branch_meta) -> List[ActionMenuItem]:
-    """Translate a (TargetState-shaped) ``branch_meta`` into the
-    six-item action list. Used both at open time (with cached values)
-    and once the async query lands (with fresh values) so the menu
-    re-evaluates enable/reason without rebuilding the list itself."""
+def _build_main_items(branch_meta,
+                      stash_count: int = 0,
+                      remote_count: int = 0) -> List[ActionMenuItem]:
+    """Main menu — repo-level actions plus four submenu openers
+    (branch / actions / stashes / remotes). Anything that fans out
+    into multiple sub-actions lives behind a submenu so the top
+    level stays short and stable. The dynamic submenus (Stashes and
+    Remotes) carry a `(N)` count in the opener label, queried at
+    open / re-entry time."""
     has_origin = branch_meta["has_origin"]
     upstream = branch_meta["upstream"]
     merging = branch_meta["merging"]
-    ahead = branch_meta["ahead"]
-    has_workflows = branch_meta["has_any_workflow"]
-    workflow_reason = branch_meta["run_workflow_reason"]
-    branch = branch_meta.get("branch") or ""
-    detached = (not branch) or branch == "(detached)"
     return [
         ActionMenuItem(
             id="fetch", label="fetch (all branches)",
@@ -169,6 +224,49 @@ def _build_items(branch_meta) -> List[ActionMenuItem]:
             reason=("merging" if merging
                     else ("no upstream" if upstream is None
                           else ("" if has_origin else "no origin")))),
+        ActionMenuItem(
+            id="push", label="push",
+            enabled=has_origin,
+            reason="" if has_origin else "no origin"),
+        ActionMenuItem(
+            id="branch_submenu", label="branch",
+            enabled=not merging,
+            reason="" if not merging else "merging",
+            has_submenu=True),
+        ActionMenuItem(
+            id="actions_submenu", label="actions",
+            enabled=True, has_submenu=True),
+        ActionMenuItem(
+            id="stashes_submenu",
+            label=f"stashes ({stash_count})",
+            enabled=True, has_submenu=True),
+        ActionMenuItem(
+            id="remotes_submenu",
+            label=f"remotes ({remote_count})",
+            enabled=True, has_submenu=True),
+    ]
+
+
+def _back_item() -> ActionMenuItem:
+    """Synthetic top-of-submenu row. Always selectable; pressing
+    Enter (or Left) pops the current frame. The actual submenu name
+    lives in the breadcrumb header above the items, so this row's
+    label is just the literal word "back"."""
+    return ActionMenuItem(id="back", label="back",
+                          enabled=True, is_back=True)
+
+
+def _build_branch_items(branch_meta) -> List[ActionMenuItem]:
+    """Branch submenu — switch / save HEAD / merge / rename / set
+    upstream. Each action carries its own enable/reason rules so the
+    submenu stays self-explanatory even when half the items are
+    blocked by detached HEAD or a merge in progress."""
+    has_origin = branch_meta["has_origin"]
+    merging = branch_meta["merging"]
+    branch = branch_meta.get("branch") or ""
+    detached = (not branch) or branch == "(detached)"
+    return [
+        _back_item(),
         ActionMenuItem(
             id="switch_branch", label="switch branch…",
             enabled=not merging,
@@ -190,18 +288,174 @@ def _build_items(branch_meta) -> List[ActionMenuItem]:
             reason=("merging" if merging
                     else ("detached HEAD" if detached else ""))),
         ActionMenuItem(
+            id="rename_branch", label="rename branch…",
+            enabled=(not detached) and (not merging),
+            reason=("merging" if merging
+                    else ("detached HEAD" if detached else ""))),
+        ActionMenuItem(
+            id="set_upstream", label="set upstream…",
+            enabled=(not detached) and (not merging) and has_origin,
+            reason=("merging" if merging
+                    else ("detached HEAD" if detached
+                          else ("" if has_origin else "no origin")))),
+    ]
+
+
+def _build_actions_items(branch_meta) -> List[ActionMenuItem]:
+    """Actions submenu — soft reset and run-a-workflow. Both used to
+    live on the main menu; grouped here so future actions-style
+    operations (cancel a run, view recent runs, reflog viewer…) can
+    join them without crowding the top level."""
+    ahead = branch_meta.get("ahead", 0) if branch_meta else 0
+    return [
+        _back_item(),
+        ActionMenuItem(
             id="soft_reset",
             label=f"soft reset ({ahead} unpushed)…",
             enabled=ahead > 0,
             reason="" if ahead > 0 else "no unpushed commits"),
         ActionMenuItem(
-            id="push", label="push",
-            enabled=has_origin,
-            reason="" if has_origin else "no origin"),
-        ActionMenuItem(
             id="run_workflow", label="run a workflow…",
-            enabled=has_workflows, reason=workflow_reason),
+            enabled=branch_meta["has_any_workflow"]
+            if branch_meta else False,
+            reason=(branch_meta["run_workflow_reason"]
+                    if branch_meta else "")),
     ]
+
+
+def _build_stashes_items(stashes: "list[tuple[str, str]]"
+                         ) -> List[ActionMenuItem]:
+    """Stashes submenu — back · new stash · ─── · stash@{0} … N.
+
+    Each stash row's id is `stash:<ref>` so the dispatcher can pull
+    the original ref back out at Enter time. Has-submenu marker
+    causes Enter to push a per-stash frame with the apply action."""
+    items: List[ActionMenuItem] = [
+        _back_item(),
+        ActionMenuItem(id="stash_create", label="new stash"),
+        ActionMenuItem(id="sep_after_new", label="",
+                       enabled=False, is_separator=True),
+    ]
+    for ref, msg in stashes:
+        # Show the ref alongside the human message so the user has
+        # both the index ("stash@{0}") and the descriptive line.
+        label = f"{ref}  {msg}" if msg else ref
+        items.append(ActionMenuItem(
+            id=f"stash:{ref}", label=label, has_submenu=True))
+    if not stashes:
+        items.append(ActionMenuItem(
+            id="stash_empty", label="(no stashes yet)",
+            enabled=False))
+    return items
+
+
+def _build_remotes_items(remotes: "list[tuple[str, str]]"
+                         ) -> List[ActionMenuItem]:
+    """Remotes submenu — back · new remote · ─── · <remote rows>.
+
+    Each remote row's id is `remote:<name>` so the dispatcher can
+    pull the name back at Enter time. Pressing Enter on a remote
+    row activates inline rename mode (the row's name becomes
+    editable); the handler renders a confirm prompt before applying
+    the rename. D triggers an inline delete (also confirmed)."""
+    items: List[ActionMenuItem] = [
+        _back_item(),
+        ActionMenuItem(id="new_remote", label="new remote"),
+        ActionMenuItem(id="sep_after_new", label="",
+                       enabled=False, is_separator=True),
+    ]
+    for name, url in remotes:
+        # The label shows both name and URL so users see the full
+        # picture on the row. URL editing isn't exposed in this
+        # iteration — rename is the inline action; full URL edits
+        # would be a future per-remote sub-sub-menu.
+        label = f"{name}: {url}" if url else name
+        items.append(ActionMenuItem(
+            id=f"remote:{name}", label=label))
+    if not remotes:
+        items.append(ActionMenuItem(
+            id="remote_empty", label="(no remotes configured)",
+            enabled=False))
+    return items
+
+
+def _build_stash_apply_items(ref: str) -> List[ActionMenuItem]:
+    """Per-stash sub-sub-menu — currently just `apply`. We
+    deliberately do NOT offer pop / drop here: removing a stash ref
+    is a cardinal-rule violation. Apply leaves the entry in place so
+    the user can re-attempt or inspect later."""
+    return [
+        _back_item(),
+        ActionMenuItem(
+            id=f"stash_apply:{ref}",
+            label=f"apply {ref}",
+            enabled=True),
+    ]
+
+
+def _in_submenu(menu: ActionMenu) -> bool:
+    return bool(menu.submenu_stack)
+
+
+def _current_items(menu: ActionMenu) -> List[ActionMenuItem]:
+    """Items currently displayed — top-of-stack frame when in a
+    submenu, the main menu items otherwise."""
+    if menu.submenu_stack:
+        return menu.submenu_stack[-1].items
+    return menu.items
+
+
+def _current_selected(menu: ActionMenu) -> int:
+    if menu.submenu_stack:
+        return menu.submenu_stack[-1].selected
+    return menu.selected
+
+
+def _set_current_selected(menu: ActionMenu, value: int) -> None:
+    if menu.submenu_stack:
+        menu.submenu_stack[-1].selected = value
+    else:
+        menu.selected = value
+
+
+def _breadcrumb_segments(menu: ActionMenu) -> List[str]:
+    """Path of names rendered in the breadcrumb above the items —
+    `repo` first, then each pushed submenu's `label`. The trailing
+    segment is the user's current location."""
+    segs = ["repo"]
+    for frame in menu.submenu_stack:
+        segs.append(frame.label)
+    return segs
+
+
+def _first_actionable_index(items: List[ActionMenuItem]) -> int:
+    """First selectable index, skipping back-rows and separators —
+    the cursor's natural landing spot when entering a submenu."""
+    for i, it in enumerate(items):
+        if it.enabled and not it.is_back and not it.is_separator:
+            return i
+    # Fall back to the back row (always selectable) so the cursor at
+    # least lands on something interactive.
+    for i, it in enumerate(items):
+        if it.enabled and not it.is_separator:
+            return i
+    return 0
+
+
+def _push_submenu(menu: ActionMenu, name: str, label: str,
+                  items: List[ActionMenuItem]) -> None:
+    """Push a new submenu frame onto the stack. Cursor lands on the
+    first real action (skipping the back row)."""
+    menu.submenu_stack.append(ActionSubmenuFrame(
+        name=name, label=label, items=items,
+        selected=_first_actionable_index(items),
+    ))
+
+
+def _pop_submenu(menu: ActionMenu) -> None:
+    """Drop the top submenu frame — Left or "back" pressed."""
+    if menu.submenu_stack:
+        menu.submenu_stack.pop()
 
 
 def _state_label_for(branch_meta):
@@ -308,12 +562,18 @@ def open_action_menu(state: State) -> None:
 
     workflows_repo = target_repo or (target_child.repo if target_child else None)
     meta = _initial_meta_from_cache(target_repo, target_child, workflows_repo)
-    items = _build_items(meta)
-    initial = 0
-    for i, it in enumerate(items):
-        if it.enabled:
-            initial = i
-            break
+    # Synchronous one-shot queries at open time so the dynamic
+    # main-menu opener labels (`stashes (N)`, `remotes (N)`) reflect
+    # the on-disk state. Both are fast even on large repos and
+    # avoid re-running on every state refresh.
+    from git_ops import list_stashes, list_remotes
+    stashes = list_stashes(target_path)
+    remotes_list = list_remotes(target_path)
+    stash_count = len(stashes)
+    remote_count = len(remotes_list)
+    items = _build_main_items(meta, stash_count=stash_count,
+                              remote_count=remote_count)
+    initial = _first_actionable_index(items)
     state_label, state_pair = _state_label_for(meta)
 
     menu = ActionMenu(
@@ -330,6 +590,11 @@ def open_action_menu(state: State) -> None:
         state_pair=state_pair,
         items=items,
         selected=initial,
+        cached_meta=meta,
+        stash_count=stash_count,
+        stashes=stashes,
+        remotes_list=remotes_list,
+        remote_count=remote_count,
         state_loading=True,
         tree_loading=True,
         commits_loading=True,
@@ -376,17 +641,31 @@ def _kick_off_state_load(menu: ActionMenu,
             menu.ahead = ts.ahead
             menu.behind = ts.behind
             menu.state_label, menu.state_pair = _state_label_for(meta)
-            menu.items = _build_items(meta)
+            menu.cached_meta = meta
+            menu.items = _build_main_items(
+                meta, stash_count=menu.stash_count,
+                remote_count=menu.remote_count)
             # If the user hasn't moved their cursor yet, re-snap to
             # the first enabled item — the cached snapshot may have
             # marked items enabled that the fresh query disables (or
             # vice versa).
             if menu.selected < len(menu.items) and not menu.items[
                     menu.selected].enabled:
-                for i, it in enumerate(menu.items):
-                    if it.enabled:
-                        menu.selected = i
-                        break
+                menu.selected = _first_actionable_index(menu.items)
+            # Refresh the visible submenu's items too if it's one we
+            # know how to rebuild from `meta`. Keeps disable/enable
+            # reasons in sync (e.g. a fetch that lands while the user
+            # is in the branch submenu re-evaluates "no upstream").
+            if menu.submenu_stack:
+                top = menu.submenu_stack[-1]
+                if top.name == "branch":
+                    top.items = _build_branch_items(meta)
+                elif top.name == "actions":
+                    top.items = _build_actions_items(meta)
+                if top.selected < len(top.items):
+                    sel_item = top.items[top.selected]
+                    if not sel_item.enabled or sel_item.is_separator:
+                        top.selected = _first_actionable_index(top.items)
         finally:
             menu.state_loading = False
 
@@ -505,14 +784,29 @@ def draw_action_menu(stdscr, state: State, sidebar_x: int) -> None:
     if menu is None:
         return
 
-    n_items = len(menu.items)
+    items = _current_items(menu)
+    selected = _current_selected(menu)
+    # Reserve enough action rows to fit whichever list is longest
+    # across all menu levels so the modal doesn't shrink/grow
+    # visibly when the user enters or exits a submenu. Stash entries
+    # plus the back/new-stash/separator chrome can outsize the main
+    # menu, so include the cached stash count too.
+    main_count = len(menu.items)
+    branch_count = len(_build_branch_items(menu.cached_meta or {}))
+    actions_count = len(_build_actions_items(menu.cached_meta or {}))
+    stashes_count = len(_build_stashes_items(menu.stashes))
+    remotes_count = len(_build_remotes_items(menu.remotes_list))
+    n_items = max(main_count, branch_count, actions_count,
+                  stashes_count, remotes_count)
     # Header (title + spacer + branch + upstream + sep) = 5 rows;
-    # actions = n_items rows; separator = 1; tab header = 1; filter = 1;
-    # pane list = up to PANE_TARGET_ROWS; footer hint = 1; padding = 2.
-    # Trailing +1 reserves a blank row below the footer for visual
-    # breathing — the existing layout already has a blank above the
-    # title via the leading "1" component.
+    # breadcrumb row (always reserved) = 1; actions = n_items rows;
+    # separator = 1; tab header = 1; filter = 1; pane list = up to
+    # PANE_TARGET_ROWS; footer hint = 1; padding = 2. Trailing +1
+    # reserves a blank row below the footer for visual breathing —
+    # the existing layout already has a blank above the title via
+    # the leading "1" component.
     content_h = (1 + 1 + 1 + 1 + 1
+                 + 1
                  + n_items + 1
                  + 1 + 1
                  + PANE_TARGET_ROWS
@@ -574,15 +868,71 @@ def draw_action_menu(stdscr, state: State, sidebar_x: int) -> None:
     line += 1
     safe_addstr(stdscr, line, inner_x, "─" * inner_w, sb | curses.A_DIM)
 
-    # Action items
+    # Breadcrumb header — `repo › branch › Stashes`. Earlier
+    # segments dim, current segment in accent cyan-bold so the user
+    # always sees where they are. The row is always reserved (kept
+    # blank on the main menu) so the modal layout doesn't shift when
+    # the user pushes into a submenu.
     line += 1
-    for i, item in enumerate(menu.items):
-        focused = (i == menu.selected and not menu.pane_focus)
-        prefix = "→ " if focused else "  "
+    if menu.submenu_stack:
+        segs = _breadcrumb_segments(menu)
+        cx = inner_x
+        sep = " › "
+        for i, seg in enumerate(segs):
+            is_last = (i == len(segs) - 1)
+            if is_last:
+                seg_attr = (curses.color_pair(PAIR_SB_CYAN)
+                            | curses.A_BOLD)
+            else:
+                seg_attr = sb | curses.A_DIM
+            text = seg
+            if cx + len(text) > inner_x + inner_w:
+                text = end_truncate(text, inner_x + inner_w - cx)
+            safe_addstr(stdscr, line, cx, text, seg_attr)
+            cx += len(text)
+            if not is_last:
+                if cx + len(sep) > inner_x + inner_w:
+                    break
+                safe_addstr(stdscr, line, cx, sep, sb | curses.A_DIM)
+                cx += len(sep)
+    line += 1
+
+    # Action items — `items` and `selected` come from the
+    # main-or-submenu helpers so the same render path serves both.
+    # The caret column 0 is reserved across every row: rows that
+    # open a submenu paint a `›` here (always visible, dim when not
+    # focused, bright when focused); regular focused rows paint the
+    # focus arrow `→`; everything else gets blank padding so labels
+    # align across the list. Separators render as a dim hairline.
+    rendered = 0
+    for i, item in enumerate(items):
+        focused = (i == selected and not menu.pane_focus
+                   and not item.is_separator)
+        if item.is_separator:
+            safe_addstr(stdscr, line, inner_x,
+                        ("  " + "─" * max(1, inner_w - 4)
+                         + "  ").ljust(inner_w),
+                        sb | curses.A_DIM)
+            line += 1
+            rendered += 1
+            continue
+        # Column 0 caret / focus arrow.
+        if item.has_submenu:
+            col0 = "› "
+        elif focused:
+            col0 = "→ "
+        else:
+            col0 = "  "
         label = item.label
         if not item.enabled and item.reason:
             label = f"{label}  ({item.reason})"
-        if focused and item.enabled:
+        # Attribute selection — back rows render as dim cyan
+        # breadcrumb-style, regardless of state.
+        if item.is_back:
+            attr = curses.color_pair(PAIR_SB_CYAN) | curses.A_DIM
+            if focused:
+                attr |= curses.A_REVERSE
+        elif focused and item.enabled:
             attr = sb | curses.A_REVERSE
         elif focused:
             attr = sb | curses.A_REVERSE | curses.A_DIM
@@ -590,8 +940,84 @@ def draw_action_menu(stdscr, state: State, sidebar_x: int) -> None:
             attr = sb | curses.A_DIM
         else:
             attr = sb
-        safe_addstr(stdscr, line, inner_x,
-                    (prefix + label).ljust(inner_w), attr)
+        inline_editing = (focused and bool(menu.edit_field)
+                          and item.id == menu.edit_target_id)
+        is_remote_row = item.id.startswith("remote:")
+        if is_remote_row:
+            # Two-column render: name on the left, URL on the right.
+            # Width auto-fits the longest cached remote name (capped
+            # at half the row); the URL column takes the rest.
+            remote_name = item.id.split(":", 1)[1]
+            remote_url = ""
+            for n, u in menu.remotes_list:
+                if n == remote_name:
+                    remote_url = u
+                    break
+            name_w = max(8, max(
+                (len(n) for n, _ in menu.remotes_list), default=8))
+            name_w = min(name_w, max(8, (inner_w - 4) // 2))
+            sep = "  "
+            name_x = inner_x + len(col0)
+            url_x = name_x + name_w + len(sep)
+            url_w = max(1, inner_w - (url_x - inner_x))
+            # Background paint for the whole row first so attrs
+            # stay contiguous when reverse-video kicks in.
+            safe_addstr(stdscr, line, inner_x, " " * inner_w, attr)
+            safe_addstr(stdscr, line, inner_x, col0, attr)
+            # Determine per-column display + per-column attrs based
+            # on which (if any) field is being edited inline.
+            if inline_editing and menu.edit_field == "rename_remote":
+                name_text = f"{menu.edit_typed}_"
+                name_attr = sb | curses.A_REVERSE
+                url_text = remote_url
+                url_attr = attr
+            elif inline_editing and menu.edit_field == "set_url_remote":
+                name_text = remote_name
+                name_attr = attr
+                url_text = f"{menu.edit_typed}_"
+                url_attr = sb | curses.A_REVERSE
+            else:
+                name_text = remote_name
+                url_text = remote_url
+                name_attr = attr
+                url_attr = attr
+            safe_addstr(stdscr, line, name_x,
+                        end_truncate(name_text, name_w).ljust(name_w),
+                        name_attr)
+            safe_addstr(stdscr, line, url_x,
+                        end_truncate(url_text, url_w).ljust(url_w),
+                        url_attr)
+        elif inline_editing:
+            # Non-remote inline edits (add_remote_name /
+            # add_remote_url) replace the whole row label with the
+            # editable buffer cell. The `_` glyph is a fake cursor.
+            if menu.edit_field == "add_remote_name":
+                cell = f"name: {menu.edit_typed}_"
+            elif menu.edit_field == "add_remote_url":
+                cell = f"url: {menu.edit_typed}_"
+            else:
+                cell = menu.edit_typed + "_"
+            full = (col0 + cell).ljust(inner_w)
+            safe_addstr(stdscr, line, inner_x, full[:inner_w],
+                        sb | curses.A_REVERSE)
+        else:
+            # Whole-row paint so reverse-video stays contiguous,
+            # then overlay the caret in its own attr when the row
+            # isn't focused — caret stays dim cyan against the
+            # dim/normal row, and the focused row's reverse-video
+            # still reads cleanly.
+            full = (col0 + label).ljust(inner_w)
+            safe_addstr(stdscr, line, inner_x, full[:inner_w], attr)
+            if item.has_submenu and not focused:
+                caret_attr = (curses.color_pair(PAIR_SB_CYAN)
+                              | curses.A_DIM)
+                safe_addstr(stdscr, line, inner_x, "›", caret_attr)
+        line += 1
+        rendered += 1
+    # Pad any remaining reserved rows so the layout below the action
+    # items doesn't shift between main and submenu views.
+    for _ in range(n_items - rendered):
+        safe_addstr(stdscr, line, inner_x, " " * inner_w, sb)
         line += 1
 
     # Bottom-pane separator
@@ -857,19 +1283,27 @@ def handle_action_menu_key(state: State, key: int) -> None:
         handle_diff_viewer_key(state, key)
         return
 
+    # Confirm prompt and inline edit modes intercept everything.
+    # Both modes have their own Esc semantics (cancel mode, not
+    # close modal), so they must run before the global Esc handler.
+    if menu.confirm_message:
+        _handle_confirm_key(state, menu, key)
+        return
+    if menu.edit_field:
+        _handle_inline_edit_key(state, menu, key)
+        return
+
     if key == 27:
         menu.cancel_event.set()
         state.action_menu = None
         return
 
     if key == curses.KEY_HOME:
-        # Jump to the first action item from anywhere.
+        # Home is "go to the top": collapse all submenu frames and
+        # snap to the first selectable main-menu entry.
         menu.pane_focus = False
-        menu.selected = 0
-        for i, it in enumerate(menu.items):
-            if it.enabled:
-                menu.selected = i
-                break
+        menu.submenu_stack.clear()
+        menu.selected = _first_actionable_index(menu.items)
         return
 
     if menu.pane_focus:
@@ -877,47 +1311,489 @@ def handle_action_menu_key(state: State, key: int) -> None:
         return
 
     # ---- Action-items navigation ----
-    # Tab closes the menu when focus is on the action items (not the pane).
+    # Tab closes the modal entirely from the action list (the bottom
+    # pane has its own Tab semantics — view diff).
     if key == 9:
         menu.cancel_event.set()
         state.action_menu = None
         return
-    if key == curses.KEY_UP and menu.items:
-        menu.selected = (menu.selected - 1) % len(menu.items)
+
+    items = _current_items(menu)
+    selected = _current_selected(menu)
+    in_submenu = _in_submenu(menu)
+
+    # Left arrow pops one submenu level. No-op on the main menu.
+    if key == curses.KEY_LEFT and in_submenu:
+        _exit_to_parent(menu)
         return
-    if key == curses.KEY_DOWN and menu.items:
-        if menu.selected >= len(menu.items) - 1:
-            # Down off the last item drops focus into the pane.
+
+    # Right arrow on a has_submenu opener pushes the matching frame.
+    if (key == curses.KEY_RIGHT and items
+            and 0 <= selected < len(items)
+            and items[selected].has_submenu
+            and items[selected].enabled):
+        _enter_submenu_for(menu, items[selected])
+        return
+
+    # R / D on a remote row activate rename / delete respectively.
+    # Enter is reserved for the most common change (set URL), so
+    # rename gets its own letter shortcut. D's confirm gate is
+    # there because losing a remote ref is mildly destructive.
+    if (key in (ord("r"), ord("R")) and items
+            and 0 <= selected < len(items)
+            and items[selected].id.startswith("remote:")):
+        item = items[selected]
+        name = item.id.split(":", 1)[1]
+        url = ""
+        for n, u in menu.remotes_list:
+            if n == name:
+                url = u
+                break
+        _begin_rename_remote(menu, name, url)
+        return
+    if (key in (ord("d"), ord("D")) and items
+            and 0 <= selected < len(items)
+            and items[selected].id.startswith("remote:")):
+        item = items[selected]
+        name = item.id.split(":", 1)[1]
+        url = ""
+        for n, u in menu.remotes_list:
+            if n == name:
+                url = u
+                break
+        _request_confirm(
+            menu,
+            f"Remove remote {name}? [y/N]",
+            "remove_remote",
+            {"name": name, "url": url})
+        return
+
+    if key == curses.KEY_UP and items:
+        _set_current_selected(menu,
+                              _step_selection(items, selected, -1))
+        return
+    if key == curses.KEY_DOWN and items:
+        next_idx = _step_selection(items, selected, +1, no_wrap=True)
+        if next_idx == selected and not in_submenu:
+            # Down past the last selectable item on the main menu
+            # drops focus into the bottom pane. Submenus don't have
+            # this fall-through — the pane belongs to the top level.
             menu.pane_focus = True
             return
-        menu.selected += 1
+        _set_current_selected(menu, next_idx)
         return
-    if key in (10, 13, curses.KEY_ENTER) and menu.items:
-        item = menu.items[menu.selected]
-        if not item.enabled:
+    if key in (10, 13, curses.KEY_ENTER) and items:
+        item = items[selected]
+        if not item.enabled or item.is_separator:
             return
-        if item.id == "switch_branch":
-            from .branch_picker import open_branch_picker
-            open_branch_picker(state)
+        if item.is_back:
+            _exit_to_parent(menu)
             return
-        if item.id == "merge_branch":
-            from .branch_picker import open_branch_picker
-            open_branch_picker(state, mode="merge")
+        if item.has_submenu:
+            _enter_submenu_for(menu, item)
             return
-        if item.id == "branch_from_head":
-            from .branch_name_prompt import open_branch_name_prompt
-            open_branch_name_prompt(state)
+        # Leaf action — dispatch.
+        _dispatch_action(state, menu, item)
+
+
+def _step_selection(items: List[ActionMenuItem], current: int,
+                    direction: int, *, no_wrap: bool = False) -> int:
+    """Move the cursor by `direction` (±1) over the items list,
+    skipping non-selectable rows (separators, disabled, etc.). When
+    `no_wrap` is True, returns `current` if the move would wrap —
+    used by KEY_DOWN to fall off the end into the bottom pane on the
+    main menu."""
+    n = len(items)
+    if n == 0:
+        return current
+    idx = current
+    for _ in range(n):
+        idx = idx + direction
+        if no_wrap and (idx < 0 or idx >= n):
+            return current
+        idx %= n
+        item = items[idx]
+        if item.is_separator:
+            continue
+        return idx
+    return current
+
+
+def _exit_to_parent(menu: ActionMenu) -> None:
+    """Pop one submenu frame and snap the parent's cursor onto the
+    opener that led here, so users return where they came from."""
+    if not menu.submenu_stack:
+        return
+    leaving = menu.submenu_stack[-1]
+    _pop_submenu(menu)
+    parent_items = _current_items(menu)
+    target_id = ""
+    if leaving.name in ("branch", "actions", "stashes", "remotes"):
+        target_id = f"{leaving.name}_submenu"
+    elif leaving.name.startswith("stash:"):
+        target_id = f"stash:{leaving.name.split(':', 1)[1]}"
+    if target_id:
+        for i, it in enumerate(parent_items):
+            if it.id == target_id:
+                _set_current_selected(menu, i)
+                return
+
+
+def _enter_submenu_for(menu: ActionMenu, item: ActionMenuItem) -> None:
+    """Push the submenu frame that corresponds to a has_submenu
+    opener. Builds items dynamically — branch/actions read from the
+    cached meta dict, stashes from the cached stash list, per-stash
+    from the chosen ref."""
+    meta = menu.cached_meta or {}
+    if item.id == "branch_submenu":
+        _push_submenu(menu, "branch", "branch", _build_branch_items(meta))
+        return
+    if item.id == "actions_submenu":
+        _push_submenu(menu, "actions", "actions",
+                      _build_actions_items(meta))
+        return
+    if item.id == "stashes_submenu":
+        # Refresh the cached stash list every time the submenu opens
+        # so a freshly-created stash shows up without needing the
+        # whole modal to reopen.
+        from git_ops import list_stashes
+        menu.stashes = list_stashes(menu.target_path)
+        menu.stash_count = len(menu.stashes)
+        menu.items = _build_main_items(
+            meta, stash_count=menu.stash_count,
+            remote_count=menu.remote_count)
+        _push_submenu(menu, "stashes", "stashes",
+                      _build_stashes_items(menu.stashes))
+        return
+    if item.id == "remotes_submenu":
+        # Refresh remotes on entry the same way stashes does — picks
+        # up renames / additions made by an external git command.
+        from git_ops import list_remotes
+        menu.remotes_list = list_remotes(menu.target_path)
+        menu.remote_count = len(menu.remotes_list)
+        menu.items = _build_main_items(
+            meta, stash_count=menu.stash_count,
+            remote_count=menu.remote_count)
+        _push_submenu(menu, "remotes", "remotes",
+                      _build_remotes_items(menu.remotes_list))
+        return
+    if item.id.startswith("stash:"):
+        ref = item.id.split(":", 1)[1]
+        # Use the ref as the breadcrumb segment label so the user
+        # sees `repo › stashes › stash@{0}`.
+        _push_submenu(menu, f"stash:{ref}", ref,
+                      _build_stash_apply_items(ref))
+        return
+
+
+# Remote-name allowlist — matches branch_name_prompt's character
+# set, since git remote names follow the same shape rules.
+_VALID_REMOTE_NAME_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    "0123456789-_./"
+)
+
+
+def _begin_rename_remote(menu: ActionMenu, name: str, url: str) -> None:
+    """Activate inline rename mode on a remote row. The current name
+    is pre-filled in the buffer with the cursor at the end, so the
+    user starts editing the existing value rather than retyping from
+    scratch."""
+    menu.edit_field = "rename_remote"
+    menu.edit_typed = name
+    menu.edit_pre_value = name
+    menu.edit_target_id = f"remote:{name}"
+    menu.edit_extra = {"url": url}
+
+
+def _begin_set_url_remote(menu: ActionMenu, name: str,
+                          url: str) -> None:
+    """Activate inline URL-edit mode on a remote row. Pre-fills the
+    buffer with the current URL — Enter on the remote row starts
+    here (the more common edit), R re-routes to the rename path."""
+    menu.edit_field = "set_url_remote"
+    menu.edit_typed = url
+    menu.edit_pre_value = url
+    menu.edit_target_id = f"remote:{name}"
+    menu.edit_extra = {"name": name, "old_url": url}
+
+
+def _begin_new_remote_name(menu: ActionMenu) -> None:
+    """Step 1 of the new-remote inline flow: capture the name."""
+    menu.edit_field = "add_remote_name"
+    menu.edit_typed = ""
+    menu.edit_pre_value = ""
+    menu.edit_target_id = "new_remote"
+    menu.edit_extra = {}
+
+
+def _begin_new_remote_url(menu: ActionMenu, name: str) -> None:
+    """Step 2 of the new-remote flow: now that we have a name,
+    capture the URL. Empty URL is invalid and refuses to advance."""
+    menu.edit_field = "add_remote_url"
+    menu.edit_typed = ""
+    menu.edit_pre_value = ""
+    menu.edit_target_id = "new_remote"
+    menu.edit_extra = {"name": name}
+
+
+def _cancel_inline_edit(menu: ActionMenu) -> None:
+    menu.edit_field = ""
+    menu.edit_typed = ""
+    menu.edit_pre_value = ""
+    menu.edit_target_id = ""
+    menu.edit_extra = {}
+
+
+def _request_confirm(menu: ActionMenu, message: str, action: str,
+                     args: "dict[str, str]") -> None:
+    """Show a y/N confirm strip and stash the action to run on Y."""
+    menu.confirm_message = message
+    menu.confirm_action = action
+    menu.confirm_args = dict(args)
+
+
+def _clear_confirm(menu: ActionMenu) -> None:
+    menu.confirm_message = ""
+    menu.confirm_action = ""
+    menu.confirm_args = {}
+
+
+def _apply_remote_op(state: State, menu: ActionMenu) -> None:
+    """Build a single-op RemoteRow that matches the pending confirm
+    action and hand it to `kick_off_remote_changes`. The same
+    pipeline that powers the standalone remotes modal handles the
+    operation order and task-label rendering."""
+    from models import RemoteRow
+    from workers import kick_off_remote_changes
+    args = menu.confirm_args
+    row: Optional[RemoteRow] = None
+    if menu.confirm_action == "rename_remote":
+        old = args.get("old", "")
+        new = args.get("new", "")
+        url = args.get("url", "")
+        row = RemoteRow(
+            original_name=old, original_url=url,
+            name=new, url=url, is_new=False)
+    elif menu.confirm_action == "set_url_remote":
+        name = args.get("name", "")
+        new_url = args.get("url", "")
+        old_url = args.get("old_url", "")
+        row = RemoteRow(
+            original_name=name, original_url=old_url,
+            name=name, url=new_url, is_new=False)
+    elif menu.confirm_action == "remove_remote":
+        old = args.get("name", "")
+        url = args.get("url", "")
+        row = RemoteRow(
+            original_name=old, original_url=url,
+            name=old, url=url, to_delete=True, is_new=False)
+    elif menu.confirm_action == "add_remote":
+        new_name = args.get("name", "")
+        new_url = args.get("url", "")
+        row = RemoteRow(
+            original_name="", original_url="",
+            name=new_name, url=new_url,
+            to_delete=False, is_new=True)
+    if row is None:
+        return
+    kick_off_remote_changes(
+        state, [row],
+        target_label=menu.target_label,
+        target_path=menu.target_path,
+        target_repo=menu.target_repo,
+    )
+    # Update the cached remotes optimistically so the visible list
+    # reflects the change — the worker's refresh will reconcile any
+    # mismatch on the next loader tick.
+    if menu.confirm_action == "rename_remote":
+        old = args.get("old", "")
+        new = args.get("new", "")
+        url = args.get("url", "")
+        menu.remotes_list = [(new if name == old else name, u)
+                             for name, u in menu.remotes_list]
+        if url and not any(u for n, u in menu.remotes_list if n == new):
+            pass  # keep cached url as-is on mismatch
+    elif menu.confirm_action == "set_url_remote":
+        name = args.get("name", "")
+        new_url = args.get("url", "")
+        menu.remotes_list = [
+            (n, new_url if n == name else u)
+            for n, u in menu.remotes_list
+        ]
+    elif menu.confirm_action == "remove_remote":
+        gone = args.get("name", "")
+        menu.remotes_list = [(n, u) for n, u in menu.remotes_list
+                             if n != gone]
+        menu.remote_count = len(menu.remotes_list)
+    elif menu.confirm_action == "add_remote":
+        new_name = args.get("name", "")
+        new_url = args.get("url", "")
+        menu.remotes_list = list(menu.remotes_list) + [
+            (new_name, new_url)]
+        menu.remote_count = len(menu.remotes_list)
+    # Re-render the live frame and main-menu opener label.
+    if menu.submenu_stack and menu.submenu_stack[-1].name == "remotes":
+        top = menu.submenu_stack[-1]
+        top.items = _build_remotes_items(menu.remotes_list)
+        if top.selected >= len(top.items):
+            top.selected = _first_actionable_index(top.items)
+    menu.items = _build_main_items(
+        menu.cached_meta or {},
+        stash_count=menu.stash_count,
+        remote_count=menu.remote_count)
+
+
+def _handle_inline_edit_key(state: State, menu: ActionMenu,
+                            key: int) -> None:
+    """Keystrokes while an inline editable field has focus.
+
+    - typing appends to the buffer (allowlist for names; printable
+      ASCII for URLs since git URLs use `:`, `@`, `/`, etc. that
+      aren't in the name allowlist),
+    - Backspace pops a char,
+    - Enter advances or fires the confirm prompt,
+    - Esc cancels the entire flow (revert to nav mode)."""
+    field = menu.edit_field
+    if key == 27:  # Esc — cancel out of inline edit
+        _cancel_inline_edit(menu)
+        return
+    if key in (10, 13, curses.KEY_ENTER):
+        text = menu.edit_typed.strip()
+        if not text:
+            return  # empty value — refuse to advance
+        if field == "rename_remote":
+            old = menu.edit_pre_value
+            url = menu.edit_extra.get("url", "")
+            if text == old:
+                _cancel_inline_edit(menu)
+                return
+            if text.startswith("-"):
+                return
+            _cancel_inline_edit(menu)
+            _request_confirm(
+                menu,
+                f"Rename remote {old} → {text}? [y/N]",
+                "rename_remote",
+                {"old": old, "new": text, "url": url})
             return
-        if item.id == "soft_reset":
-            from .reset_prompt import open_reset_prompt
-            open_reset_prompt(state)
+        if field == "set_url_remote":
+            name = menu.edit_extra.get("name", "")
+            old_url = menu.edit_extra.get("old_url", "")
+            if text == old_url:
+                _cancel_inline_edit(menu)
+                return
+            if text.startswith("-"):
+                return
+            _cancel_inline_edit(menu)
+            _request_confirm(
+                menu,
+                f"Set {name} URL → {text}? [y/N]",
+                "set_url_remote",
+                {"name": name, "url": text, "old_url": old_url})
             return
-        if item.id == "run_workflow":
-            from .workflow_picker import open_workflow_picker
-            open_workflow_picker(state)
+        if field == "add_remote_name":
+            if text.startswith("-"):
+                return
+            # Refuse a name that already exists locally.
+            if any(n == text for n, _ in menu.remotes_list):
+                return
+            _begin_new_remote_url(menu, text)
             return
+        if field == "add_remote_url":
+            if text.startswith("-"):
+                return
+            name = menu.edit_extra.get("name", "")
+            _cancel_inline_edit(menu)
+            _request_confirm(
+                menu,
+                f"Add remote {name} → {text}? [y/N]",
+                "add_remote",
+                {"name": name, "url": text})
+            return
+        return
+    if key in (curses.KEY_BACKSPACE, 127, 8):
+        menu.edit_typed = menu.edit_typed[:-1]
+        return
+    if 32 <= key < 127:
+        ch = chr(key)
+        if field in ("rename_remote", "add_remote_name"):
+            if not menu.edit_typed and ch == "-":
+                return
+            if ch in _VALID_REMOTE_NAME_CHARS:
+                menu.edit_typed += ch
+        elif field in ("add_remote_url", "set_url_remote"):
+            # URLs accept any printable ASCII char so user can paste
+            # `git@github.com:user/repo.git` without us silently
+            # filtering colon / at-sign / slash.
+            menu.edit_typed += ch
+
+
+def _handle_confirm_key(state: State, menu: ActionMenu,
+                        key: int) -> None:
+    """y/N strip dismisses on Esc, applies on y, cancels on n."""
+    if key in (ord("y"), ord("Y")):
+        _apply_remote_op(state, menu)
+        _clear_confirm(menu)
+        return
+    if key in (ord("n"), ord("N"), 27):
+        _clear_confirm(menu)
+        return
+
+
+def _dispatch_action(state: State, menu: ActionMenu,
+                     item: ActionMenuItem) -> None:
+    """Run a leaf action item. Each branch maps the item id to the
+    right open-modal call or kick_off_action invocation. Generic
+    branch_arg ids (`stash_apply:<ref>`) get split before dispatch."""
+    if item.id == "switch_branch":
+        from .branch_picker import open_branch_picker
+        open_branch_picker(state)
+        return
+    if item.id == "merge_branch":
+        from .branch_picker import open_branch_picker
+        open_branch_picker(state, mode="merge")
+        return
+    if item.id == "set_upstream":
+        from .branch_picker import open_branch_picker
+        open_branch_picker(state, mode="set_upstream")
+        return
+    if item.id == "branch_from_head":
+        from .branch_name_prompt import open_branch_name_prompt
+        open_branch_name_prompt(state)
+        return
+    if item.id == "rename_branch":
+        from .branch_name_prompt import open_branch_name_prompt
+        open_branch_name_prompt(state, mode="rename")
+        return
+    if item.id == "soft_reset":
+        from .reset_prompt import open_reset_prompt
+        open_reset_prompt(state)
+        return
+    if item.id == "run_workflow":
+        from .workflow_picker import open_workflow_picker
+        open_workflow_picker(state)
+        return
+    if item.id == "new_remote":
+        _begin_new_remote_name(menu)
+        return
+    if item.id.startswith("remote:"):
+        # Enter on a remote row activates inline URL edit (the more
+        # common change). The in-place buffer is pre-filled with the
+        # current URL — cursor at the end so the user can backspace
+        # to clear or arrow to a position. Rename is on R; delete
+        # is on D.
+        name = item.id.split(":", 1)[1]
+        url = ""
+        for n, u in menu.remotes_list:
+            if n == name:
+                url = u
+                break
+        _begin_set_url_remote(menu, name, url)
+        return
+    if item.id == "stash_create":
         kick_off_action(
-            state, item.id,
+            state, "stash_create",
             target_label=menu.target_label,
             target_path=menu.target_path,
             target_repo=menu.target_repo,
@@ -925,6 +1801,30 @@ def handle_action_menu_key(state: State, key: int) -> None:
         )
         menu.cancel_event.set()
         state.action_menu = None
+        return
+    if item.id.startswith("stash_apply:"):
+        ref = item.id.split(":", 1)[1]
+        kick_off_action(
+            state, "stash_apply",
+            target_label=menu.target_label,
+            target_path=menu.target_path,
+            target_repo=menu.target_repo,
+            target_parent=menu.target_parent,
+            branch_arg=ref,
+        )
+        menu.cancel_event.set()
+        state.action_menu = None
+        return
+    # Generic leaf action — fetch / pull / push / etc.
+    kick_off_action(
+        state, item.id,
+        target_label=menu.target_label,
+        target_path=menu.target_path,
+        target_repo=menu.target_repo,
+        target_parent=menu.target_parent,
+    )
+    menu.cancel_event.set()
+    state.action_menu = None
 
 
 def _handle_pane_key(state: State, menu: ActionMenu, key: int) -> None:
