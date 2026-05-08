@@ -1,17 +1,22 @@
 """Defaults, the Config dataclass, and the conf-file loaders.
 
 Configuration lives in two files under the per-user state directory
-(`USER_STATE_DIR`, overridable via IDLEGIT_CONFIG_DIR):
+(`USER_STATE_DIR`):
   - idlegit.conf — global defaults (display, suggestion, LFS, action
-    polling…). Restart idlegit to pick up edits.
-  - idlegit.workspaces — one or more named workspaces, each with its own
-    folder list, optional setting overrides, and optional subtree
-    declarations. Workspaces are switchable at runtime via the title-row
-    selector; the workspace-overrides modal persists changes back here.
+    polling…). Restart idlegit to pick up edits. On first run, the
+    bundled `idlegit.default.conf` template is copied into place.
+  - idlegit.workspaces — one or more named workspaces, each with its
+    own folder list, optional setting overrides, and optional subtree
+    declarations. Workspaces are switchable at runtime via the
+    title-row selector; the workspace-overrides modal persists
+    changes back here. No template — the first-run creator wizard
+    writes the file when the user commits their first workspace.
 
-On first run after an upgrade, files previously kept next to the
-application (``TOOL_DIR``) are copied into ``USER_STATE_DIR`` if the new
-location is still empty for that file.
+Resolution order for `USER_STATE_DIR`:
+  1. `USER_STATE_DIR_OVERRIDE` (set explicitly below in this file)
+  2. `IDLEGIT_CONFIG_DIR` env var
+  3. OS-default (Library/Application Support / %APPDATA% /
+     XDG_CONFIG_HOME)
 """
 from __future__ import annotations
 
@@ -28,16 +33,61 @@ from models import SubtreeSpec, Workspace
 TOOL_DIR = Path(__file__).resolve().parent
 
 
+def _read_version() -> str:
+    """Pull the version string from the `VERSION` file beside this
+    module. Only the first non-blank, non-comment line counts —
+    anything below is free-form (release notes, scratch space) and
+    is ignored. Falls back to `"0.0.0"` if the file is missing or
+    empty so a broken install fails loudly later (e.g. the updater
+    will think every release is newer) rather than at import time."""
+    path = TOOL_DIR / "VERSION"
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            return stripped
+    except OSError:
+        pass
+    return "0.0.0"
+
+
+VERSION = _read_version()
+
+# `<owner>/<repo>` for the upstream GitHub project. Drives the update
+# script (`update.py`), which queries the Releases API for newer
+# versions and downloads the source tarball when one is found.
+GITHUB_REPO = "jtelwar/Idlegit"
+
+# Set this to a Path to force `idlegit.conf` / `idlegit.workspaces` to
+# live in a specific directory regardless of the OS or the
+# `IDLEGIT_CONFIG_DIR` env var. None → fall through to the env var,
+# then the OS default (see `user_state_dir`). Useful when vendoring
+# the app or pinning state for a sandboxed install.
+USER_STATE_DIR_OVERRIDE: "Path | None" = None
+
+# Filename of the bundled config template that gets copied into
+# `USER_STATE_DIR` as `idlegit.conf` on first run. The template lives
+# beside this module (TOOL_DIR) — repo source ships
+# `idlegit.default.conf`; the installer copies it through unchanged.
+DEFAULT_CONFIG_TEMPLATE = "idlegit.default.conf"
+
+
 def user_state_dir() -> Path:
     """Directory for ``idlegit.conf`` and ``idlegit.workspaces``.
 
-    Override with the ``IDLEGIT_CONFIG_DIR`` environment variable (any
-    platform). Otherwise:
-
-    - **macOS:** ``~/Library/Application Support/idlegit``
-    - **Windows:** ``%APPDATA%\\idlegit`` (or ``%USERPROFILE%\\AppData\\Roaming\\idlegit``)
-    - **Other (Linux, etc.):** ``$XDG_CONFIG_HOME/idlegit`` or ``~/.config/idlegit``
+    Resolution order (first hit wins):
+      1. ``USER_STATE_DIR_OVERRIDE`` set in this file
+      2. ``IDLEGIT_CONFIG_DIR`` env var
+      3. OS default —
+         - **macOS:** ``~/Library/Application Support/idlegit``
+         - **Windows:** ``%APPDATA%\\idlegit`` (or
+           ``%USERPROFILE%\\AppData\\Roaming\\idlegit``)
+         - **Other (Linux, etc.):** ``$XDG_CONFIG_HOME/idlegit``
+           or ``~/.config/idlegit``
     """
+    if USER_STATE_DIR_OVERRIDE is not None:
+        return Path(USER_STATE_DIR_OVERRIDE).expanduser().resolve()
     override = os.environ.get("IDLEGIT_CONFIG_DIR", "").strip()
     if override:
         return Path(override).expanduser().resolve()
@@ -60,27 +110,27 @@ CONFIG_FILE = USER_STATE_DIR / "idlegit.conf"
 WORKSPACES_FILE = USER_STATE_DIR / "idlegit.workspaces"
 
 
-def _migrate_if_missing(dest: Path) -> None:
-    """Copy ``idlegit.conf`` / ``idlegit.workspaces`` from next to the
-    application into ``dest`` if the user has no file there yet."""
-    legacy = TOOL_DIR / dest.name
-    if dest.exists() or not legacy.exists():
-        return
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(legacy, dest)
-
-
 def _ensure_config_ready() -> None:
+    """Make sure the user has a writable `idlegit.conf` to read from.
+    On first run we seed it from the bundled `idlegit.default.conf`
+    template; once it exists we never overwrite it (the installer's
+    merge_config step layers in any new keys without clobbering
+    user values)."""
     CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-    _migrate_if_missing(CONFIG_FILE)
+    if CONFIG_FILE.exists():
+        return
+    template = TOOL_DIR / DEFAULT_CONFIG_TEMPLATE
+    if template.is_file():
+        shutil.copy2(template, CONFIG_FILE)
 
 
 def _ensure_workspaces_file_ready() -> None:
+    """Just guarantee the parent dir exists. There's no template for
+    workspaces — the file is written when the user commits their
+    first workspace via the creator wizard, and an absent file is a
+    valid first-run signal upstream."""
     WORKSPACES_FILE.parent.mkdir(parents=True, exist_ok=True)
-    _migrate_if_missing(WORKSPACES_FILE)
 
-
-VERSION = "0.5.2"
 # Shown in the curses UI title row, modals, and terminal title (OSC).
 APP_DISPLAY_NAME = "Idlegit"
 _CONFIG_WARNINGS: List[str] = []

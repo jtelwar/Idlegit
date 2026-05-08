@@ -9,7 +9,7 @@ from models import ChildRef, Repo, State
 from config import APP_DISPLAY_NAME, VERSION, WORKSPACES_FILE
 from .colors import (
     PAIR_AHEAD, PAIR_BEHIND, PAIR_BRANCH, PAIR_DIRTY, PAIR_ERR, PAIR_HEADER,
-    PAIR_OK, child_state_color, state_color,
+    PAIR_HEADER_ACTIVE, PAIR_OK, child_state_color, state_color,
 )
 from .geometry import clamp_scroll, field_visible, safe_addstr, truncate
 from .hints import (
@@ -18,7 +18,8 @@ from .hints import (
 )
 from .modals import (
     draw_action_menu, draw_align_heads_prompt, draw_branch_name_prompt,
-    draw_branch_picker, draw_clone_modal, draw_detached_recovery_prompt,
+    draw_branch_picker, draw_clone_modal, draw_commit_view_modal,
+    draw_detached_recovery_prompt,
     draw_diff_viewer, draw_remotes_modal, draw_reset_prompt,
     draw_task_action_menu, draw_workflow_picker,
     draw_workspace_creator, draw_workspace_menu, draw_workspaces_picker,
@@ -201,15 +202,14 @@ def draw_main(stdscr, state: State) -> None:
 
     # Row 0 — Idlegit title (selectable; Tab opens the workspaces
     # picker) followed by a muted version label where the workspace
-    # name used to live. Title focus is signalled by brightness: the
-    # text is dim when unfocused and full-bright when focused. No
-    # chevrons here — those are reserved for ←/→ switchers like the
-    # workspace selector below.
+    # name used to live. Focus is signalled by a brighter shade —
+    # at-rest is bold magenta (PAIR_HEADER), focused steps up to
+    # orchid2 (PAIR_HEADER_ACTIVE). No chevrons here — those are
+    # reserved for ←/→ switchers like the workspace selector below.
     title_focused = (state.on_title_row
                      and state.focused_panel == "repos")
-    title_attr = curses.A_BOLD | curses.color_pair(PAIR_HEADER)
-    if not title_focused:
-        title_attr |= curses.A_DIM
+    title_pair = (PAIR_HEADER_ACTIVE if title_focused else PAIR_HEADER)
+    title_attr = curses.A_BOLD | curses.color_pair(title_pair)
     safe_addstr(stdscr, 0, 0, APP_DISPLAY_NAME, title_attr)
     x = len(APP_DISPLAY_NAME)
     safe_addstr(stdscr, 0, x, " · ", curses.A_DIM)
@@ -366,7 +366,8 @@ def draw_main(stdscr, state: State) -> None:
                     or state.workspace_creator is not None
                     or state.diff_viewer is not None
                     or state.remotes_modal is not None
-                    or state.clone_modal is not None)
+                    or state.clone_modal is not None
+                    or state.commit_view_modal is not None)
     if state.action_menu is not None:
         draw_action_menu(stdscr, state, sidebar_x)
     if state.branch_picker is not None:
@@ -391,12 +392,16 @@ def draw_main(stdscr, state: State) -> None:
         draw_workspaces_picker(stdscr, state, sidebar_x)
     if state.workspace_creator is not None:
         draw_workspace_creator(stdscr, state, sidebar_x)
-    # Sub-modals of action_menu (remotes) and workspace_menu (clone)
-    # paint last so they layer on top of their parents.
+    # Sub-modals of action_menu (remotes, commit view) and
+    # workspace_menu (clone) paint last so they layer on top of
+    # their parents. The commit view goes above remotes/clone since
+    # it can be opened on top of the action menu's commits pane.
     if state.remotes_modal is not None:
         draw_remotes_modal(stdscr, state, sidebar_x)
     if state.clone_modal is not None:
         draw_clone_modal(stdscr, state, sidebar_x)
+    if state.commit_view_modal is not None:
+        draw_commit_view_modal(stdscr, state, sidebar_x)
     if state.diff_viewer is not None:
         draw_diff_viewer(stdscr, state, sidebar_x)
 

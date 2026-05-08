@@ -23,6 +23,16 @@ PAIR_WARN = 8
 PAIR_HEADER = 9
 PAIR_AHEAD = 10
 PAIR_BEHIND = 11
+# Extra-muted variant of PAIR_SB_FG, used for "unavailable" controls
+# (e.g. the right-pane toolbar's "stage all" button when every file
+# is already staged). On 256-colour terminals it's a dim grey;
+# fallback is PAIR_SB_FG + A_DIM at usage site for 8/16-colour TTYs.
+PAIR_SB_FG_DISABLED = 31
+# Focused-title accent — same magenta family as PAIR_HEADER but a
+# notch brighter so the focused row pops against the at-rest title
+# colour. 256-colour terminals get xterm orchid2 (213); fallback is
+# plain magenta + bold which matches PAIR_HEADER on 8-colour TTYs.
+PAIR_HEADER_ACTIVE = 30
 # Sidebar pairs share a darker bg so the panel reads as a distinct surface.
 PAIR_SB_FG = 12
 PAIR_SB_CYAN = 13
@@ -71,6 +81,11 @@ def init_colors() -> None:
     curses.init_pair(PAIR_ERR, curses.COLOR_RED, bg)
     curses.init_pair(PAIR_WARN, curses.COLOR_YELLOW, bg)
     curses.init_pair(PAIR_HEADER, curses.COLOR_MAGENTA, bg)
+    if curses.COLORS >= 256:
+        # orchid2 — bright pink-magenta, one shade above bold magenta.
+        curses.init_pair(PAIR_HEADER_ACTIVE, 213, bg)
+    else:
+        curses.init_pair(PAIR_HEADER_ACTIVE, curses.COLOR_MAGENTA, bg)
     curses.init_pair(PAIR_AHEAD, curses.COLOR_CYAN, bg)
     curses.init_pair(PAIR_BEHIND, curses.COLOR_MAGENTA, bg)
     sb_bg = curses.COLOR_BLACK
@@ -84,6 +99,13 @@ def init_colors() -> None:
     # header accent).
     sb_bg_active = 236 if curses.COLORS >= 256 else sb_bg
     curses.init_pair(PAIR_SB_FG, curses.COLOR_WHITE, sb_bg)
+    if curses.COLORS >= 256:
+        # xterm grey (240) — dimmer than COLOR_WHITE + A_DIM, gives a
+        # clearly "unavailable" look on the toolbar without mistaking
+        # for a missing/blank button.
+        curses.init_pair(PAIR_SB_FG_DISABLED, 240, sb_bg)
+    else:
+        curses.init_pair(PAIR_SB_FG_DISABLED, curses.COLOR_WHITE, sb_bg)
     curses.init_pair(PAIR_SB_CYAN, curses.COLOR_CYAN, sb_bg)
     curses.init_pair(PAIR_SB_OK, curses.COLOR_GREEN, sb_bg)
     curses.init_pair(PAIR_SB_ERR, curses.COLOR_RED, sb_bg)

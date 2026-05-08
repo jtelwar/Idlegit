@@ -1,2 +1,9 @@
 __pycache__/
 *.pyc
+
+# User state files — these live in USER_STATE_DIR (per-OS user
+# library location, see config.user_state_dir). Pattern-matched here
+# so an idlegit run executed from inside the repo can't accidentally
+# leak someone's workspace list back into the repo.
+idlegit.conf
+idlegit.workspaces

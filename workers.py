@@ -99,7 +99,8 @@ def _format_job_label(job_name: str, current_step: str = "") -> str:
 def _poll_run(state: State, slug: str, run_id: int,
               repo: Repo, workflow_name: str,
               run_task: Task,
-              pending_task: Optional[Task] = None) -> None:
+              pending_task: Optional[Task] = None,
+              pushed_sha: str = "") -> None:
     """Poll one run's detailed view until it terminates, mirroring its
     progress to the sidebar. Each job materialises as its own indented
     sub-task, and the parent task's label refreshes with the current step
@@ -207,14 +208,66 @@ def _poll_run(state: State, slug: str, run_id: int,
             # "Then run after <workflow>" chain — only fire on a clean
             # success. We pop the entry so a later push doesn't double-
             # fire (the user reset their selection on the next review).
+            # Two shapes:
+            #   * a workflow name → manual dispatch (existing path)
+            #   * "__add_tag__"   → tag the commit that triggered
+            #     this run with the buffered name. Falls back to
+            #     `git rev-parse HEAD` when no pushed_sha was
+            #     captured (manual-dispatch chain).
             if rstatus == "ok":
-                next_workflow = repo.then_run_after_workflow.pop(
+                next_target = repo.then_run_after_workflow.pop(
                     workflow_name, "")
-                if next_workflow:
+                if next_target == "__add_tag__":
+                    # Pop the slot's parameter bucket — currently
+                    # only "tag" lives in it, but the dict shape
+                    # leaves room for more inputs (e.g.
+                    # workflow_dispatch fields wired through the
+                    # same ParamSpec pattern in the future).
+                    params = repo.then_run_params_after_workflow.pop(
+                        workflow_name, {})
+                    tag_name = params.get("tag", "").strip()
+                    sha = pushed_sha
+                    if not sha:
+                        rc_h, head_out, _ = git(
+                            repo.path, ["rev-parse", "HEAD"])
+                        sha = head_out.strip() if rc_h == 0 else ""
+                    tag_label = (
+                        f"  ↪ tag {tag_name}" if tag_name
+                        else "  ↪ tag (empty name)")
+                    if pending_task is not None:
+                        state.tasks.set_label(pending_task, tag_label)
+                        state.tasks.update(pending_task, "running", "")
+                        tag_task = pending_task
+                    else:
+                        tag_task = state.tasks.add(tag_label,
+                                                   parent=run_task)
+                    if not tag_name or tag_name.startswith("-"):
+                        state.tasks.update(
+                            tag_task, "fail",
+                            "tag name empty or unsafe")
+                    elif not sha:
+                        state.tasks.update(
+                            tag_task, "fail", "no sha to tag")
+                    else:
+                        rc_t, _, err_t = git(
+                            repo.path, ["tag", tag_name, sha])
+                        state.tasks.update(
+                            tag_task,
+                            "ok" if rc_t == 0 else "fail",
+                            "" if rc_t == 0 else first_line(err_t))
+                elif next_target:
                     branch = repo.branch or "main"
+                    # Pop the per-workflow input buffer the same
+                    # way the add-tag branch above pops its tag
+                    # buffer — keeps a follow-up run from
+                    # re-dispatching with stale -F values.
+                    chain_inputs = (
+                        repo.then_run_params_after_workflow.pop(
+                            workflow_name, {}))
                     kick_off_manual_dispatch(
-                        state, repo, next_workflow, branch,
-                        existing_task=pending_task)
+                        state, repo, next_target, branch,
+                        existing_task=pending_task,
+                        inputs=chain_inputs)
             elif pending_task is not None:
                 # Parent didn't succeed — the chain is dead. Mark the
                 # placeholder so the user can see the chain was skipped
@@ -238,10 +291,17 @@ def _poll_run(state: State, slug: str, run_id: int,
 
 
 def kick_off_workflow_tracking(state: State, slug: str, run: dict,
-                               repo: Repo) -> Optional[Task]:
+                               repo: Repo,
+                               pushed_sha: str = "") -> Optional[Task]:
     """Add a sidebar task for a known GitHub Actions run and spawn a daemon
     that updates it (and its job sub-tasks) until completion. Returns the
     parent task on success, or None when the run dict is unusable.
+
+    `pushed_sha` (when supplied) is the commit that triggered this
+    run — used by `_poll_run` to tag the right commit if the
+    repo has wired up an "__add_tag__" then-run for this workflow.
+    Empty when called from a manual dispatch path; the tag fallback
+    in `_poll_run` reads HEAD at that moment in that case.
 
     If the repo has a chained then-run wired up for `workflow_name`,
     we insert its `pending`-status placeholder row SYNCHRONOUSLY here,
@@ -262,8 +322,19 @@ def kick_off_workflow_tracking(state: State, slug: str, run: dict,
     pending_then_run = repo.then_run_after_workflow.get(workflow_name, "")
     pending_task: Optional[Task] = None
     if pending_then_run:
-        pending_task = state.tasks.add(
-            f"  ↪ then run: {pending_then_run}", parent=t)
+        # Pretty up the placeholder when the chain is "add tag" —
+        # the user-facing label says "tag <name>" so the row reads
+        # like a real action rather than the sentinel.
+        if pending_then_run == "__add_tag__":
+            tag_name = (repo.then_run_params_after_workflow
+                        .get(workflow_name, {})
+                        .get("tag", ""))
+            placeholder_label = (
+                f"  ↪ then run: tag {tag_name}" if tag_name
+                else "  ↪ then run: tag (name unset)")
+        else:
+            placeholder_label = f"  ↪ then run: {pending_then_run}"
+        pending_task = state.tasks.add(placeholder_label, parent=t)
         state.tasks.update(pending_task, "pending",
                            f"waiting on {workflow_name}")
         state.tasks.set_meta(
@@ -273,7 +344,8 @@ def kick_off_workflow_tracking(state: State, slug: str, run: dict,
 
     threading.Thread(
         target=_poll_run,
-        args=(state, slug, run_id, repo, workflow_name, t, pending_task),
+        args=(state, slug, run_id, repo, workflow_name, t, pending_task,
+              pushed_sha),
         daemon=True,
     ).start()
     return t
@@ -312,7 +384,8 @@ def kick_off_post_push_run_tracking(state: State, repo: Repo, branch: str,
                     continue
                 seen.add(rid)
                 remaining.discard(wf)
-                kick_off_workflow_tracking(state, slug, run, repo)
+                kick_off_workflow_tracking(
+                    state, slug, run, repo, pushed_sha=sha)
             if remaining:
                 time.sleep(poll_interval)
         for wf in remaining:
@@ -324,7 +397,9 @@ def kick_off_post_push_run_tracking(state: State, repo: Repo, branch: str,
 
 def kick_off_manual_dispatch(state: State, target_repo: Repo,
                              workflow_name: str, ref: str,
-                             *, existing_task: Optional[Task] = None) -> None:
+                             *, existing_task: Optional[Task] = None,
+                             inputs: "Optional[dict[str, str]]" = None
+                             ) -> None:
     """Fire `gh workflow run` for `workflow_name` against `ref`, then poll
     for the resulting run id and hand off to kick_off_workflow_tracking.
     workflow_dispatch runs don't carry a commit filter, so we identify the
@@ -333,7 +408,15 @@ def kick_off_manual_dispatch(state: State, target_repo: Repo,
 
     `existing_task` lets a chained then-run reuse the placeholder row
     that `_poll_run` added in `pending` state, so the dispatch step
-    transforms in place rather than spawning a fresh row alongside it."""
+    transforms in place rather than spawning a fresh row alongside it.
+
+    `inputs` (when supplied) maps `workflow_dispatch.inputs` names
+    to the values the user typed in the review screen's inline
+    param rows; non-empty entries are forwarded as `-F name=value`
+    by `dispatch_workflow`. Empty / missing keys leave the
+    workflow's declared default in place (or raise the canonical
+    "required input missing" gh error for required-but-blank
+    fields)."""
     slug = parse_github_slug(target_repo.remote_url_raw)
     repo_label = state.task_repo_label(target_repo)
     if not slug or not gh_available():
@@ -359,7 +442,8 @@ def kick_off_manual_dispatch(state: State, target_repo: Repo,
             f"↗ {repo_label}: dispatch {workflow_name}")
 
     def worker() -> None:
-        ok, msg = dispatch_workflow(slug, workflow_name, ref)
+        ok, msg = dispatch_workflow(slug, workflow_name, ref,
+                                    inputs=inputs)
         if not ok:
             state.tasks.update(dispatch_task, "fail", msg)
             return
@@ -780,6 +864,91 @@ def kick_off_remote_changes(state: State, modal_rows,
 # ---------- Clone --------------------------------------------------------
 
 
+def kick_off_load_commit_view(state: State, modal) -> None:
+    """Load a commit view modal's async fields (tags list, full
+    message body, file changes, HEAD reflog hits) in a single daemon
+    thread so the modal can render immediately with spinner
+    placeholders. Each field flips its respective `*_loading` flag
+    False as it lands; `cancel_event` short-circuits if the user
+    closes the modal while the queries are in flight."""
+    from git_ops import (
+        get_commit_details, list_tags_at, query_commit_files,
+        query_commit_reflog,
+    )
+
+    def worker() -> None:
+        try:
+            if modal.cancel_event.is_set():
+                return
+            modal.tags = list_tags_at(modal.target_path, modal.sha)
+            modal.tags_loading = False
+            if modal.cancel_event.is_set():
+                return
+            author, date, subject, body = get_commit_details(
+                modal.target_path, modal.sha)
+            modal.author = author
+            modal.date = date
+            # Subject was already populated from the CommitEntry the
+            # caller had on hand; only overwrite if the on-disk show
+            # disagrees (rare — mostly when the commit moved).
+            if subject and not modal.subject:
+                modal.subject = subject
+            modal.body = body
+            modal.details_loading = False
+            if modal.cancel_event.is_set():
+                return
+            modal.files = query_commit_files(modal.target_path, modal.sha)
+            modal.files_loading = False
+            if modal.cancel_event.is_set():
+                return
+            modal.reflog_entries = query_commit_reflog(
+                modal.target_path, modal.sha)
+        finally:
+            modal.tags_loading = False
+            modal.details_loading = False
+            modal.files_loading = False
+            modal.reflog_loading = False
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def kick_off_add_tag(state: State, target_label: str,
+                     target_path: Path,
+                     target_repo: Optional[Repo],
+                     target_parent: Optional[Repo],
+                     name: str, sha: str) -> None:
+    """Create a lightweight tag pointing at `sha`. Refuses unsafe
+    name / sha (defence-in-depth). Creating a tag is cardinal-rule
+    safe: it only writes a new ref. Pushing the tag is a separate
+    operation we don't run automatically."""
+    target_child = _find_child_at(target_parent, target_path)
+    if target_repo is not None:
+        target_repo.refreshing = True
+    if target_child is not None:
+        target_child.refreshing = True
+
+    def worker() -> None:
+        try:
+            t = state.tasks.add(f"{target_label}: tag {name}")
+            if not is_safe_ref_arg(name):
+                state.tasks.update(t, "fail", "unsafe tag name")
+                return
+            if not sha or sha.startswith("-"):
+                state.tasks.update(t, "fail", "unsafe sha")
+                return
+            rc, _, err = git(target_path, ["tag", name, sha])
+            state.tasks.update(
+                t, "ok" if rc == 0 else "fail",
+                "" if rc == 0 else first_line(err))
+        finally:
+            if target_repo is not None:
+                target_repo.refreshing = False
+            if target_child is not None:
+                target_child.refreshing = False
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
 def kick_off_clone(state: State, url: str, dest: Path, branch: str,
                    recurse_submodules: bool,
                    on_done=None) -> None:
@@ -874,24 +1043,53 @@ def _apply_staging_plan(target_path: Path,
                         staged_paths: "dict[str, bool]"
                         ) -> Tuple[bool, str]:
     """Bring the index in line with the user's per-file checkbox state.
-    `git add` for paths checked True; `git restore --staged` for paths
-    checked False. Both forms are passed explicit `--` paths and use
-    git plumbing that's idempotent for already-correct entries
-    (re-staging an already-staged path is a no-op, same for restoring
-    an already-unstaged path). Returns (ok, error_msg) — ok=False on
-    the first command failure, with the message ready for sidebar
-    display."""
+    `git add -A` for paths checked True (so deletions land too — plain
+    `git add` skips removed files); `git restore --staged` for paths
+    checked False. Stale entries — paths the user checked in the
+    review pane but that have since gone away (e.g. an external
+    `git rm` removed the file from both working tree and index) —
+    are filtered out by intersecting with current `git status` so
+    they don't trigger `pathspec did not match any files`. Returns
+    (ok, error_msg)."""
+    from git_ops import _iter_porcelain_z_entries  # local: avoid circ
     if not staged_paths:
         return True, ""
-    to_stage = sorted(p for p, on in staged_paths.items() if on)
-    to_unstage = sorted(p for p, on in staged_paths.items() if not on)
+    rc, status_out, _ = git(target_path,
+                            ["status", "--porcelain=v1", "-z"])
+    # Map of path → porcelain XY code so we can tell "already fully
+    # staged" (X non-space, Y space) apart from "has unstaged work
+    # left to capture". Empty when the status read fails — we play
+    # it safe and skip everything in that case.
+    current_status: "dict[str, str]" = {}
+    if rc == 0:
+        for xy, p in _iter_porcelain_z_entries(status_out):
+            current_status[p] = xy
+
+    def _needs_add(xy: str) -> bool:
+        """True when there's anything for `git add -A` to do for the
+        path. `X != ' '` and `Y == ' '` means the change is already
+        staged — a re-add is a no-op for modifications and an
+        outright error ("pathspec did not match") for staged
+        deletions, since the path is gone from both the working
+        tree and the index. Skipping these keeps the staging step
+        from blowing up on already-correct rows."""
+        return not (xy[0] != " " and xy[1] == " ")
+
+    to_stage = sorted(p for p, on in staged_paths.items()
+                      if on and p in current_status
+                      and _needs_add(current_status[p]))
+    to_unstage = sorted(p for p, on in staged_paths.items()
+                        if not on and p in current_status)
     if to_unstage:
         rc, _, err = git(target_path,
                          ["restore", "--staged", "--"] + to_unstage)
         if rc != 0:
             return False, first_line(err)
     if to_stage:
-        rc, _, err = git(target_path, ["add", "--"] + to_stage)
+        # `-A` so a path the user checked that's been deleted from
+        # the working tree (` D` in porcelain) still gets its
+        # deletion staged — plain `git add` skips removed files.
+        rc, _, err = git(target_path, ["add", "-A", "--"] + to_stage)
         if rc != 0:
             return False, first_line(err)
     return True, ""
@@ -934,7 +1132,8 @@ def kick_off_review_suggest(state: State, block: ReviewBlock) -> None:
 
 def commit_worker(state: State, repo: Repo, msg: str,
                   lfs_cands: List[LFSCandidate],
-                  staged_paths: Optional["dict[str, bool]"] = None) -> None:
+                  staged_paths: Optional["dict[str, bool]"] = None,
+                  amend: bool = False) -> None:
     """Run the full stage / commit / push / sync pipeline for one repo,
     publishing each step into the sidebar. After a successful push, kicks
     off GitHub Actions tracking for any workflows the user opted in to on
@@ -943,9 +1142,16 @@ def commit_worker(state: State, repo: Repo, msg: str,
     `staged_paths` (when provided) overrides the auto_stage default —
     only paths checked True end up in the index, anything checked
     False is unstaged before commit. None means "fall back to legacy
-    auto_stage semantics" for callers that haven't been ported yet."""
+    auto_stage semantics" for callers that haven't been ported yet.
+
+    `amend=True` swaps the commit step to `git commit --amend -m msg`,
+    folding any staged changes (and the new message) into the latest
+    local commit. The review-pane toolbar gates this on `ahead > 0`
+    so a published commit never gets rewritten — but the worker
+    trusts the caller and doesn't re-validate."""
     try:
-        _commit_worker_inner(state, repo, msg, lfs_cands, staged_paths)
+        _commit_worker_inner(state, repo, msg, lfs_cands, staged_paths,
+                             amend)
     except Exception as e:
         name = state.task_repo_label(repo)
         t = state.tasks.add(f"{name}: failed")
@@ -954,7 +1160,8 @@ def commit_worker(state: State, repo: Repo, msg: str,
 
 def _commit_worker_inner(state: State, repo: Repo, msg: str,
                          lfs_cands: List[LFSCandidate],
-                         staged_paths: Optional["dict[str, bool]"] = None
+                         staged_paths: Optional["dict[str, bool]"] = None,
+                         amend: bool = False
                          ) -> None:
     auto_stage = state.auto_stage
     auto_push = state.auto_push
@@ -1032,13 +1239,21 @@ def _commit_worker_inner(state: State, repo: Repo, msg: str,
         tasks.update(t, "ok")
 
     rc, _, _ = git(repo.path, ["diff", "--cached", "--quiet"])
-    if rc == 0:
+    nothing_staged = (rc == 0)
+    # `--amend -m msg` is happy to update just the message even with
+    # nothing staged, so we let amend through; fresh commits still
+    # bail when there's nothing to land.
+    if nothing_staged and not amend:
         t = tasks.add(f"{name}: skipped")
         tasks.update(t, "warn", "nothing staged")
         return
 
-    t = tasks.add(f"{name}: commit")
-    rc, _, err = git(repo.path, ["commit", "-m", msg])
+    if amend:
+        t = tasks.add(f"{name}: commit --amend")
+        rc, _, err = git(repo.path, ["commit", "--amend", "-m", msg])
+    else:
+        t = tasks.add(f"{name}: commit")
+        rc, _, err = git(repo.path, ["commit", "-m", msg])
     if rc != 0:
         tasks.update(t, "fail", first_line(err))
         return
@@ -1079,15 +1294,41 @@ def _commit_worker_inner(state: State, repo: Repo, msg: str,
             state, repo, repo.branch, pushed_sha, tracked)
     repo.track_workflow.clear()
 
-    # "Then run after push" — dispatch a manual workflow once the push
-    # itself completes, regardless of any tracked workflow runs. Lives
-    # alongside per-workflow then-runs (which fire when the tracked run
-    # finishes successfully — handled inside _poll_run).
+    # "Then run after push" — fired once the push itself completes,
+    # regardless of any tracked workflow runs. Two shapes:
+    #   * a workflow name → dispatch the manual workflow
+    #   * the "__add_tag__" sentinel → create a lightweight tag at
+    #     the just-pushed sha. Per-action parameter buffers live in
+    #     `then_run_params_after_push` (today only "tag", but the
+    #     same dict will hold workflow_dispatch inputs in the
+    #     future). We pop the slot's params unconditionally so a
+    #     follow-up push doesn't double-fire stale values.
     after_push_target = repo.then_run_after_push
+    after_push_params = dict(repo.then_run_params_after_push)
     repo.then_run_after_push = ""
-    if after_push_target:
+    repo.then_run_params_after_push.clear()
+    if after_push_target == "__add_tag__":
+        tag_name = after_push_params.get("tag", "").strip()
+        tag_label = state.task_repo_label(repo)
+        t_tag = tasks.add(f"{tag_label}: tag {tag_name or '(empty)'}")
+        if not tag_name or tag_name.startswith("-"):
+            tasks.update(t_tag, "fail", "tag name empty or unsafe")
+        elif not pushed_sha:
+            tasks.update(t_tag, "fail", "no pushed sha")
+        else:
+            rc_tag, _, err_tag = git(repo.path, [
+                "tag", tag_name, pushed_sha,
+            ])
+            tasks.update(
+                t_tag, "ok" if rc_tag == 0 else "fail",
+                "" if rc_tag == 0 else first_line(err_tag))
+    elif after_push_target:
+        # `after_push_params` carries the buffered values for
+        # `workflow_dispatch.inputs` — non-empty entries get
+        # forwarded as `-F name=value` by dispatch_workflow.
         kick_off_manual_dispatch(
-            state, repo, after_push_target, repo.branch)
+            state, repo, after_push_target, repo.branch,
+            inputs=after_push_params)
 
     for sib_repo, sib_path in repo.siblings:
         t = tasks.add(
@@ -1098,7 +1339,8 @@ def _commit_worker_inner(state: State, repo: Repo, msg: str,
 
 def commit_worker_for_child(state: State, parent: Repo, ref: ChildRef,
                             msg: str,
-                            staged_paths: Optional["dict[str, bool]"] = None
+                            staged_paths: Optional["dict[str, bool]"] = None,
+                            amend: bool = False
                             ) -> None:
     """Run the stage / commit / push pipeline against `ref.nested_path` —
     the working tree of a nested submodule checkout inside `parent`.
@@ -1110,9 +1352,13 @@ def commit_worker_for_child(state: State, parent: Repo, ref: ChildRef,
     push.
 
     `staged_paths` mirrors `commit_worker` — review-screen per-file
-    checkbox state, or None to fall back to legacy auto_stage."""
+    checkbox state, or None to fall back to legacy auto_stage. `amend`
+    swaps the commit step to `git commit --amend -m msg` (same gating
+    rule as the top-level worker — caller is responsible for ensuring
+    the latest commit hasn't been pushed)."""
     try:
-        _commit_worker_for_child_inner(state, parent, ref, msg, staged_paths)
+        _commit_worker_for_child_inner(state, parent, ref, msg,
+                                       staged_paths, amend)
     except Exception as e:
         name = (f"{state.task_repo_label(ref.repo)} "
                 f"(in {state.task_repo_label(parent)})")
@@ -1123,7 +1369,8 @@ def commit_worker_for_child(state: State, parent: Repo, ref: ChildRef,
 def _commit_worker_for_child_inner(state: State, parent: Repo,
                                    ref: ChildRef, msg: str,
                                    staged_paths: Optional["dict[str, bool]"]
-                                   = None) -> None:
+                                   = None,
+                                   amend: bool = False) -> None:
     auto_stage = state.auto_stage
     auto_push = state.auto_push
     tasks = state.tasks
@@ -1173,13 +1420,19 @@ def _commit_worker_for_child_inner(state: State, parent: Repo,
         tasks.update(t, "ok")
 
     rc, _, _ = git(ref.nested_path, ["diff", "--cached", "--quiet"])
-    if rc == 0:
+    nothing_staged = (rc == 0)
+    if nothing_staged and not amend:
         t = tasks.add(f"{name}: skipped")
         tasks.update(t, "warn", "nothing staged")
         return
 
-    t = tasks.add(f"{name}: commit")
-    rc, _, err = git(ref.nested_path, ["commit", "-m", msg])
+    if amend:
+        t = tasks.add(f"{name}: commit --amend")
+        rc, _, err = git(ref.nested_path,
+                         ["commit", "--amend", "-m", msg])
+    else:
+        t = tasks.add(f"{name}: commit")
+        rc, _, err = git(ref.nested_path, ["commit", "-m", msg])
     if rc != 0:
         tasks.update(t, "fail", first_line(err))
         return
@@ -1214,13 +1467,38 @@ def _commit_worker_for_child_inner(state: State, parent: Repo,
             state, ref.repo, nested_branch, pushed_sha, tracked)
     ref.repo.track_workflow.clear()
 
-    # "Then run after push" for the canonical — same semantics as the
-    # top-level commit_worker version.
+    # "Then run after push" for the canonical — same semantics as
+    # the top-level commit_worker version, including the
+    # "__add_tag__" sentinel for creating a lightweight tag at the
+    # pushed sha. Reads the action's per-parameter buffer dict,
+    # popping it so a follow-up push doesn't replay stale params.
     after_push_target = ref.repo.then_run_after_push
+    after_push_params = dict(ref.repo.then_run_params_after_push)
     ref.repo.then_run_after_push = ""
-    if after_push_target:
+    ref.repo.then_run_params_after_push.clear()
+    if after_push_target == "__add_tag__":
+        tag_name = after_push_params.get("tag", "").strip()
+        tag_label = (f"{state.task_repo_label(ref.repo)} "
+                     f"(in {state.task_repo_label(parent)})")
+        t_tag = tasks.add(f"{tag_label}: tag {tag_name or '(empty)'}")
+        if not tag_name or tag_name.startswith("-"):
+            tasks.update(t_tag, "fail", "tag name empty or unsafe")
+        elif not pushed_sha:
+            tasks.update(t_tag, "fail", "no pushed sha")
+        else:
+            rc_tag, _, err_tag = git(ref.nested_path, [
+                "tag", tag_name, pushed_sha,
+            ])
+            tasks.update(
+                t_tag, "ok" if rc_tag == 0 else "fail",
+                "" if rc_tag == 0 else first_line(err_tag))
+    elif after_push_target:
+        # `after_push_params` was popped above and holds buffered
+        # `workflow_dispatch.inputs` values; forward as -F flags so
+        # the dispatched run honours the user's review-screen edits.
         kick_off_manual_dispatch(
-            state, ref.repo, after_push_target, nested_branch)
+            state, ref.repo, after_push_target, nested_branch,
+            inputs=after_push_params)
 
     # Build the post-push sync targets. For tracked canonicals we sync
     # the top-level checkout first; for synthetic canonicals there's no
@@ -1267,7 +1545,7 @@ def kick_off_workers(state: State, blocks: List[ReviewBlock]) -> None:
                     if b.target_child is not None}
 
     repo_plans: List[Tuple[Repo, str, List[LFSCandidate],
-                           "dict[str, bool]"]] = []
+                           "dict[str, bool]", bool]] = []
     for repo in state.repos:
         msg = repo.message.strip()
         if not msg:
@@ -1278,11 +1556,12 @@ def kick_off_workers(state: State, blocks: List[ReviewBlock]) -> None:
         block = repo_blocks.get(id(repo))
         repo_cands = list(block.lfs_candidates) if block else []
         staged = dict(block.staged_paths) if block else {}
-        repo_plans.append((repo, msg, repo_cands, staged))
+        amend = bool(block.amend) if block else False
+        repo_plans.append((repo, msg, repo_cands, staged, amend))
         repo.refreshing = True  # lock synchronously before spawning
 
     child_plans: List[Tuple[Repo, ChildRef, str,
-                            "dict[str, bool]"]] = []
+                            "dict[str, bool]", bool]] = []
     for parent in state.repos:
         for ref in parent.children:
             if ref.kind != "submodule":
@@ -1295,29 +1574,30 @@ def kick_off_workers(state: State, blocks: List[ReviewBlock]) -> None:
                 continue
             block = child_blocks.get(id(ref))
             staged = dict(block.staged_paths) if block else {}
-            child_plans.append((parent, ref, msg, staged))
+            amend = bool(block.amend) if block else False
+            child_plans.append((parent, ref, msg, staged, amend))
             ref.refreshing = True  # lock synchronously before spawning
 
     if not repo_plans and not child_plans:
         return
 
-    locked_repos = {id(repo) for repo, _, _, _ in repo_plans}
-    locked_refs = {id(ref) for _, ref, _, _ in child_plans}
+    locked_repos = {id(repo) for repo, _, _, _, _ in repo_plans}
+    locked_refs = {id(ref) for _, ref, _, _, _ in child_plans}
 
     workers: List[threading.Thread] = []
-    for repo, msg, repo_cands, staged in repo_plans:
+    for repo, msg, repo_cands, staged, amend in repo_plans:
         w = threading.Thread(
             target=commit_worker,
-            args=(state, repo, msg, repo_cands, staged),
+            args=(state, repo, msg, repo_cands, staged, amend),
             daemon=True,
         )
         w.start()
         workers.append(w)
 
-    for parent, ref, msg, staged in child_plans:
+    for parent, ref, msg, staged, amend in child_plans:
         w = threading.Thread(
             target=commit_worker_for_child,
-            args=(state, parent, ref, msg, staged),
+            args=(state, parent, ref, msg, staged, amend),
             daemon=True,
         )
         w.start()

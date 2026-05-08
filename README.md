@@ -1,7 +1,10 @@
 # Idlegit
 
-A small interactive multi-repo git tool. One screen for status of the whole workspace. Stage, commit, and
-push across every repo and track the resulting actions.
+An interactive multi-repo git tool. One screen for status of the whole workspace, switch workspaces easily.
+
+Suggest messages, stage, commit, and push across every repo. Track and chain the resulting actions. 
+
+No destructive git operations allowed.
 
 ## Why
 

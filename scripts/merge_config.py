@@ -8,8 +8,13 @@ Existing keys and the rest of the file are left unchanged.
 Resolves the destination path the same way as runtime config (``config``
 module — respects IDLEGIT_CONFIG_DIR).
 
+Used by both `install.py` (fresh installs) and `update.py` (after a
+release tarball replaces the app files), so the user's overrides
+survive across upgrades while new template keys land with their
+defaults.
+
 Usage:
-  PYTHONPATH=<dir-with-config.py> python install_merge_config.py [path/to/template.conf]
+  PYTHONPATH=<dir-with-config.py> python merge_config.py [path/to/template.conf]
 
 With no template path, uses ``idlegit.conf.sample`` beside this script if present,
 otherwise ``idlegit.conf`` in the same directory.
@@ -32,11 +37,15 @@ _KEY = re.compile(r"^([A-Za-z0-9_]+)\s*=")
 
 
 def _default_template_path() -> Path:
-    """Prefer shipped sample next to this script; else ``idlegit.conf`` (dev tree)."""
-    bundled = ROOT / "idlegit.conf.sample"
-    if bundled.is_file():
-        return bundled
-    return ROOT / "idlegit.conf"
+    """Locate the bundled config template. Tries (in order):
+      - ``idlegit.default.conf`` next to this script (post-install
+        layout, everything flat in IDLEGIT_HOME),
+      - ``idlegit.default.conf`` at the project root (dev tree, this
+        script lives in ``scripts/`` one level down)."""
+    flat = ROOT / "idlegit.default.conf"
+    if flat.is_file():
+        return flat
+    return ROOT.parent / "idlegit.default.conf"
 
 
 def _idlegit_span(lines: list[str]) -> tuple[int, int] | None:

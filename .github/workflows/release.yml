@@ -1,0 +1,47 @@
+name: release
+
+# Cuts a GitHub Release whenever a `vX.Y.Z` tag is pushed. The
+# Release page links to the source tarball (under `tarball_url` in
+# the API), which is what `update.py` downloads when it sees a
+# newer tag than the installed VERSION.
+#
+# Pre-flight check: refuses to publish unless `config.VERSION`
+# matches the tag being pushed, so a misnamed tag fails fast
+# instead of producing a release the updater can't reconcile.
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout tagged commit
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify tag matches VERSION file
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          # First non-blank, non-comment line of VERSION — same rule
+          # config.py uses at startup.
+          ver="$(grep -v '^[[:space:]]*\(#\|$\)' VERSION | head -n 1 | xargs)"
+          if [[ "$tag" != "$ver" ]]; then
+            echo "Tag ($tag) does not match VERSION file ($ver)" >&2
+            exit 1
+          fi
+          echo "Tag matches VERSION: $ver"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes

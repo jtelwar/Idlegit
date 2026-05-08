@@ -20,6 +20,19 @@ def _monotonic() -> float:
 
 
 @dataclass
+class WorkflowInput:
+    """One `workflow_dispatch.inputs` entry parsed from a workflow's
+    YAML — surfaced in the review screen as an inline text-field
+    parameter and forwarded to `gh workflow run -F <name>=<value>`
+    when the dispatch fires. Only the fields we render today are
+    captured; type / required / options can be added later without
+    a schema change since we keep value handling generic (string)."""
+    name: str
+    description: str = ""
+    default: str = ""
+
+
+@dataclass
 class WorkflowInfo:
     """A GitHub Actions workflow advertised by `gh workflow list`. Cached on
     Repo so the review screen and the action menu can list them without
@@ -28,6 +41,11 @@ class WorkflowInfo:
     `triggers_push` / `push_branches` / `push_branches_ignore` are derived
     from the YAML's `on:` block so we can predict whether the workflow
     will fire on a push to the repo's current branch.
+
+    `inputs` holds the `workflow_dispatch.inputs` entries parsed from
+    the same YAML; when the user picks this workflow as a then-run
+    target, the review screen renders one inline param row per
+    input and the dispatch site forwards typed values via -F.
 
     `state` mirrors GitHub's workflow state (`active`, `disabled_manually`,
     `disabled_inactivity`, `disabled_fork`). Empty string until we've
@@ -39,6 +57,7 @@ class WorkflowInfo:
     triggers_push: bool = False  # has `on: push` in any form
     push_branches: List[str] = field(default_factory=list)
     push_branches_ignore: List[str] = field(default_factory=list)
+    inputs: List[WorkflowInput] = field(default_factory=list)
 
 
 @dataclass
@@ -87,6 +106,19 @@ class Repo:
     # survives navigation.
     then_run_after_push: str = ""
     then_run_after_workflow: "dict[str, str]" = field(default_factory=dict)
+    # Generic per-action parameter buffers paired with the targets
+    # in the then-run dicts above. Outer key is the parent's slot
+    # (after-push uses the "" key for `then_run_params_after_push`,
+    # after-workflow uses the workflow name); inner dict maps a
+    # parameter name (e.g. "tag" for the __add_tag__ sentinel,
+    # workflow_dispatch input names for real workflows) to its
+    # buffered value. The review screen's inline param_input rows
+    # read/write through these dicts; dispatch sites pop the
+    # matching slot when the parent task fires.
+    then_run_params_after_push: "dict[str, str]" = field(
+        default_factory=dict)
+    then_run_params_after_workflow: "dict[str, dict[str, str]]" = field(
+        default_factory=dict)
 
     @property
     def display_name(self) -> str:
@@ -436,9 +468,30 @@ class DiffViewer:
     target_path: Path       # repo working-tree dir the path is rooted in
     label: str              # block label rendered in the modal title
     untracked: bool = False
+    # Optional: when set, the loader runs `git show <sha> -- <path>`
+    # instead of `git diff HEAD -- <path>` so the commit-view modal
+    # can reuse the diff viewer scoped to a single commit.
+    commit_sha: str = ""
+    # ---- Tabbed UI state -----------------------------------------
+    # Three tabs: diff (default, the original view), log (commits
+    # touching this file), blame (line-by-line attribution). ←/→
+    # switches the active tab; ↑/↓ scrolls the active tab. Each
+    # tab carries its own lines / loading flag / scroll position so
+    # switching back lands where you left.
+    active_tab: str = "diff"
+    # Diff tab — keeps the original short field names so external
+    # animation hooks (`state.diff_viewer.loading`) keep working.
     lines: "list[str]" = field(default_factory=list)
     loading: bool = True
     scroll: int = 0
+    # Log tab.
+    log_lines: "list[str]" = field(default_factory=list)
+    log_loading: bool = True
+    log_scroll: int = 0
+    # Blame tab.
+    blame_lines: "list[str]" = field(default_factory=list)
+    blame_loading: bool = True
+    blame_scroll: int = 0
     cancel_event: threading.Event = field(default_factory=threading.Event)
     lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -487,6 +540,19 @@ class ReviewBlock:
     # they Shift+Tab back to the left side.
     file_selected: int = 0
     file_scroll: int = 0
+    # Right-pane toolbar focus. -1 = focus is in the file list (the
+    # default — landing in the right pane lands on a file row); 0 =
+    # "stage all" button; 1 = "unstage all" button. Up from the first
+    # file lifts focus to the toolbar; Down from the toolbar drops it
+    # back to file 0.
+    toolbar_focus: int = -1
+    # When True, the commit step uses `git commit --amend -m <msg>`
+    # instead of a fresh commit so the staged changes (if any) and
+    # the new message replace the latest unpushed commit. Toggled by
+    # the right-pane toolbar's `[X] amend` checkbox; the toolbar
+    # offers it only when `ahead > 0` so we never amend a published
+    # commit (the cardinal rule's no-rewrite-of-shared-history line).
+    amend: bool = False
     # Per-file "should this end up in the index for the commit?" flag.
     # Populated by the file loader once `files` lands. Defaults derive
     # from `auto_stage`: True → every change checked; False → only
@@ -619,6 +685,7 @@ class ActionMenu:
     edit_field: str = ""        # "" / "rename_remote" / "add_remote_name"
                                 # / "add_remote_url"
     edit_typed: str = ""
+    edit_cursor: int = 0
     edit_pre_value: str = ""
     edit_target_id: str = ""
     edit_extra: "dict[str, str]" = field(default_factory=dict)
@@ -993,13 +1060,16 @@ class WorkspaceMenuRow:
     bounded by `min_value`/`max_value`. `label` is the human-readable
     setting name shown on the left of the row; `attr_name` names the
     State attribute the row drives (and indirectly the workspace
-    overrides key once persisted)."""
+    overrides key once persisted). `hint_text` is the muted one-line
+    explanation shown above the hints footer when the row is
+    focused — empty for rows that don't need an explainer."""
     label: str
     attr_name: str
     kind: str  # "bool" | "trunc_mode" | "int"
     min_value: int = 0
     max_value: int = 999
     step: int = 1
+    hint_text: str = ""
 
 
 @dataclass
@@ -1050,6 +1120,64 @@ _DEFAULT_TRACK_ACTIONS = True
 _DEFAULT_ACTIONS_POLL_SECONDS = 5.0
 _DEFAULT_AUTO_REMOVE_COMPLETED_AFTER = -1.0
 _DEFAULT_MAX_COMMIT_MESSAGE_LENGTH_IN_REVIEW = 480
+
+
+@dataclass
+class CommitViewModal:
+    """Sub-modal of the action menu — opened with Tab on a focused
+    row in the recent-commits pane. Shows the commit's metadata
+    (author, date, message), tag badges, an action list (currently
+    just `+ add tag`), and a tabbed lower pane with `Changes` and
+    `Reflog` tabs. The Changes tab reuses the review pane's file
+    row renderer; Tab on a focused file row pops the diff viewer
+    scoped to this commit (`git show <sha> -- <path>`). The Reflog
+    tab lists HEAD reflog entries that mention this commit's sha
+    so the user can see when the commit was current (checkout,
+    reset, rebase, …).
+
+    Section navigation: action items at the top, tabbed pane
+    below; Down past the last action drops focus into the pane,
+    Home returns to the actions. While `section == "actions"`, Tab
+    closes the modal back to the action menu's commits pane.
+    While `section == "tabs"`, Tab opens the diff viewer for the
+    focused file row (Changes only); ←/→ switches active tab; ↑/↓
+    scrolls the active tab."""
+    target_label: str
+    target_path: Path
+    sha: str
+    subject: str = ""
+    body: str = ""
+    author: str = ""
+    date: str = ""
+    tags: List[str] = field(default_factory=list)
+    files: List[FileEntry] = field(default_factory=list)
+    files_loading: bool = True
+    details_loading: bool = True
+    tags_loading: bool = True
+    # Reflog tab — entries that mention this commit's sha. Loaded
+    # alongside the file changes when the modal opens.
+    reflog_entries: "list[str]" = field(default_factory=list)
+    reflog_loading: bool = True
+    # Section + active-tab state. `section` is one of "actions" or
+    # "tabs"; while in "tabs", `active_tab` picks "changes" or
+    # "reflog". Per-tab cursor / scroll fields below.
+    section: str = "actions"
+    action_selected: int = 0
+    active_tab: str = "changes"
+    file_selected: int = 0
+    file_scroll: int = 0
+    reflog_selected: int = 0
+    reflog_scroll: int = 0
+    # Inline tag-name edit (Enter on "+ add tag" activates this).
+    edit_field: str = ""        # "" / "add_tag"
+    edit_typed: str = ""
+    # Confirm overlay before applying a destructive-adjacent op
+    # (creating a tag is non-destructive but still gets a y/N gate
+    # so the user reviews the name before it lands).
+    confirm_message: str = ""
+    confirm_action: str = ""    # "add_tag"
+    confirm_args: "dict[str, str]" = field(default_factory=dict)
+    cancel_event: threading.Event = field(default_factory=threading.Event)
 
 
 @dataclass
@@ -1150,6 +1278,11 @@ class State:
     workspaces_picker: Optional["WorkspacesPicker"] = None
     remotes_modal: Optional[RemotesModal] = None
     clone_modal: Optional[CloneModal] = None
+    # Sub-modal of the action menu's commits pane — Tab on a focused
+    # commit row opens it. Drawn on top of the action menu; key
+    # routing in idlegit.py ensures it gets keys before the action
+    # menu does.
+    commit_view_modal: Optional[CommitViewModal] = None
 
     @property
     def active_workspace(self) -> Optional[Workspace]:

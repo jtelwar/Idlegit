@@ -41,6 +41,7 @@ from ui import (
     handle_branch_name_prompt_key,
     handle_branch_picker_key,
     handle_clone_modal_key,
+    handle_commit_view_modal_key,
     handle_confirm,
     handle_detached_recovery_prompt_key,
     handle_remotes_modal_key,
@@ -301,6 +302,12 @@ def run(stdscr, cfg, workspaces, initial_active_idx: int = 0,
             and (state.action_menu.state_loading
                  or state.action_menu.tree_loading
                  or state.action_menu.commits_loading))
+        commit_view_loading = (
+            state.commit_view_modal is not None
+            and (state.commit_view_modal.tags_loading
+                 or state.commit_view_modal.details_loading
+                 or state.commit_view_modal.files_loading
+                 or state.commit_view_modal.reflog_loading))
         anim_running = (state.tasks.has_running()
                         or state.tasks.has_pending_auto_remove(
                             state.auto_remove_completed_after)
@@ -310,8 +317,11 @@ def run(stdscr, cfg, workspaces, initial_active_idx: int = 0,
                         or creator_checking
                         or menu_checking
                         or action_menu_loading
+                        or commit_view_loading
                         or (state.diff_viewer is not None
-                            and state.diff_viewer.loading))
+                            and (state.diff_viewer.loading
+                                 or state.diff_viewer.log_loading
+                                 or state.diff_viewer.blame_loading)))
         if anim_running:
             state.spinner_frame = (state.spinner_frame + 1) % len(SPINNER_FRAMES)
 
@@ -368,8 +378,13 @@ def run(stdscr, cfg, workspaces, initial_active_idx: int = 0,
         if state.detached_recovery_prompt is not None:
             handle_detached_recovery_prompt_key(state, key)
             continue
-        # Sub-modal of action_menu — must dispatch before action_menu so
-        # the modal on top owns key handling while it's open.
+        # Sub-modals of action_menu — must dispatch before action_menu
+        # so whichever modal is on top owns key handling. The commit
+        # view (popped from the commits pane) and the remotes editor
+        # are siblings; only one can be open at a time.
+        if state.commit_view_modal is not None:
+            handle_commit_view_modal_key(state, key)
+            continue
         if state.remotes_modal is not None:
             handle_remotes_modal_key(state, key)
             continue

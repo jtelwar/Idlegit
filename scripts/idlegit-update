@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Idlegit updater launcher — finds python3, hands off to update.py.
+#
+# Mirrors the resolution dance from `idlegit`: walks `$0` through any
+# symlinks (the install script symlinks this launcher into a PATH
+# directory, typically /usr/local/bin) so we end up at the real
+# install dir and can locate the matching update.py.
+set -euo pipefail
+
+SOURCE="$0"
+while [ -L "$SOURCE" ]; do
+    SOURCE_DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+    SOURCE="$(readlink "$SOURCE")"
+    case "$SOURCE" in
+        /*) ;;
+        *) SOURCE="$SOURCE_DIR/$SOURCE" ;;
+    esac
+done
+DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+SCRIPT="$DIR/update.py"
+
+if [[ ! -f "$SCRIPT" ]]; then
+    echo "idlegit-update: $SCRIPT not found" >&2
+    exit 1
+fi
+
+if command -v python3 >/dev/null 2>&1; then
+    PY=python3
+elif command -v python >/dev/null 2>&1; then
+    PY=python
+else
+    echo "idlegit-update: python3 not found on PATH" >&2
+    exit 1
+fi
+
+exec "$PY" "$SCRIPT" "$@"

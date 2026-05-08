@@ -91,57 +91,91 @@ _OVERRIDE_ROWS: Tuple[WorkspaceMenuRow, ...] = (
     # carries these as quick-toggles; the workspace menu is the sole
     # place to flip them now.
     WorkspaceMenuRow(label="COMMIT", attr_name="", kind="header"),
-    WorkspaceMenuRow(label="Auto-stage first",
-                     attr_name="default_auto_stage", kind="bool"),
-    WorkspaceMenuRow(label="Auto-push after",
-                     attr_name="default_auto_push", kind="bool"),
-    WorkspaceMenuRow(label="Track actions by default",
-                     attr_name="track_actions_default", kind="bool"),
+    WorkspaceMenuRow(
+        label="Auto-stage first",
+        attr_name="default_auto_stage", kind="bool",
+        hint_text="stage all changes before committing (default: on)"),
+    WorkspaceMenuRow(
+        label="Auto-push after",
+        attr_name="default_auto_push", kind="bool",
+        hint_text="push to upstream after a successful commit (default: on)"),
+    WorkspaceMenuRow(
+        label="Track actions by default",
+        attr_name="track_actions_default", kind="bool",
+        hint_text="poll GitHub Actions on new repos (default: on)"),
     # SMART-SYNC — Ctrl+S behaviour. align_heads gates the detached-
     # checkout handling; auto_ff gates the loser-FF step; prompt_for_
     # branch decides whether to ask the user which branch a detached
     # winner should push to (off → auto-resolve to origin/HEAD).
     WorkspaceMenuRow(label="SMART-SYNC", attr_name="", kind="header"),
-    WorkspaceMenuRow(label="Align heads",
-                     attr_name="default_align_heads", kind="bool"),
-    WorkspaceMenuRow(label="Auto-FF",
-                     attr_name="default_auto_ff", kind="bool"),
-    WorkspaceMenuRow(label="Prompt for branch",
-                     attr_name="default_prompt_for_branch", kind="bool"),
+    WorkspaceMenuRow(
+        label="Align heads",
+        attr_name="default_align_heads", kind="bool",
+        hint_text="reattach a detached HEAD onto its branch before sync (default: on)"),
+    WorkspaceMenuRow(
+        label="Auto-FF",
+        attr_name="default_auto_ff", kind="bool",
+        hint_text="fast-forward the loser side of a sync when safe (default: on)"),
+    WorkspaceMenuRow(
+        label="Prompt for branch",
+        attr_name="default_prompt_for_branch", kind="bool",
+        hint_text="ask which branch a detached winner pushes to (default: on)"),
     WorkspaceMenuRow(label="DISPLAY", attr_name="", kind="header"),
-    WorkspaceMenuRow(label="Name truncation",
-                     attr_name="name_truncation", kind="trunc_mode"),
-    WorkspaceMenuRow(label="Branch truncation",
-                     attr_name="branch_truncation", kind="trunc_mode"),
-    WorkspaceMenuRow(label="Task name truncation",
-                     attr_name="task_name_truncation", kind="trunc_mode"),
-    WorkspaceMenuRow(label="Name display max",
-                     attr_name="name_display_max", kind="int",
-                     min_value=0, max_value=200, step=2),
+    WorkspaceMenuRow(
+        label="Name truncation",
+        attr_name="name_truncation", kind="trunc_mode",
+        hint_text="where to drop characters when a repo name overflows (default: middle)"),
+    WorkspaceMenuRow(
+        label="Branch truncation",
+        attr_name="branch_truncation", kind="trunc_mode",
+        hint_text="where to drop characters when a branch name overflows (default: middle)"),
+    WorkspaceMenuRow(
+        label="Task name truncation",
+        attr_name="task_name_truncation", kind="trunc_mode",
+        hint_text="where to drop characters when a task name overflows (default: middle)"),
+    WorkspaceMenuRow(
+        label="Name display max",
+        attr_name="name_display_max", kind="int",
+        min_value=0, max_value=200, step=2,
+        hint_text="max width of the repo name column, in cells (default: 40)"),
     # -1 means "share the parent's cap" — that's the sentinel the
     # draw layer uses; values >= 0 truncate child rows independently.
-    WorkspaceMenuRow(label="Child name display max",
-                     attr_name="child_name_display_max", kind="int",
-                     min_value=-1, max_value=200, step=2),
-    WorkspaceMenuRow(label="Branch display max",
-                     attr_name="branch_display_max", kind="int",
-                     min_value=0, max_value=80, step=1),
-    WorkspaceMenuRow(label="Task name display max",
-                     attr_name="task_name_display_max", kind="int",
-                     min_value=0, max_value=80, step=1),
-    WorkspaceMenuRow(label="Max visible repo rows",
-                     attr_name="max_visible_repo_rows", kind="int",
-                     min_value=0, max_value=200, step=1),
+    WorkspaceMenuRow(
+        label="Child name display max",
+        attr_name="child_name_display_max", kind="int",
+        min_value=-1, max_value=200, step=2,
+        hint_text="max width of sub-repo name column, -1 = inherit parent (default: -1)"),
+    WorkspaceMenuRow(
+        label="Branch display max",
+        attr_name="branch_display_max", kind="int",
+        min_value=0, max_value=80, step=1,
+        hint_text="max width of the branch column, in cells (default: 12)"),
+    WorkspaceMenuRow(
+        label="Task name display max",
+        attr_name="task_name_display_max", kind="int",
+        min_value=0, max_value=80, step=1,
+        hint_text="max width of the task-name column, in cells (default: 16)"),
+    WorkspaceMenuRow(
+        label="Max visible repo rows",
+        attr_name="max_visible_repo_rows", kind="int",
+        min_value=0, max_value=200, step=1,
+        hint_text="how many repo rows to show, 0 = use full available height (default: 0)"),
     WorkspaceMenuRow(label="COMMIT SUGGESTIONS", attr_name="", kind="header"),
-    WorkspaceMenuRow(label="Suggest added",
-                     attr_name="suggest_added", kind="int",
-                     min_value=0, max_value=99, step=1),
-    WorkspaceMenuRow(label="Suggest updated",
-                     attr_name="suggest_updated", kind="int",
-                     min_value=0, max_value=99, step=1),
-    WorkspaceMenuRow(label="Suggest deleted",
-                     attr_name="suggest_deleted", kind="int",
-                     min_value=0, max_value=99, step=1),
+    WorkspaceMenuRow(
+        label="Suggest added",
+        attr_name="suggest_added", kind="int",
+        min_value=0, max_value=99, step=1,
+        hint_text="number of added files to suggest, 0 = unlimited (default: 5)"),
+    WorkspaceMenuRow(
+        label="Suggest updated",
+        attr_name="suggest_updated", kind="int",
+        min_value=0, max_value=99, step=1,
+        hint_text="number of updated files to suggest, 0 = unlimited (default: 5)"),
+    WorkspaceMenuRow(
+        label="Suggest deleted",
+        attr_name="suggest_deleted", kind="int",
+        min_value=0, max_value=99, step=1,
+        hint_text="number of deleted files to suggest, 0 = unlimited (default: 5)"),
 )
 
 # Modal sizing.
@@ -498,8 +532,11 @@ def draw_workspace_menu(stdscr, state: State, sidebar_x: int) -> None:
     n_rows = len(menu.rows)
     body_h = max(3, min(BODY_TARGET_ROWS, n_rows))
     # blank-top (1) + app-row (1) + blank (1) + title (1) + spacer (1)
-    # + body + spacer (1) + slack (1) + footer (1) + blank-bottom (1)
-    content_h = 1 + 1 + 1 + 1 + 1 + body_h + 1 + 1 + 1 + 1
+    # + body + spacer/scroll-↓ (1) + hint-text (1) + blank (1)
+    # + footer (1) + blank-bottom (1). The hint-text row is sandwiched
+    # between two blank rows so the explainer reads as a separate
+    # block, not as an extension of the body or the hints footer.
+    content_h = 1 + 1 + 1 + 1 + 1 + body_h + 1 + 1 + 1 + 1 + 1
     x, y, w, h = modal_geometry(stdscr, sidebar_x, MODAL_W, content_h)
     sb = curses.color_pair(PAIR_SB_FG)
     draw_modal_fill(stdscr, x, y, w, h, sb)
@@ -593,6 +630,18 @@ def draw_workspace_menu(stdscr, state: State, sidebar_x: int) -> None:
         below = n_rows - (menu.scroll + body_h)
         safe_addstr(stdscr, y + 5 + body_h, inner_x,
                     f"↓ {below} more below", sb | curses.A_DIM)
+
+    # Per-row explainer — sits two rows above the hints footer with a
+    # blank row above and below, only when the focused row carries a
+    # hint_text. Header rows aren't focusable, so we won't end up
+    # rendering blank text on a section break.
+    hint_text = ""
+    if 0 <= menu.selected < n_rows:
+        hint_text = menu.rows[menu.selected].hint_text
+    if hint_text:
+        safe_addstr(stdscr, y + h - 4, inner_x,
+                    truncate(hint_text, inner_w, "end"),
+                    sb | curses.A_DIM)
 
     _draw_menu_hints(stdscr, state, menu, y + h - 2, inner_x, inner_w,
                      sb | curses.A_DIM)

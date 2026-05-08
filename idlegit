@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Launches the interactive multi-repo git menu.
+# Launches Idlegit
 #
 # We don't just exec idlegit.py directly: VS Code's terminal tab title
 # (and `ps -o comm`, and similar tools) reads the kernel-reported binary
@@ -9,9 +9,22 @@
 # the renamed link. The kernel records that path, so `comm` becomes
 # "idlegit". Falls back to a copy if the hardlink can't be made (cross-
 # device, read-only home, etc.).
+
 set -euo pipefail
 
-DIR="$(cd "$(dirname "$0")" && pwd)"
+# Resolve `$0` through any symlinks so the launcher finds the
+# matching idlegit.py regardless of how it was invoked.
+SOURCE="$0"
+while [ -L "$SOURCE" ]; do
+    SOURCE_DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+    SOURCE="$(readlink "$SOURCE")"
+    # Re-anchor relative symlink targets against their directory.
+    case "$SOURCE" in
+        /*) ;;
+        *) SOURCE="$SOURCE_DIR/$SOURCE" ;;
+    esac
+done
+DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
 SCRIPT="$DIR/idlegit.py"
 
 if ! command -v python3 >/dev/null 2>&1 && ! command -v python >/dev/null 2>&1; then

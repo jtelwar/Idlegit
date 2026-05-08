@@ -32,6 +32,8 @@ from .review import (
     build_review_blocks,
     cycle_then_run,
     draw_review,
+    fire_toolbar_action,
+    is_toolbar_toggle,
     kick_off_review_files_load,
 )
 from .sidebar import SPINNER_FRAMES
@@ -461,7 +463,10 @@ def handle_confirm(stdscr, state: State) -> None:
     try:
         while True:
             anim = any(b.files_loading or b.suggesting for b in blocks) or (
-                state.diff_viewer is not None and state.diff_viewer.loading)
+                state.diff_viewer is not None
+                and (state.diff_viewer.loading
+                     or state.diff_viewer.log_loading
+                     or state.diff_viewer.blame_loading))
             stdscr.timeout(100 if anim else 1000)
             scroll = draw_review(stdscr, state, blocks, focusables,
                                  focus, panel_focus, scroll)
@@ -493,6 +498,14 @@ def handle_confirm(stdscr, state: State) -> None:
                 if panel_focus == "left":
                     kick_off_workers(state, blocks)
                     return  # async pipeline takes over the sidebar
+                # Right pane: Enter fires the focused toolbar button
+                # when the toolbar has focus; otherwise it's a no-op
+                # (file rows don't have an Enter action).
+                bi = _focused_block_idx(focusables, focus)
+                if 0 <= bi < len(blocks):
+                    block = blocks[bi]
+                    if block.toolbar_focus >= 0:
+                        fire_toolbar_action(block, block.toolbar_focus)
                 continue
             if key == 9:  # Tab — only meaningful in the right (Changes) pane
                 # No-op when the user is on the left review pane: there's
@@ -522,6 +535,44 @@ def handle_confirm(stdscr, state: State) -> None:
                 continue
 
             if panel_focus == "left":
+                # Param-input rows own typing / backspace before the
+                # generic Space / arrow handlers, so the user can put
+                # any allowed char into a parameter buffer without
+                # those keys leaking out to navigation. Up and Down
+                # still fall through (they're not printable), and the
+                # row is auto-removed from the focusables list when
+                # the parent then-run is cycled away from a
+                # parameterised action — no separate exit gesture
+                # required. The validator (allowed-chars +
+                # leading-dash rule) comes from the row's ParamSpec.
+                if (0 <= focus < len(focusables)
+                        and focusables[focus][1] == "param_input"):
+                    from .review import (
+                        _find_param_spec,
+                        _set_then_run_param_value,
+                        _then_run_param_value,
+                    )
+                    sel, param_name = focusables[focus][2]
+                    spec = _find_param_spec(sel, param_name)
+                    if spec is None:
+                        continue
+                    if key in (curses.KEY_BACKSPACE, 127, 8):
+                        cur = _then_run_param_value(sel, param_name)
+                        _set_then_run_param_value(
+                            sel, param_name, cur[:-1])
+                        continue
+                    if 32 <= key < 127:
+                        ch = chr(key)
+                        cur = _then_run_param_value(sel, param_name)
+                        if (not cur and ch == "-"
+                                and spec.refuse_leading_dash):
+                            continue
+                        if ch in spec.valid_chars:
+                            _set_then_run_param_value(
+                                sel, param_name, cur + ch)
+                        continue
+                    # Fall through for ↑/↓ (handled below) and any
+                    # other gesture that should still navigate.
                 if key == ord(" ") and 0 <= focus < len(focusables):
                     _, kind, obj = focusables[focus]
                     if kind == "lfs":
@@ -539,6 +590,16 @@ def handle_confirm(stdscr, state: State) -> None:
                     if kind == "then_run":
                         cycle_then_run(
                             obj, -1 if key == curses.KEY_LEFT else 1)
+                        # Cycling can add or remove the tag_input
+                        # row that follows this selector — rebuild
+                        # the focusables list so Down lands on the
+                        # newly-injected row (or skips one that
+                        # just disappeared). Clamp focus so an
+                        # entry that was at the tail doesn't fall
+                        # past the end after the rebuild.
+                        focusables = _collect_review_focusables(blocks)
+                        if focus >= len(focusables):
+                            focus = max(0, len(focusables) - 1)
                     elif kind == "suggest" and key == curses.KEY_LEFT:
                         # Re-suggest the commit message scoped to the
                         # block's currently-checked files. Lazy import
@@ -557,17 +618,49 @@ def handle_confirm(stdscr, state: State) -> None:
                 if 0 <= bi < len(blocks):
                     block = blocks[bi]
                     n = len(block.files)
-                    if key == curses.KEY_UP and block.file_selected > 0:
-                        block.file_selected -= 1
-                    elif (key == curses.KEY_DOWN
-                            and block.file_selected < n - 1):
-                        block.file_selected += 1
-                    elif key == ord(" ") and 0 <= block.file_selected < n:
-                        # Toggle the staged-for-commit checkbox. Pipeline
-                        # reads block.staged_paths at commit dispatch.
-                        fe = block.files[block.file_selected]
-                        cur = block.staged_paths.get(fe.path, False)
-                        block.staged_paths[fe.path] = not cur
+                    if block.toolbar_focus >= 0:
+                        # Toolbar focus mode — Up is a no-op (already
+                        # at the top of the pane), Down drops back to
+                        # the file list, Left/Right cycle between the
+                        # buttons. Enter is fired by the top-level
+                        # Enter handler (so it isn't swallowed by the
+                        # earlier `continue`); Space here only fires
+                        # toggle buttons (e.g. amend) so an accidental
+                        # Space on `[ stage all ]` doesn't trigger a
+                        # bulk-stage the user didn't intend.
+                        if key == curses.KEY_DOWN:
+                            block.toolbar_focus = -1
+                            if n > 0 and block.file_selected >= n:
+                                block.file_selected = 0
+                        elif key == curses.KEY_LEFT:
+                            block.toolbar_focus = max(
+                                0, block.toolbar_focus - 1)
+                        elif key == curses.KEY_RIGHT:
+                            block.toolbar_focus = min(
+                                2, block.toolbar_focus + 1)
+                        elif key == ord(" ") and is_toolbar_toggle(
+                                block.toolbar_focus):
+                            fire_toolbar_action(
+                                block, block.toolbar_focus)
+                    else:
+                        if key == curses.KEY_UP and block.file_selected > 0:
+                            block.file_selected -= 1
+                        elif key == curses.KEY_UP:
+                            # At file 0 — Up lifts focus to the
+                            # toolbar. Default to "stage all" so the
+                            # most-common follow-up gesture is one
+                            # keystroke away.
+                            block.toolbar_focus = 0
+                        elif (key == curses.KEY_DOWN
+                                and block.file_selected < n - 1):
+                            block.file_selected += 1
+                        elif key == ord(" ") and 0 <= block.file_selected < n:
+                            # Toggle the staged-for-commit checkbox.
+                            # Pipeline reads block.staged_paths at
+                            # commit dispatch.
+                            fe = block.files[block.file_selected]
+                            cur = block.staged_paths.get(fe.path, False)
+                            block.staged_paths[fe.path] = not cur
     finally:
         for b in blocks:
             b.cancel_event.set()

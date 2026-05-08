@@ -779,6 +779,34 @@ def _maybe_prefetch(menu: ActionMenu) -> None:
 # ---------- Draw ----------------------------------------------------------
 
 
+def _scroll_for_cursor(text: str, cur: int,
+                       width: int) -> "tuple[str, int]":
+    """Crop `text` to `width` so the cursor stays visible. When the
+    buffer fits, returns it unchanged with the cursor at its natural
+    offset; when it doesn't, slides a window over the buffer and
+    returns the cursor offset within that window. Mirrors the
+    workspace_menu inline-edit helper so paste-of-long-URLs into the
+    name/url cells doesn't push the cursor off-screen."""
+    cur = max(0, min(cur, len(text)))
+    width = max(1, width)
+    if len(text) <= width - 1 or width <= 1:
+        return text[: width], cur
+    half = (width - 1) // 2
+    start = max(0, min(cur - half, len(text) - (width - 1)))
+    return text[start:start + width - 1], cur - start
+
+
+def _place_inline_cursor(stdscr, y: int, x: int) -> None:
+    """Move the terminal cursor to (y, x) and make it visible. Wrapped
+    in try/except since `move` raises on out-of-bounds, which can
+    happen during a resize race."""
+    try:
+        stdscr.move(y, x)
+        curses.curs_set(2)
+    except curses.error:
+        pass
+
+
 def draw_action_menu(stdscr, state: State, sidebar_x: int) -> None:
     menu = state.action_menu
     if menu is None:
@@ -965,41 +993,72 @@ def draw_action_menu(stdscr, state: State, sidebar_x: int) -> None:
             safe_addstr(stdscr, line, inner_x, " " * inner_w, attr)
             safe_addstr(stdscr, line, inner_x, col0, attr)
             # Determine per-column display + per-column attrs based
-            # on which (if any) field is being edited inline.
+            # on which (if any) field is being edited inline. The
+            # actively-edited cell carries a real terminal cursor —
+            # see _place_inline_cursor below for placement.
+            edit_cell_x = -1
             if inline_editing and menu.edit_field == "rename_remote":
-                name_text = f"{menu.edit_typed}_"
+                name_text = menu.edit_typed
                 name_attr = sb | curses.A_REVERSE
                 url_text = remote_url
                 url_attr = attr
+                edit_cell_x = name_x
             elif inline_editing and menu.edit_field == "set_url_remote":
                 name_text = remote_name
                 name_attr = attr
-                url_text = f"{menu.edit_typed}_"
+                url_text = menu.edit_typed
                 url_attr = sb | curses.A_REVERSE
+                edit_cell_x = url_x
             else:
                 name_text = remote_name
                 url_text = remote_url
                 name_attr = attr
                 url_attr = attr
+            name_render = (name_text if inline_editing
+                           and edit_cell_x == name_x
+                           else end_truncate(name_text, name_w))
+            url_render = (url_text if inline_editing
+                          and edit_cell_x == url_x
+                          else end_truncate(url_text, url_w))
+            # Apply scroll-offset truncation on the active edit cell so
+            # the cursor stays visible when the buffer outgrows the
+            # column width.
+            if inline_editing and edit_cell_x == name_x:
+                name_render, edit_cur_off = _scroll_for_cursor(
+                    name_text, menu.edit_cursor, name_w)
+            elif inline_editing and edit_cell_x == url_x:
+                url_render, edit_cur_off = _scroll_for_cursor(
+                    url_text, menu.edit_cursor, url_w)
+            else:
+                edit_cur_off = 0
             safe_addstr(stdscr, line, name_x,
-                        end_truncate(name_text, name_w).ljust(name_w),
-                        name_attr)
+                        name_render.ljust(name_w), name_attr)
             safe_addstr(stdscr, line, url_x,
-                        end_truncate(url_text, url_w).ljust(url_w),
-                        url_attr)
+                        url_render.ljust(url_w), url_attr)
+            if inline_editing:
+                _place_inline_cursor(
+                    stdscr, line, edit_cell_x + edit_cur_off)
         elif inline_editing:
             # Non-remote inline edits (add_remote_name /
             # add_remote_url) replace the whole row label with the
-            # editable buffer cell. The `_` glyph is a fake cursor.
+            # editable buffer cell. A real terminal cursor lands at
+            # menu.edit_cursor — see _place_inline_cursor.
             if menu.edit_field == "add_remote_name":
-                cell = f"name: {menu.edit_typed}_"
+                prefix_label = "name: "
             elif menu.edit_field == "add_remote_url":
-                cell = f"url: {menu.edit_typed}_"
+                prefix_label = "url: "
             else:
-                cell = menu.edit_typed + "_"
+                prefix_label = ""
+            buf_w = max(1, inner_w - len(col0) - len(prefix_label))
+            visible, cur_off = _scroll_for_cursor(
+                menu.edit_typed, menu.edit_cursor, buf_w)
+            cell = prefix_label + visible
             full = (col0 + cell).ljust(inner_w)
             safe_addstr(stdscr, line, inner_x, full[:inner_w],
                         sb | curses.A_REVERSE)
+            _place_inline_cursor(
+                stdscr, line,
+                inner_x + len(col0) + len(prefix_label) + cur_off)
         else:
             # Whole-row paint so reverse-video stays contiguous,
             # then overlay the caret in its own attr when the row
@@ -1038,6 +1097,15 @@ def draw_action_menu(stdscr, state: State, sidebar_x: int) -> None:
 
     _draw_action_hints(stdscr, menu, footer_y, inner_x, inner_w,
                        sb | curses.A_DIM)
+
+    # No inline edit active → make sure the terminal cursor stays
+    # hidden. _place_inline_cursor turns it back on (and positions
+    # it) inside the per-item draw when an edit is in progress.
+    if not menu.edit_field:
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
 
 
 def _draw_tab_header(stdscr, line: int, inner_x: int, inner_w: int,
@@ -1486,14 +1554,6 @@ def _enter_submenu_for(menu: ActionMenu, item: ActionMenuItem) -> None:
         return
 
 
-# Remote-name allowlist — matches branch_name_prompt's character
-# set, since git remote names follow the same shape rules.
-_VALID_REMOTE_NAME_CHARS = frozenset(
-    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
-    "0123456789-_./"
-)
-
-
 def _begin_rename_remote(menu: ActionMenu, name: str, url: str) -> None:
     """Activate inline rename mode on a remote row. The current name
     is pre-filled in the buffer with the cursor at the end, so the
@@ -1501,6 +1561,7 @@ def _begin_rename_remote(menu: ActionMenu, name: str, url: str) -> None:
     scratch."""
     menu.edit_field = "rename_remote"
     menu.edit_typed = name
+    menu.edit_cursor = len(name)
     menu.edit_pre_value = name
     menu.edit_target_id = f"remote:{name}"
     menu.edit_extra = {"url": url}
@@ -1513,6 +1574,7 @@ def _begin_set_url_remote(menu: ActionMenu, name: str,
     here (the more common edit), R re-routes to the rename path."""
     menu.edit_field = "set_url_remote"
     menu.edit_typed = url
+    menu.edit_cursor = len(url)
     menu.edit_pre_value = url
     menu.edit_target_id = f"remote:{name}"
     menu.edit_extra = {"name": name, "old_url": url}
@@ -1522,6 +1584,7 @@ def _begin_new_remote_name(menu: ActionMenu) -> None:
     """Step 1 of the new-remote inline flow: capture the name."""
     menu.edit_field = "add_remote_name"
     menu.edit_typed = ""
+    menu.edit_cursor = 0
     menu.edit_pre_value = ""
     menu.edit_target_id = "new_remote"
     menu.edit_extra = {}
@@ -1532,6 +1595,7 @@ def _begin_new_remote_url(menu: ActionMenu, name: str) -> None:
     capture the URL. Empty URL is invalid and refuses to advance."""
     menu.edit_field = "add_remote_url"
     menu.edit_typed = ""
+    menu.edit_cursor = 0
     menu.edit_pre_value = ""
     menu.edit_target_id = "new_remote"
     menu.edit_extra = {"name": name}
@@ -1540,6 +1604,7 @@ def _begin_new_remote_url(menu: ActionMenu, name: str) -> None:
 def _cancel_inline_edit(menu: ActionMenu) -> None:
     menu.edit_field = ""
     menu.edit_typed = ""
+    menu.edit_cursor = 0
     menu.edit_pre_value = ""
     menu.edit_target_id = ""
     menu.edit_extra = {}
@@ -1648,85 +1713,102 @@ def _handle_inline_edit_key(state: State, menu: ActionMenu,
                             key: int) -> None:
     """Keystrokes while an inline editable field has focus.
 
-    - typing appends to the buffer (allowlist for names; printable
-      ASCII for URLs since git URLs use `:`, `@`, `/`, etc. that
-      aren't in the name allowlist),
-    - Backspace pops a char,
-    - Enter advances or fires the confirm prompt,
-    - Esc cancels the entire flow (revert to nav mode)."""
+    All four fields (rename / set-url / add-name / add-url) accept
+    any printable ASCII so a pasted URL like
+    `git@github.com:user/repo.git` lands intact regardless of which
+    step the user happens to be on. ←/→/Home/End move the cursor;
+    Backspace and Delete remove the char before/at the cursor;
+    typing inserts at the cursor; Enter advances or fires the
+    confirm prompt; Esc cancels the whole flow."""
     field = menu.edit_field
+    text = menu.edit_typed
+    cur = max(0, min(menu.edit_cursor, len(text)))
     if key == 27:  # Esc — cancel out of inline edit
         _cancel_inline_edit(menu)
         return
     if key in (10, 13, curses.KEY_ENTER):
-        text = menu.edit_typed.strip()
-        if not text:
+        committed = text.strip()
+        if not committed:
             return  # empty value — refuse to advance
         if field == "rename_remote":
             old = menu.edit_pre_value
             url = menu.edit_extra.get("url", "")
-            if text == old:
+            if committed == old:
                 _cancel_inline_edit(menu)
                 return
-            if text.startswith("-"):
+            if committed.startswith("-"):
                 return
             _cancel_inline_edit(menu)
             _request_confirm(
                 menu,
-                f"Rename remote {old} → {text}? [y/N]",
+                f"Rename remote {old} → {committed}? [y/N]",
                 "rename_remote",
-                {"old": old, "new": text, "url": url})
+                {"old": old, "new": committed, "url": url})
             return
         if field == "set_url_remote":
             name = menu.edit_extra.get("name", "")
             old_url = menu.edit_extra.get("old_url", "")
-            if text == old_url:
+            if committed == old_url:
                 _cancel_inline_edit(menu)
                 return
-            if text.startswith("-"):
+            if committed.startswith("-"):
                 return
             _cancel_inline_edit(menu)
             _request_confirm(
                 menu,
-                f"Set {name} URL → {text}? [y/N]",
+                f"Set {name} URL → {committed}? [y/N]",
                 "set_url_remote",
-                {"name": name, "url": text, "old_url": old_url})
+                {"name": name, "url": committed, "old_url": old_url})
             return
         if field == "add_remote_name":
-            if text.startswith("-"):
+            if committed.startswith("-"):
                 return
             # Refuse a name that already exists locally.
-            if any(n == text for n, _ in menu.remotes_list):
+            if any(n == committed for n, _ in menu.remotes_list):
                 return
-            _begin_new_remote_url(menu, text)
+            _begin_new_remote_url(menu, committed)
             return
         if field == "add_remote_url":
-            if text.startswith("-"):
+            if committed.startswith("-"):
                 return
             name = menu.edit_extra.get("name", "")
             _cancel_inline_edit(menu)
             _request_confirm(
                 menu,
-                f"Add remote {name} → {text}? [y/N]",
+                f"Add remote {name} → {committed}? [y/N]",
                 "add_remote",
-                {"name": name, "url": text})
+                {"name": name, "url": committed})
             return
         return
+    if key == curses.KEY_LEFT:
+        menu.edit_cursor = max(0, cur - 1)
+        return
+    if key == curses.KEY_RIGHT:
+        menu.edit_cursor = min(len(text), cur + 1)
+        return
+    if key in (curses.KEY_HOME, 1):
+        menu.edit_cursor = 0
+        return
+    if key in (curses.KEY_END, 5):
+        menu.edit_cursor = len(text)
+        return
     if key in (curses.KEY_BACKSPACE, 127, 8):
-        menu.edit_typed = menu.edit_typed[:-1]
+        if cur > 0:
+            menu.edit_typed = text[: cur - 1] + text[cur:]
+            menu.edit_cursor = cur - 1
+        return
+    if key == curses.KEY_DC:
+        if cur < len(text):
+            menu.edit_typed = text[:cur] + text[cur + 1:]
         return
     if 32 <= key < 127:
-        ch = chr(key)
-        if field in ("rename_remote", "add_remote_name"):
-            if not menu.edit_typed and ch == "-":
-                return
-            if ch in _VALID_REMOTE_NAME_CHARS:
-                menu.edit_typed += ch
-        elif field in ("add_remote_url", "set_url_remote"):
-            # URLs accept any printable ASCII char so user can paste
-            # `git@github.com:user/repo.git` without us silently
-            # filtering colon / at-sign / slash.
-            menu.edit_typed += ch
+        # All fields accept any printable ASCII so paste of a full
+        # remote URL (with `:` / `@` / `/`) survives intact even when
+        # the user lands on the name step. Submit-time validators
+        # (the `-` prefix check above + git's own remote add) catch
+        # genuinely invalid values.
+        menu.edit_typed = text[:cur] + chr(key) + text[cur:]
+        menu.edit_cursor = cur + 1
 
 
 def _handle_confirm_key(state: State, menu: ActionMenu,
@@ -1842,7 +1924,7 @@ def _handle_pane_key(state: State, menu: ActionMenu, key: int) -> None:
     if menu.pane_tab == "tree":
         _handle_tree_key(state, menu, key)
     else:
-        _handle_commits_key(menu, key)
+        _handle_commits_key(state, menu, key)
     _maybe_prefetch(menu)
 
 
@@ -1883,7 +1965,8 @@ def _handle_tree_key(state: State, menu: ActionMenu, key: int) -> None:
         return
 
 
-def _handle_commits_key(menu: ActionMenu, key: int) -> None:
+def _handle_commits_key(state: State, menu: ActionMenu,
+                        key: int) -> None:
     commits = _filtered_commits(menu)
     max_idx = len(commits)
     on_filter = (menu.commits_selected == 0)
@@ -1897,6 +1980,22 @@ def _handle_commits_key(menu: ActionMenu, key: int) -> None:
     if key == curses.KEY_DOWN:
         if menu.commits_selected < max_idx:
             menu.commits_selected += 1
+        return
+    if key == 9 and not on_filter:
+        # Tab on a focused commit row pops the commit-view modal.
+        # `commits_selected` is 1-indexed (0 = filter row); subtract
+        # 1 to land on the commit list. Sub-modal of the action
+        # menu — main loop dispatches keys to it before this menu.
+        idx = menu.commits_selected - 1
+        if 0 <= idx < len(commits):
+            from .commit_view import open_commit_view_modal
+            commit = commits[idx]
+            open_commit_view_modal(
+                state,
+                target_path=menu.target_path,
+                target_label=menu.target_label,
+                sha=commit.sha,
+                subject=commit.subject)
         return
     if on_filter and _is_typing_key(key):
         if key in (curses.KEY_BACKSPACE, 127, 8):

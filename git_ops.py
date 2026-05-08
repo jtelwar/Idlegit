@@ -42,6 +42,38 @@ def _find_embedded_gitlinks(base: Path,
 # git status XY codes that indicate an unmerged path.
 CONFLICT_CODES = frozenset({"DD", "AU", "UD", "UA", "DU", "AA", "UU"})
 
+
+def _iter_porcelain_z_entries(out: str):
+    """Yield `(xy, path)` tuples from the output of
+    `git status --porcelain=v1 -z`, correctly skipping the
+    source-path follow-up token that `R` (rename) and `C` (copy)
+    entries emit.
+
+    `-z` mode encodes a rename as TWO NUL-separated tokens —
+    `R<flag> destpath` followed by `srcpath` — and a naive
+    `out.split("\\x00")` loop reads `srcpath` as a third row. That
+    row has no `XY ` prefix, so a downstream `entry[3:]` slice would
+    chop the first three characters of the source path (`idlegit.conf`
+    → `egit.conf`) and pass the corrupt path to `git add`, producing
+    `fatal: pathspec 'egit.conf' did not match any files`. Centralising
+    the parser here keeps every status reader consistent — only one
+    place to update if the porcelain format ever changes again."""
+    parts = out.split("\x00")
+    i = 0
+    while i < len(parts):
+        entry = parts[i]
+        i += 1
+        if len(entry) < 3:
+            continue
+        xy = entry[:2]
+        path = entry[3:]
+        # R/C entries carry an extra source-path token under -z;
+        # consume it here so callers don't have to.
+        if xy[0] in ("R", "C") or xy[1] in ("R", "C"):
+            if i < len(parts):
+                i += 1
+        yield xy, path
+
 # .git/<marker> files/dirs that mean a merge-like operation is in progress.
 MERGE_MARKER_FILES = ("MERGE_HEAD", "REBASE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD")
 MERGE_MARKER_DIRS = ("rebase-merge", "rebase-apply")
@@ -220,11 +252,7 @@ def refresh_repo(repo: Repo) -> None:
     if rc != 0:
         repo.error = (err or "git status failed").strip().splitlines()[0]
         return
-    for entry in out.split("\x00"):
-        if len(entry) < 3:
-            continue
-        xy = entry[:2]
-        p = entry[3:]
+    for xy, p in _iter_porcelain_z_entries(out):
         if xy == "??":
             repo.untracked.append(p)
             continue
@@ -795,7 +823,7 @@ import json  # noqa: E402 — section-local convenience
 import re  # noqa: E402
 import shutil  # noqa: E402
 
-from models import WorkflowInfo  # noqa: E402
+from models import WorkflowInfo, WorkflowInput  # noqa: E402
 
 
 _GH_PATH: Optional[str] = shutil.which("gh")
@@ -997,12 +1025,150 @@ def _parse_on_block(text: str) -> dict:
     return result
 
 
+def _parse_workflow_dispatch_inputs(text: str) -> "List[WorkflowInput]":
+    """Best-effort scan for `on.workflow_dispatch.inputs` entries —
+    returns each input as a `WorkflowInput(name, description,
+    default)` in declaration order. Hand-rolled rather than pulling
+    in PyYAML so the project keeps its zero-dependency promise; the
+    parser handles the common shape:
+
+        on:
+          workflow_dispatch:
+            inputs:
+              version:
+                description: 'Version to deploy'
+                default: 'v1.0'
+                required: true
+                type: string
+
+    Sub-fields it doesn't know about (type / required / options) are
+    silently ignored — value handling on the dispatch side is
+    generic (string), and required-but-empty inputs surface as a gh
+    error rather than a parse-time concern. Returns [] when the
+    workflow isn't dispatchable, the YAML is exotic enough to
+    confuse the line scanner, or the `inputs:` block is absent."""
+    lines = text.splitlines()
+
+    on_idx: Optional[int] = None
+    for i, raw in enumerate(lines):
+        if raw.startswith(("on:", "on ")) and not raw.startswith((" ", "\t")):
+            on_idx = i
+            break
+    if on_idx is None:
+        return []
+
+    def _walk_children(start_idx: int, parent_indent: int
+                       ) -> List[Tuple[int, int, str]]:
+        """Yield (line_idx, indent, line) for indented children of
+        the line at start_idx (which sits at `parent_indent`).
+        Stops at the next line whose indent is <= parent_indent.
+        Skips blanks and comment-only lines."""
+        out: List[Tuple[int, int, str]] = []
+        j = start_idx + 1
+        while j < len(lines):
+            line = lines[j]
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                j += 1
+                continue
+            indent = len(line) - len(line.lstrip())
+            if indent <= parent_indent:
+                break
+            out.append((j, indent, line))
+            j += 1
+        return out
+
+    on_children = _walk_children(on_idx, 0)
+    if not on_children:
+        return []
+
+    # Locate `workflow_dispatch:` directly under `on:`.
+    base_indent = min(ind for _, ind, _ in on_children)
+    wd_idx: Optional[int] = None
+    wd_indent: int = 0
+    for line_idx, indent, line in on_children:
+        if indent != base_indent:
+            continue
+        stripped = line.strip()
+        if stripped.startswith("workflow_dispatch:") or \
+                stripped == "workflow_dispatch":
+            wd_idx = line_idx
+            wd_indent = indent
+            break
+    if wd_idx is None:
+        return []
+
+    # Then `inputs:` directly under `workflow_dispatch:`.
+    wd_children = _walk_children(wd_idx, wd_indent)
+    inputs_idx: Optional[int] = None
+    inputs_indent: int = 0
+    if wd_children:
+        wd_base = min(ind for _, ind, _ in wd_children)
+        for line_idx, indent, line in wd_children:
+            if indent != wd_base:
+                continue
+            stripped = line.strip()
+            if stripped.startswith("inputs:") or stripped == "inputs":
+                inputs_idx = line_idx
+                inputs_indent = indent
+                break
+    if inputs_idx is None:
+        return []
+
+    # Walk every input name (one per child at the inputs-base indent)
+    # and pick up `description:` / `default:` from its sub-block.
+    input_children = _walk_children(inputs_idx, inputs_indent)
+    if not input_children:
+        return []
+    name_indent = min(ind for _, ind, _ in input_children)
+    inputs: List[WorkflowInput] = []
+    i = 0
+    while i < len(input_children):
+        line_idx, indent, line = input_children[i]
+        if indent != name_indent:
+            i += 1
+            continue
+        stripped = line.strip().split("#", 1)[0].strip()
+        if not stripped.endswith(":"):
+            # Skip exotic `name: <inline>` forms — inputs always
+            # nest sub-fields under the name in real workflow YAML.
+            i += 1
+            continue
+        name = stripped[:-1].strip().strip('"').strip("'")
+        if not name:
+            i += 1
+            continue
+        entry = WorkflowInput(name=name)
+        # Sub-fields of this input — siblings deeper than name_indent
+        # until the next sibling at name_indent.
+        sub = i + 1
+        while sub < len(input_children):
+            sub_idx, sub_indent, sub_line = input_children[sub]
+            if sub_indent <= name_indent:
+                break
+            sub_stripped = sub_line.strip()
+            if ":" in sub_stripped:
+                k, _, v = sub_stripped.partition(":")
+                k = k.strip()
+                v = v.split("#", 1)[0].strip()
+                v = v.strip('"').strip("'")
+                if k == "description":
+                    entry.description = v
+                elif k == "default":
+                    entry.default = v
+            sub += 1
+        inputs.append(entry)
+        i = sub if sub > i + 1 else i + 1
+    return inputs
+
+
 def discover_workflows_local(repo_path: Path) -> List[WorkflowInfo]:
     """Scan `<repo>/.github/workflows/*.{yml,yaml}` and return a
     WorkflowInfo per file. Workflow `name:` falls back to the filename.
-    Trigger metadata is parsed via `_parse_on_block` so callers can
-    predict whether each workflow will fire on a push to a given branch
-    without re-parsing the YAML themselves."""
+    Trigger metadata is parsed via `_parse_on_block`, dispatch inputs
+    via `_parse_workflow_dispatch_inputs`, so callers get everything
+    they need to predict pushes and prompt for inputs without
+    re-parsing the YAML themselves."""
     wf_dir = repo_path / ".github" / "workflows"
     if not wf_dir.is_dir():
         return []
@@ -1030,6 +1196,13 @@ def discover_workflows_local(repo_path: Path) -> List[WorkflowInfo]:
         if not wf_name:
             wf_name = yml.stem
         on_info = _parse_on_block(text)
+        # Inputs are only meaningful when the workflow is
+        # dispatchable — `_parse_workflow_dispatch_inputs` returns
+        # [] either way, but skipping the call when not dispatchable
+        # avoids walking the YAML for nothing.
+        wf_inputs: List[WorkflowInput] = []
+        if on_info["workflow_dispatch"]:
+            wf_inputs = _parse_workflow_dispatch_inputs(text)
         found.append(WorkflowInfo(
             name=wf_name,
             path=str(yml.relative_to(repo_path)),
@@ -1038,6 +1211,7 @@ def discover_workflows_local(repo_path: Path) -> List[WorkflowInfo]:
             triggers_push=on_info["push"],
             push_branches=on_info["push_branches"],
             push_branches_ignore=on_info["push_branches_ignore"],
+            inputs=wf_inputs,
         ))
     return found
 
@@ -1143,19 +1317,38 @@ def get_run_view(slug: str, run_id: int) -> Optional[dict]:
 
 
 def dispatch_workflow(slug: str, workflow_name: str,
-                      ref: str) -> Tuple[bool, str]:
-    """Trigger a workflow_dispatch on the given branch. Surfaces the gh
-    error (single line) if the workflow isn't dispatchable, the ref is
-    invalid, or the user lacks permission."""
+                      ref: str,
+                      inputs: "Optional[dict]" = None
+                      ) -> Tuple[bool, str]:
+    """Trigger a workflow_dispatch on the given branch. Surfaces the
+    gh error (single line) if the workflow isn't dispatchable, the
+    ref is invalid, or the user lacks permission.
+
+    `inputs` (when supplied) is a `{name: value}` dict — non-empty
+    entries are forwarded as `-F <name>=<value>`. Required-but-empty
+    inputs aren't pre-checked here; we let GitHub return the
+    canonical error so the user sees the same message they'd get on
+    the web UI."""
     if not workflow_name or workflow_name.startswith("-"):
         return False, "unsafe workflow name"
     if not is_safe_ref_arg(ref):
         return False, "unsafe workflow ref"
-    rc, _, err = gh([
+    args = [
         "workflow", "run", workflow_name,
         "--repo", slug,
         "--ref", ref,
-    ])
+    ]
+    if inputs:
+        for name, value in inputs.items():
+            if not name or name.startswith("-"):
+                # Defence-in-depth: gh's argv parsing would already
+                # reject these, but skipping here keeps the error
+                # surface tight.
+                continue
+            if value == "":
+                continue
+            args.extend(["-F", f"{name}={value}"])
+    rc, _, err = gh(args)
     if rc != 0:
         return False, first_line(err)
     return True, "dispatched"
@@ -1248,11 +1441,7 @@ def query_working_tree(path: Path) -> List[FileEntry]:
     rc, out, _ = git(path, ["status", "--porcelain=v1", "-z"])
     if rc != 0:
         return []
-    for entry in out.split("\x00"):
-        if len(entry) < 3:
-            continue
-        xy = entry[:2]
-        p = entry[3:]
+    for xy, p in _iter_porcelain_z_entries(out):
         if xy == "??":
             entries[p] = FileEntry(path=p, x=" ", y=" ", untracked=True)
             continue
@@ -1409,6 +1598,177 @@ def list_stashes(path: Path) -> List[Tuple[str, str]]:
     return rows
 
 
+def list_tags_at(path: Path, sha: str) -> List[str]:
+    """Return every tag pointing at `sha`, in `git tag` order. Refuses
+    `-`-prefixed shas as a defence-in-depth (git's argv parsing already
+    rejects them in this position) so the caller doesn't have to."""
+    if not sha or sha.startswith("-"):
+        return []
+    rc, out, _ = git(path, ["tag", "--points-at", sha])
+    if rc != 0:
+        return []
+    return [ln.strip() for ln in out.splitlines() if ln.strip()]
+
+
+def query_commit_files(path: Path, sha: str) -> List[FileEntry]:
+    """File-changes list for a single commit, in the same FileEntry
+    shape `query_working_tree` returns so the review-pane file row
+    renderer can display either without branching. `x` is the change
+    status letter (M / A / D / R / …); `y` stays blank since commits
+    don't carry a worktree-side state. Insertion / deletion counts
+    come from `git show --numstat`."""
+    if not sha or sha.startswith("-"):
+        return []
+    entries: Dict[str, FileEntry] = {}
+    rc, name_out, _ = git(path, [
+        "show", "--name-status", "--format=", sha,
+    ])
+    if rc != 0:
+        return []
+    for line in name_out.splitlines():
+        line = line.rstrip()
+        if not line:
+            continue
+        parts = line.split("\t")
+        if len(parts) < 2:
+            continue
+        status = parts[0][0] if parts[0] else " "
+        # Renames have shape `R100\told\tnew` — pick the new path so
+        # the row reflects what's in the tree after the commit.
+        path_s = parts[-1]
+        if path_s in entries:
+            continue
+        entries[path_s] = FileEntry(path=path_s, x=status, y=" ")
+    rc2, num_out, _ = git(path, [
+        "show", "--numstat", "--format=", sha,
+    ])
+    if rc2 == 0:
+        for line in num_out.splitlines():
+            parts = line.split("\t")
+            if len(parts) < 3:
+                continue
+            try:
+                ins = int(parts[0]) if parts[0] != "-" else 0
+                dels = int(parts[1]) if parts[1] != "-" else 0
+            except ValueError:
+                continue
+            fe = entries.get(parts[-1])
+            if fe is not None:
+                fe.inserted = ins
+                fe.deleted = dels
+    return sorted(entries.values(), key=lambda f: f.path.lower())
+
+
+def get_commit_details(path: Path, sha: str
+                       ) -> Tuple[str, str, str, str]:
+    """Return `(author, date, subject, body)` for `sha`. `date` uses
+    git's --date=short (YYYY-MM-DD) for a stable display format.
+    Empty tuple on failure / unsafe sha — caller treats blank fields
+    as "not yet loaded" so the modal can render before this lands."""
+    if not sha or sha.startswith("-"):
+        return ("", "", "", "")
+    # Use a NUL separator so multi-line bodies don't collide with
+    # tab-separated fields.
+    rc, out, _ = git(path, [
+        "show", "-s",
+        "--format=%an%x00%ad%x00%s%x00%b",
+        "--date=short", sha,
+    ])
+    if rc != 0 or not out:
+        return ("", "", "", "")
+    parts = out.split("\x00", 3)
+    while len(parts) < 4:
+        parts.append("")
+    return (parts[0], parts[1], parts[2], parts[3].rstrip("\n"))
+
+
+def query_file_log(path: Path, file_path: str, *,
+                   max_count: int = 200,
+                   sha: str = "") -> List[str]:
+    """Return one-line `<short-sha> <date> <subject>` rows for
+    commits that touched `file_path`. When `sha` is supplied the
+    log is scoped to commits reachable from that sha (useful when
+    the diff viewer is opened against a specific commit). Empty
+    list on failure / unsafe input."""
+    if not file_path or file_path.startswith("-"):
+        return []
+    args = ["log", f"--max-count={max_count}",
+            "--pretty=format:%h %ad %s", "--date=short"]
+    if sha:
+        if sha.startswith("-"):
+            return []
+        args.append(sha)
+    args.extend(["--", file_path])
+    rc, out, _ = git(path, args)
+    if rc != 0 or not out:
+        return []
+    return out.splitlines()
+
+
+def query_file_blame(path: Path, file_path: str, *,
+                     sha: str = "") -> List[str]:
+    """Return blame output lines for `file_path` (at `sha` if
+    given). Each row is the standard `<short-sha> (<author> <date>
+    <line-number>) <line content>` format git emits with
+    `--abbrev=8`. Empty list when blame fails (binary file,
+    untracked, etc.)."""
+    if not file_path or file_path.startswith("-"):
+        return []
+    args = ["blame", "--abbrev=8"]
+    if sha:
+        if sha.startswith("-"):
+            return []
+        args.append(sha)
+    args.extend(["--", file_path])
+    rc, out, _ = git(path, args)
+    if rc != 0:
+        return []
+    return out.splitlines()
+
+
+def query_commit_reflog(path: Path, sha: str) -> List[str]:
+    """Return HEAD reflog entries that mention `sha` as the
+    resolved commit. Each row: `<short-sha> <reflog-selector>
+    <reflog-message>`, e.g. `a1b2c3d HEAD@{2} reset: moving to
+    HEAD~1`. Filtered client-side by matching the first
+    space-separated token against the requested sha (full or
+    short) — `git reflog` lacks a built-in filter and we'd rather
+    do the comparison locally than hit the network. Empty list on
+    failure or no matches."""
+    if not sha:
+        return []
+    rc, out, _ = git(path, [
+        "reflog", "--pretty=format:%h %gd %gs",
+    ])
+    if rc != 0 or not out:
+        return []
+    sha_short = sha[:8]
+    matches: List[str] = []
+    for line in out.splitlines():
+        if not line:
+            continue
+        head = line.split(" ", 1)[0]
+        if (head == sha_short or head == sha
+                or sha.startswith(head) or head.startswith(sha_short)):
+            matches.append(line)
+    return matches
+
+
+def commit_show_diff(path: Path, sha: str, file_path: str) -> List[str]:
+    """Return the per-file diff lines for a commit — i.e. what
+    `git show <sha> -- <path>` produces, split into lines. Used by
+    the diff viewer when it's opened from the commit view modal."""
+    if (not sha or sha.startswith("-")
+            or not file_path or file_path.startswith("-")):
+        return ["(unsafe sha or path)"]
+    rc, out, err = git(path, [
+        "show", sha, "--", file_path,
+    ])
+    if rc != 0 and not out:
+        return [(err or "(no diff available)").strip()]
+    return out.splitlines() if out else ["(no diff)"]
+
+
 def list_remote_tracking_refs(path: Path) -> List[str]:
     """Return remote-tracking refs in their full form (e.g.
     `origin/main`, `upstream/dev`). Used by the set-upstream picker —
@@ -1504,11 +1864,7 @@ def _scan_path_status(path: Path) -> Tuple[
     rc, out, _ = git(path, ["status", "--porcelain=v1", "-z"])
     if rc != 0:
         return staged, unstaged, untracked, has_conflicts
-    for entry in out.split("\x00"):
-        if len(entry) < 3:
-            continue
-        xy = entry[:2]
-        p = entry[3:]
+    for xy, p in _iter_porcelain_z_entries(out):
         if xy == "??":
             untracked.append(p)
             continue

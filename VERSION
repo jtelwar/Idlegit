@@ -1,0 +1,6 @@
+0.8.7
+
+# This file is the single source of truth for the app's version
+# string. config.py reads only the first non-blank, non-comment line.
+# Everything below is free-form — use it for release notes / change
+# tracking between bumps if you like; the loader ignores it.
