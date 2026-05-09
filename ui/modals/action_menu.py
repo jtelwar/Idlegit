@@ -13,20 +13,20 @@ import curses
 import threading
 from typing import List, Optional
 
-from models import (
+from core.models import (
     ActionMenu, ActionMenuItem, ActionSubmenuFrame, ChildRef,
     CommitEntry, FileEntry, Repo, State,
 )
-from git_ops import (
+from core.git_ops import (
     gh_available, load_commits, parse_github_slug, query_target_state,
     query_working_tree,
 )
-from workers import kick_off_action
+from core.workers import kick_off_action
 
 from ..colors import (
-    PAIR_AHEAD, PAIR_BEHIND, PAIR_BRANCH, PAIR_DIRTY, PAIR_ERR, PAIR_OK,
-    PAIR_PASTEL_BLUE, PAIR_PASTEL_GREEN, PAIR_PASTEL_RED, PAIR_PASTEL_YELLOW,
-    PAIR_SB_CYAN, PAIR_SB_FG,
+    PAIR_DLG_MAGENTA, PAIR_DLG_WARN, PAIR_DLG_ERR, PAIR_DLG_OK,
+    PAIR_DLG_PASTEL_BLUE, PAIR_DLG_PASTEL_GREEN, PAIR_DLG_PASTEL_RED, PAIR_DLG_PASTEL_YELLOW,
+    PAIR_DLG_CYAN, PAIR_DLG_FG,
 )
 from ..geometry import (
     draw_modal_fill, end_truncate, modal_geometry, safe_addstr, truncate,
@@ -113,11 +113,11 @@ def _draw_action_hints(stdscr, menu: ActionMenu, y: int, x: int,
         # Bold yellow strip — same treatment the standalone remotes
         # modal's confirm row uses, so the confirm UX reads the same
         # everywhere.
-        from ..colors import PAIR_WARN
+        from ..colors import PAIR_DLG_WARN
         text = menu.confirm_message
         safe_addstr(stdscr, y, x,
                     text[:max(0, w)],
-                    curses.color_pair(PAIR_WARN) | curses.A_BOLD)
+                    curses.color_pair(PAIR_DLG_WARN) | curses.A_BOLD)
         return
     if menu.edit_field:
         from ..hints import KEY_BACKSPACE
@@ -151,15 +151,15 @@ def _draw_action_hints(stdscr, menu: ActionMenu, y: int, x: int,
 def _file_status_pair(x: str, y: str) -> Optional[int]:
     pair = (x, y)
     if "U" in pair or pair == ("A", "A") or pair == ("D", "D"):
-        return PAIR_PASTEL_RED
+        return PAIR_DLG_PASTEL_RED
     if "D" in pair:
-        return PAIR_PASTEL_RED
+        return PAIR_DLG_PASTEL_RED
     if "A" in pair:
-        return PAIR_PASTEL_GREEN
+        return PAIR_DLG_PASTEL_GREEN
     if "R" in pair:
-        return PAIR_PASTEL_BLUE
+        return PAIR_DLG_PASTEL_BLUE
     if "M" in pair:
-        return PAIR_PASTEL_YELLOW
+        return PAIR_DLG_PASTEL_YELLOW
     return None
 
 
@@ -463,18 +463,18 @@ def _state_label_for(branch_meta):
     Same precedence as the existing UI: merging > diverged > dirty >
     behind > ahead > no-upstream > clean."""
     if branch_meta["merging"]:
-        return "merging", PAIR_ERR
+        return "merging", PAIR_DLG_ERR
     if branch_meta["ahead"] > 0 and branch_meta["behind"] > 0:
-        return "diverged", PAIR_ERR
+        return "diverged", PAIR_DLG_ERR
     if branch_meta["dirty"]:
-        return "dirty", PAIR_DIRTY
+        return "dirty", PAIR_DLG_WARN
     if branch_meta["behind"] > 0:
-        return "behind", PAIR_BEHIND
+        return "behind", PAIR_DLG_MAGENTA
     if branch_meta["ahead"] > 0:
-        return "ahead", PAIR_AHEAD
+        return "ahead", PAIR_DLG_CYAN
     if branch_meta["upstream"] is None:
         return "no upstream", 0
-    return "clean", PAIR_OK
+    return "clean", PAIR_DLG_OK
 
 
 def _initial_meta_from_cache(target_repo: Optional[Repo],
@@ -566,7 +566,7 @@ def open_action_menu(state: State) -> None:
     # main-menu opener labels (`stashes (N)`, `remotes (N)`) reflect
     # the on-disk state. Both are fast even on large repos and
     # avoid re-running on every state refresh.
-    from git_ops import list_stashes, list_remotes
+    from core.git_ops import list_stashes, list_remotes
     stashes = list_stashes(target_path)
     remotes_list = list_remotes(target_path)
     stash_count = len(stashes)
@@ -841,7 +841,7 @@ def draw_action_menu(stdscr, state: State, sidebar_x: int) -> None:
                  + 1 + 1
                  + 1)
     x, y, w, h = modal_geometry(stdscr, sidebar_x, MODAL_W, content_h)
-    sb = curses.color_pair(PAIR_SB_FG)
+    sb = curses.color_pair(PAIR_DLG_FG)
     draw_modal_fill(stdscr, x, y, w, h, sb)
 
     inner_x = x + 2
@@ -857,7 +857,7 @@ def draw_action_menu(stdscr, state: State, sidebar_x: int) -> None:
     path_str = str(menu.target_path)
     name_clip = end_truncate(name, inner_w)
     safe_addstr(stdscr, y + 1, inner_x, name_clip,
-                curses.A_BOLD | curses.color_pair(PAIR_SB_CYAN))
+                curses.A_BOLD | curses.color_pair(PAIR_DLG_CYAN))
     # Reserve room for "  [<path>]" — 4 cells of fixed chrome around
     # the truncated path. min length 3 so we never collapse to "[…]".
     avail = inner_w - len(name_clip) - 4
@@ -870,7 +870,7 @@ def draw_action_menu(stdscr, state: State, sidebar_x: int) -> None:
     branch_label = menu.branch or "(loading…)"
     branch_str = f"[{branch_label}]"
     safe_addstr(stdscr, line, inner_x, branch_str,
-                curses.color_pair(PAIR_BRANCH))
+                curses.color_pair(PAIR_DLG_CYAN))
     if menu.state_loading:
         # Spinner + neutral "checking…" badge while query_target_state
         # is in flight. Matches the sidebar spinner so the user reads
@@ -909,7 +909,7 @@ def draw_action_menu(stdscr, state: State, sidebar_x: int) -> None:
         for i, seg in enumerate(segs):
             is_last = (i == len(segs) - 1)
             if is_last:
-                seg_attr = (curses.color_pair(PAIR_SB_CYAN)
+                seg_attr = (curses.color_pair(PAIR_DLG_CYAN)
                             | curses.A_BOLD)
             else:
                 seg_attr = sb | curses.A_DIM
@@ -957,7 +957,7 @@ def draw_action_menu(stdscr, state: State, sidebar_x: int) -> None:
         # Attribute selection — back rows render as dim cyan
         # breadcrumb-style, regardless of state.
         if item.is_back:
-            attr = curses.color_pair(PAIR_SB_CYAN) | curses.A_DIM
+            attr = curses.color_pair(PAIR_DLG_CYAN) | curses.A_DIM
             if focused:
                 attr |= curses.A_REVERSE
         elif focused and item.enabled:
@@ -1068,7 +1068,7 @@ def draw_action_menu(stdscr, state: State, sidebar_x: int) -> None:
             full = (col0 + label).ljust(inner_w)
             safe_addstr(stdscr, line, inner_x, full[:inner_w], attr)
             if item.has_submenu and not focused:
-                caret_attr = (curses.color_pair(PAIR_SB_CYAN)
+                caret_attr = (curses.color_pair(PAIR_DLG_CYAN)
                               | curses.A_DIM)
                 safe_addstr(stdscr, line, inner_x, "›", caret_attr)
         line += 1
@@ -1130,7 +1130,7 @@ def _draw_tab_header(stdscr, line: int, inner_x: int, inner_w: int,
         active = (menu.pane_tab == tid)
         text = f" {label} ({count}) "
         if active and menu.pane_focus:
-            attr = curses.color_pair(PAIR_SB_CYAN) | curses.A_BOLD
+            attr = curses.color_pair(PAIR_DLG_CYAN) | curses.A_BOLD
         elif active:
             attr = sb | curses.A_BOLD
         else:
@@ -1256,9 +1256,9 @@ def _draw_tree_row(stdscr, y: int, x: int, inner_w: int, fe: FileEntry,
     if stat:
         stat_x = x + len(left) + pad + 1
         safe_addstr(stdscr, y, stat_x, stat_ins,
-                    curses.color_pair(PAIR_PASTEL_GREEN))
+                    curses.color_pair(PAIR_DLG_PASTEL_GREEN))
         safe_addstr(stdscr, y, stat_x + len(stat_ins) + 1, stat_del,
-                    curses.color_pair(PAIR_PASTEL_RED))
+                    curses.color_pair(PAIR_DLG_PASTEL_RED))
 
 
 def _draw_commits_pane(stdscr, line: int, inner_x: int, inner_w: int,
@@ -1330,11 +1330,11 @@ def _draw_commit_row(stdscr, y: int, x: int, inner_w: int,
     safe_addstr(stdscr, y, x, full, sb)
     # Overlay the SHA (positions 2..2+len(sha)).
     safe_addstr(stdscr, y, x + 2, sha,
-                curses.color_pair(PAIR_PASTEL_YELLOW))
+                curses.color_pair(PAIR_DLG_PASTEL_YELLOW))
     if rel:
         rel_x = x + len(head) + pad + 1
         safe_addstr(stdscr, y, rel_x, rel,
-                    curses.color_pair(PAIR_PASTEL_BLUE))
+                    curses.color_pair(PAIR_DLG_PASTEL_BLUE))
 
 
 # ---------- Handle --------------------------------------------------------
@@ -1524,7 +1524,7 @@ def _enter_submenu_for(menu: ActionMenu, item: ActionMenuItem) -> None:
         # Refresh the cached stash list every time the submenu opens
         # so a freshly-created stash shows up without needing the
         # whole modal to reopen.
-        from git_ops import list_stashes
+        from core.git_ops import list_stashes
         menu.stashes = list_stashes(menu.target_path)
         menu.stash_count = len(menu.stashes)
         menu.items = _build_main_items(
@@ -1536,7 +1536,7 @@ def _enter_submenu_for(menu: ActionMenu, item: ActionMenuItem) -> None:
     if item.id == "remotes_submenu":
         # Refresh remotes on entry the same way stashes does — picks
         # up renames / additions made by an external git command.
-        from git_ops import list_remotes
+        from core.git_ops import list_remotes
         menu.remotes_list = list_remotes(menu.target_path)
         menu.remote_count = len(menu.remotes_list)
         menu.items = _build_main_items(
@@ -1629,8 +1629,8 @@ def _apply_remote_op(state: State, menu: ActionMenu) -> None:
     action and hand it to `kick_off_remote_changes`. The same
     pipeline that powers the standalone remotes modal handles the
     operation order and task-label rendering."""
-    from models import RemoteRow
-    from workers import kick_off_remote_changes
+    from core.models import RemoteRow
+    from core.workers import kick_off_remote_changes
     args = menu.confirm_args
     row: Optional[RemoteRow] = None
     if menu.confirm_action == "rename_remote":

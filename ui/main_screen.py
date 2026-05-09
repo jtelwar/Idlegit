@@ -5,13 +5,15 @@ import curses
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from models import ChildRef, Repo, State
-from config import APP_DISPLAY_NAME, VERSION, WORKSPACES_FILE
+from core.models import ChildRef, Repo, State
+from core.config import APP_DISPLAY_NAME, VERSION, WORKSPACES_FILE
 from .colors import (
     PAIR_AHEAD, PAIR_BEHIND, PAIR_BRANCH, PAIR_DIRTY, PAIR_ERR, PAIR_HEADER,
-    PAIR_HEADER_ACTIVE, PAIR_OK, child_state_color, state_color,
+    PAIR_OK, child_state_color, state_color,
 )
-from .geometry import clamp_scroll, field_visible, safe_addstr, truncate
+from .geometry import (
+    clamp_scroll, draw_scroll_overflow, field_visible, safe_addstr, truncate,
+)
 from .hints import (
     KEY_CTRL_R, KEY_CTRL_S, KEY_ENTER, KEY_ESC, KEY_LEFT, KEY_LEFT_RIGHT,
     KEY_SHIFT_TAB, KEY_TAB, KEY_UP_DOWN, Hint, render_hints,
@@ -22,7 +24,7 @@ from .modals import (
     draw_detached_recovery_prompt,
     draw_diff_viewer, draw_remotes_modal, draw_reset_prompt,
     draw_task_action_menu, draw_workflow_picker,
-    draw_workspace_creator, draw_workspace_menu, draw_workspaces_picker,
+    draw_workspace_creator, draw_workspace_menu, draw_app_menu,
 )
 from .sidebar import SPINNER_FRAMES, draw_sidebar
 
@@ -202,14 +204,18 @@ def draw_main(stdscr, state: State) -> None:
 
     # Row 0 — Idlegit title (selectable; Tab opens the workspaces
     # picker) followed by a muted version label where the workspace
-    # name used to live. Focus is signalled by a brighter shade —
-    # at-rest is bold magenta (PAIR_HEADER), focused steps up to
-    # orchid2 (PAIR_HEADER_ACTIVE). No chevrons here — those are
-    # reserved for ←/→ switchers like the workspace selector below.
+    # name used to live. Focus is signalled with an underline rather
+    # than a colour shift: every "shade brighter than bold magenta"
+    # in the xterm-256 palette ends up reading as pink/orchid on
+    # the terminals we tested, so the underline keeps the hue
+    # consistent and the focus state still unambiguous. No chevrons
+    # here — those are reserved for ←/→ switchers like the workspace
+    # selector below.
     title_focused = (state.on_title_row
                      and state.focused_panel == "repos")
-    title_pair = (PAIR_HEADER_ACTIVE if title_focused else PAIR_HEADER)
-    title_attr = curses.A_BOLD | curses.color_pair(title_pair)
+    title_attr = curses.A_BOLD | curses.color_pair(PAIR_HEADER)
+    if title_focused:
+        title_attr |= curses.A_UNDERLINE
     safe_addstr(stdscr, 0, 0, APP_DISPLAY_NAME, title_attr)
     x = len(APP_DISPLAY_NAME)
     safe_addstr(stdscr, 0, x, " · ", curses.A_DIM)
@@ -325,12 +331,12 @@ def draw_main(stdscr, state: State) -> None:
                            row_cursor, spinner_char)
 
     if visible_start > 0:
-        safe_addstr(stdscr, base_y - 1, 2,
-                    f"↑ {visible_start} more above", curses.A_DIM)
+        draw_scroll_overflow(stdscr, base_y - 1, 2, main_w - 2,
+                             visible_start, "up", curses.A_DIM)
     if visible_end < len(body_rows):
         below = len(body_rows) - visible_end
-        safe_addstr(stdscr, base_y + body_h, 2,
-                    f"↓ {below} more below", curses.A_DIM)
+        draw_scroll_overflow(stdscr, base_y + body_h, 2, main_w - 2,
+                             below, "down", curses.A_DIM)
 
     # Subtle focus marker at column 0 of the active body row. Skipped
     # on the workspace row (selected = -1) since the chevrons around
@@ -362,7 +368,7 @@ def draw_main(stdscr, state: State) -> None:
                     or state.align_heads_prompt is not None
                     or state.task_action_menu is not None
                     or state.workspace_menu is not None
-                    or state.workspaces_picker is not None
+                    or state.app_menu is not None
                     or state.workspace_creator is not None
                     or state.diff_viewer is not None
                     or state.remotes_modal is not None
@@ -388,8 +394,8 @@ def draw_main(stdscr, state: State) -> None:
         draw_workspace_menu(stdscr, state, sidebar_x)
     # Picker drawn before creator so the creator (when both are open)
     # paints on top — common during the "Create new workspace" flow.
-    if state.workspaces_picker is not None:
-        draw_workspaces_picker(stdscr, state, sidebar_x)
+    if state.app_menu is not None:
+        draw_app_menu(stdscr, state, sidebar_x)
     if state.workspace_creator is not None:
         draw_workspace_creator(stdscr, state, sidebar_x)
     # Sub-modals of action_menu (remotes, commit view) and

@@ -38,7 +38,7 @@ from pathlib import Path
 SCRIPTS_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPTS_DIR.parent
 sys.path.insert(0, str(PROJECT_ROOT))
-from config import APP_DISPLAY_NAME, VERSION  # noqa: E402
+from core.config import APP_DISPLAY_NAME, VERSION  # noqa: E402
 
 
 # ---------- ANSI colors --------------------------------------------------
@@ -183,7 +183,6 @@ def check_repo_layout(summary: "list[str]") -> None:
     # scripts/; everything else sits at the project root.
     required_files = [
         "idlegit", "idlegit.py", "idlegit.default.conf",
-        "config.py", "models.py", "git_ops.py", "workers.py",
         "VERSION",
         "scripts/idlegit-update", "scripts/merge_config.py",
         "scripts/update.py",
@@ -192,8 +191,9 @@ def check_repo_layout(summary: "list[str]") -> None:
         if not (PROJECT_ROOT / name).is_file():
             die(f"missing \"{name}\" — run install.sh from the "
                 f"idlegit repo root (got PROJECT_ROOT={PROJECT_ROOT})")
-    if not (PROJECT_ROOT / "ui").is_dir():
-        die("missing ui/ — run install.sh from the idlegit repo root")
+    for pkg in ("core", "ui"):
+        if not (PROJECT_ROOT / pkg).is_dir():
+            die(f"missing {pkg}/ — run install.sh from the idlegit repo root")
     ok("repo layout", str(PROJECT_ROOT))
     summary.append(f"Verified repo layout under {PROJECT_ROOT}")
 
@@ -248,10 +248,6 @@ def install_files(home: Path, summary: list) -> None:
         ("idlegit", 0o755, None),
         ("idlegit.default.conf", 0o644, None),
         ("idlegit.py", 0o644, None),
-        ("config.py", 0o644, None),
-        ("models.py", 0o644, None),
-        ("git_ops.py", 0o644, None),
-        ("workers.py", 0o644, None),
         ("VERSION", 0o644, None),
         ("scripts/idlegit-update", 0o755, None),
         ("scripts/update.py", 0o755, None),
@@ -262,11 +258,14 @@ def install_files(home: Path, summary: list) -> None:
         dst = home / (dst_name or Path(src_relpath).name)
         shutil.copy2(src, dst)
         os.chmod(dst, mode)
-    # Replace the ui/ tree wholesale so renames / removals propagate.
-    ui_dst = home / "ui"
-    if ui_dst.exists():
-        shutil.rmtree(ui_dst)
-    shutil.copytree(PROJECT_ROOT / "ui", ui_dst)
+    # Replace the core/ and ui/ trees wholesale so renames / removals
+    # propagate. core/ is the domain layer (config + models + git_ops
+    # + workers); ui/ is the curses surface.
+    for pkg in ("core", "ui"):
+        dst = home / pkg
+        if dst.exists():
+            shutil.rmtree(dst)
+        shutil.copytree(PROJECT_ROOT / pkg, dst)
     ok("copied launcher + Python modules + ui/")
     summary.append(f"Installed / refreshed app files in {home}")
 

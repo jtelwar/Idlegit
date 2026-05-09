@@ -13,17 +13,17 @@ from __future__ import annotations
 import curses
 from typing import List
 
-from models import ActionMenuItem, CommitViewModal, FileEntry, State
-from workers import kick_off_add_tag, kick_off_load_commit_view
+from core.models import ActionMenuItem, CommitViewModal, FileEntry, State
+from core.workers import kick_off_add_tag, kick_off_load_commit_view
 
 from ..colors import (
-    PAIR_BRANCH, PAIR_OK, PAIR_PASTEL_GREEN, PAIR_PASTEL_GREEN_ACTIVE,
-    PAIR_PASTEL_RED, PAIR_PASTEL_RED_ACTIVE, PAIR_PASTEL_YELLOW,
-    PAIR_SB_CYAN, PAIR_SB_FG, PAIR_SB_FG_ACTIVE, PAIR_WARN,
+    PAIR_DLG_OK, PAIR_DLG_PASTEL_GREEN, PAIR_DLG_PASTEL_GREEN_ACTIVE,
+    PAIR_DLG_PASTEL_RED, PAIR_DLG_PASTEL_RED_ACTIVE, PAIR_DLG_PASTEL_YELLOW,
+    PAIR_DLG_CYAN, PAIR_DLG_FG, PAIR_DLG_FG_ACTIVE, PAIR_DLG_WARN,
 )
 from ..geometry import (
-    clamp_scroll, draw_modal_fill, end_truncate, modal_geometry,
-    safe_addstr,
+    clamp_scroll, draw_modal_fill, draw_scroll_overflow, end_truncate,
+    modal_geometry, safe_addstr,
 )
 from ..hints import (
     KEY_BACKSPACE, KEY_ENTER, KEY_ESC, KEY_LEFT_RIGHT, KEY_TAB,
@@ -169,14 +169,14 @@ def _file_status_pair(status: str) -> int:
     delete / add / rename / modify visual hierarchy matches the
     review screen and the action menu's working-tree pane."""
     if status == "A":
-        return PAIR_PASTEL_GREEN
+        return PAIR_DLG_PASTEL_GREEN
     if status == "D":
-        return PAIR_PASTEL_RED
+        return PAIR_DLG_PASTEL_RED
     if status == "R":
-        return PAIR_BRANCH
+        return PAIR_DLG_CYAN
     if status == "M":
-        return PAIR_PASTEL_YELLOW
-    return PAIR_SB_FG
+        return PAIR_DLG_PASTEL_YELLOW
+    return PAIR_DLG_FG
 
 
 def _draw_file_row(stdscr, y: int, x: int, w: int, fe: FileEntry,
@@ -196,25 +196,25 @@ def _draw_file_row(stdscr, y: int, x: int, w: int, fe: FileEntry,
         name = name[: pad - 1] + "…"
     name = name.ljust(pad)
     full = f"{left}{name} {stat}"
-    fill = curses.color_pair(PAIR_SB_FG_ACTIVE if focused else PAIR_SB_FG)
+    fill = curses.color_pair(PAIR_DLG_FG_ACTIVE if focused else PAIR_DLG_FG)
     if focused:
         safe_addstr(stdscr, y, x, full, fill | curses.A_REVERSE)
         return
     safe_addstr(stdscr, y, x, full, fill)
     pair_id = _file_status_pair(fe.x.strip())
-    if pair_id != PAIR_SB_FG:
+    if pair_id != PAIR_DLG_FG:
         safe_addstr(stdscr, y, x + 1, code.strip(),
                     curses.color_pair(pair_id))
     if stat:
         stat_x = x + len(left) + pad + 1
         safe_addstr(stdscr, y, stat_x, stat_ins,
-                    curses.color_pair(PAIR_PASTEL_GREEN_ACTIVE
+                    curses.color_pair(PAIR_DLG_PASTEL_GREEN_ACTIVE
                                       if focused
-                                      else PAIR_PASTEL_GREEN))
+                                      else PAIR_DLG_PASTEL_GREEN))
         safe_addstr(stdscr, y, stat_x + len(stat_ins) + 1, stat_del,
-                    curses.color_pair(PAIR_PASTEL_RED_ACTIVE
+                    curses.color_pair(PAIR_DLG_PASTEL_RED_ACTIVE
                                       if focused
-                                      else PAIR_PASTEL_RED))
+                                      else PAIR_DLG_PASTEL_RED))
 
 
 # ---------- Hints ---------------------------------------------------------
@@ -311,17 +311,14 @@ def _draw_changes_tab(stdscr, state: State, modal: CommitViewModal,
         _draw_file_row(stdscr, line + slot, inner_x, inner_w,
                        fe, focused)
     if modal.file_scroll > 0:
-        msg = f"  ↑ {modal.file_scroll} more above"
-        safe_addstr(stdscr, line,
-                    inner_x + max(0, inner_w - len(msg) - 1),
-                    msg, sb | curses.A_DIM)
+        draw_scroll_overflow(stdscr, line, inner_x, inner_w,
+                             modal.file_scroll, "up", sb | curses.A_DIM)
     end = min(n, modal.file_scroll + pane_visible)
     if end < n:
         below = n - end
-        msg = f"  ↓ {below} more below"
-        safe_addstr(stdscr, line + pane_visible - 1,
-                    inner_x + max(0, inner_w - len(msg) - 1),
-                    msg, sb | curses.A_DIM)
+        draw_scroll_overflow(stdscr, line + pane_visible - 1,
+                             inner_x, inner_w, below, "down",
+                             sb | curses.A_DIM)
 
 
 def _draw_reflog_tab(stdscr, state: State, modal: CommitViewModal,
@@ -358,7 +355,7 @@ def _draw_reflog_tab(stdscr, state: State, modal: CommitViewModal,
         head, _, rest = row.partition(" ")
         head_clip = end_truncate(head, inner_w)
         safe_addstr(stdscr, line + slot, inner_x, head_clip,
-                    curses.color_pair(PAIR_PASTEL_YELLOW))
+                    curses.color_pair(PAIR_DLG_PASTEL_YELLOW))
         if rest:
             rest_x = inner_x + len(head_clip) + 1
             rest_w = max(0, inner_w - (rest_x - inner_x))
@@ -366,17 +363,15 @@ def _draw_reflog_tab(stdscr, state: State, modal: CommitViewModal,
                 safe_addstr(stdscr, line + slot, rest_x,
                             end_truncate(rest, rest_w), sb)
     if modal.reflog_scroll > 0:
-        msg = f"  ↑ {modal.reflog_scroll} more above"
-        safe_addstr(stdscr, line,
-                    inner_x + max(0, inner_w - len(msg) - 1),
-                    msg, sb | curses.A_DIM)
+        draw_scroll_overflow(stdscr, line, inner_x, inner_w,
+                             modal.reflog_scroll, "up",
+                             sb | curses.A_DIM)
     end = min(n, modal.reflog_scroll + pane_visible)
     if end < n:
         below = n - end
-        msg = f"  ↓ {below} more below"
-        safe_addstr(stdscr, line + pane_visible - 1,
-                    inner_x + max(0, inner_w - len(msg) - 1),
-                    msg, sb | curses.A_DIM)
+        draw_scroll_overflow(stdscr, line + pane_visible - 1,
+                             inner_x, inner_w, below, "down",
+                             sb | curses.A_DIM)
 
 
 def draw_commit_view_modal(stdscr, state: State, sidebar_x: int) -> None:
@@ -384,7 +379,7 @@ def draw_commit_view_modal(stdscr, state: State, sidebar_x: int) -> None:
     if modal is None:
         return
 
-    sb = curses.color_pair(PAIR_SB_FG)
+    sb = curses.color_pair(PAIR_DLG_FG)
     target_inner_w = max(20, _MODAL_W - 2 * _PAD_X)
 
     # Pre-compute the variable-height blocks so the modal can size
@@ -441,7 +436,7 @@ def draw_commit_view_modal(stdscr, state: State, sidebar_x: int) -> None:
     # Title (cyan bold) + subtitle (dim).
     safe_addstr(stdscr, line, inner_x,
                 end_truncate(title_line, inner_w),
-                curses.A_BOLD | curses.color_pair(PAIR_SB_CYAN))
+                curses.A_BOLD | curses.color_pair(PAIR_DLG_CYAN))
     line += 1
     if subtitle:
         safe_addstr(stdscr, line, inner_x,
@@ -465,7 +460,7 @@ def draw_commit_view_modal(stdscr, state: State, sidebar_x: int) -> None:
     # read as informational rather than as an actual badge.
     is_placeholder = (not modal.tags)
     badge_attr = (sb | curses.A_DIM if is_placeholder
-                  else (curses.color_pair(PAIR_OK) | curses.A_BOLD))
+                  else (curses.color_pair(PAIR_DLG_OK) | curses.A_BOLD))
     for row in badge_rows:
         rendered = " ".join(row)
         safe_addstr(stdscr, line, inner_x,
@@ -527,7 +522,7 @@ def draw_commit_view_modal(stdscr, state: State, sidebar_x: int) -> None:
     if modal.confirm_message:
         safe_addstr(stdscr, line, inner_x,
                     end_truncate(modal.confirm_message, inner_w),
-                    curses.color_pair(PAIR_WARN) | curses.A_BOLD)
+                    curses.color_pair(PAIR_DLG_WARN) | curses.A_BOLD)
     else:
         render_hints(stdscr, line, inner_x, inner_w,
                      _hints(modal), attr=sb | curses.A_DIM)

@@ -13,7 +13,7 @@ from __future__ import annotations
 import curses
 from typing import List, Tuple
 
-from .colors import PAIR_SB_CYAN
+from .colors import PAIR_DLG_CYAN
 from .geometry import safe_addstr
 
 
@@ -34,7 +34,7 @@ def draw_tab_strip(stdscr, y: int, x: int, max_w: int,
         active = tid == active_id
         text = f" {label} ({count}) " if count else f" {label} "
         if active and focused:
-            attr = curses.color_pair(PAIR_SB_CYAN) | curses.A_BOLD
+            attr = curses.color_pair(PAIR_DLG_CYAN) | curses.A_BOLD
         elif active:
             attr = base_attr | curses.A_BOLD
         else:

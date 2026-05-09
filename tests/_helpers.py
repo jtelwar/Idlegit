@@ -85,13 +85,13 @@ def stage_and_commit(repo: Path, message: str,
 def make_repo_model(rel: str = "r", **kwargs):
     """Phantom Repo dataclass instance — no filesystem touched. The
     on-disk counterpart is `make_repo()` above."""
-    from models import Repo
+    from core.models import Repo
     return Repo(rel=rel, path=Path(f"/tmp/{rel}"), **kwargs)
 
 
 def make_state(*repos, **kwargs):
     """State factory for unit tests. Defaults workspace_name='ws' so
     callers don't have to repeat it; any kwarg the caller passes wins."""
-    from models import State
+    from core.models import State
     kwargs.setdefault("workspace_name", "ws")
     return State(repos=list(repos), **kwargs)

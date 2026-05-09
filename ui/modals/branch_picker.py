@@ -3,13 +3,13 @@ from __future__ import annotations
 
 import curses
 
-from models import BranchPicker, State
-from git_ops import (
+from core.models import BranchPicker, State
+from core.git_ops import (
     is_safe_ref_arg, list_branches, list_remote_tracking_refs,
 )
-from workers import kick_off_action
+from core.workers import kick_off_action
 
-from ..colors import PAIR_SB_CYAN, PAIR_SB_FG
+from ..colors import PAIR_DLG_CYAN, PAIR_DLG_FG
 from ..geometry import (
     clamp_scroll, draw_modal_fill, draw_scroll_overflow, end_truncate,
     modal_geometry, safe_addstr, wrap_label_value,
@@ -102,7 +102,7 @@ def open_branch_picker(state: State, mode: str = "switch") -> None:
         # Track the user's current branch so the action handler can
         # pass it through, and so the title can show "current → ref".
         _, cur_out, _ = (0, "", "")
-        from git_ops import git as _git
+        from core.git_ops import git as _git
         rc, cur_out, _ = _git(menu.target_path, ["branch", "--show-current"])
         current = cur_out.strip() if rc == 0 else ""
         # Default the cursor to origin/<current-branch> when present —
@@ -179,7 +179,7 @@ def draw_branch_picker(stdscr, state: State, sidebar_x: int) -> None:
     if picker is None:
         return
 
-    sb = curses.color_pair(PAIR_SB_FG)
+    sb = curses.color_pair(PAIR_DLG_FG)
     has_create = _has_create_row(picker)
 
     target_inner_w = max(1, _MODAL_W - 2 * _PAD_X)
@@ -220,7 +220,7 @@ def draw_branch_picker(stdscr, state: State, sidebar_x: int) -> None:
     # Title.
     line = y + _PAD_TOP
     for i, text in enumerate(title_rows):
-        attr = (curses.A_BOLD | curses.color_pair(PAIR_SB_CYAN)
+        attr = (curses.A_BOLD | curses.color_pair(PAIR_DLG_CYAN)
                 if i == 0 else sb)
         safe_addstr(stdscr, line, inner_x,
                     end_truncate(text, inner_w), attr)

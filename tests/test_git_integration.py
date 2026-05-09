@@ -21,12 +21,12 @@ for _p in (str(_HERE.parent), str(_HERE)):
 from _helpers import (  # noqa: E402
     _run, add_origin, make_repo, stage_and_commit, write_file,
 )
-from git_ops import (  # noqa: E402
+from core.git_ops import (  # noqa: E402
     discover_repos, discover_workflows_local, find_lfs_warnings,
     link_siblings, refresh_repo, signature_mtime, suggest_commit_message,
     sync_subtree, working_tree_signature,
 )
-from models import Repo, SubtreeSpec  # noqa: E402
+from core.models import Repo, SubtreeSpec  # noqa: E402
 
 
 def _spawn_recovery_canceller(state, timeout: float = 5.0):
@@ -627,7 +627,7 @@ class TestRedundantDirtyFF(_TempWorkspace):
         fields the helper actually reads matter (path, branch). The full
         dataclass is overkill here, so a minimal stand-in keeps the test
         focused on behavior."""
-        from models import SmartSyncCheckout, Repo
+        from core.models import SmartSyncCheckout, Repo
         return SmartSyncCheckout(
             canonical=Repo(rel="ws", path=path),
             parent=None, path=path, branch=branch, label=path.name,
@@ -637,11 +637,11 @@ class TestRedundantDirtyFF(_TempWorkspace):
         """Minimal State for the helpers' new state+name signature.
         The helpers only touch state.tasks for the leftover-stash
         warning path; an empty repos list is enough for the rest."""
-        from models import State
+        from core.models import State
         return State(repos=[], workspace_name="test")
 
     def test_returns_true_when_dirty_matches_origin_bit_for_bit(self) -> None:
-        from workers import _try_ff_through_redundant_dirty
+        from core.workers import _try_ff_through_redundant_dirty
 
         upstream, winner, loser = self._setup_fork()
         # Winner makes a change, commits, pushes. Loser independently
@@ -679,7 +679,7 @@ class TestRedundantDirtyFF(_TempWorkspace):
         fast path because its status filter only allowed ' M' / '??'
         — leaving the loser dirty and 1 behind even though origin
         already had the exact same content."""
-        from workers import _try_ff_through_redundant_dirty
+        from core.workers import _try_ff_through_redundant_dirty
 
         upstream, winner, loser = self._setup_fork()
         write_file(winner, "shared.py", "def x(): return 7\n")
@@ -707,7 +707,7 @@ class TestRedundantDirtyFF(_TempWorkspace):
             "def x(): return 7\n")
 
     def test_returns_false_when_dirty_diverges_from_origin(self) -> None:
-        from workers import _try_ff_through_redundant_dirty
+        from core.workers import _try_ff_through_redundant_dirty
 
         upstream, winner, loser = self._setup_fork()
         write_file(winner, "shared.py", "def x(): return 1\n")
@@ -740,8 +740,8 @@ class TestDetachedWinnerSwitch(_TempWorkspace):
     actually propagates to remote."""
 
     def test_clean_detached_winner_switches_with_plain_checkout(self) -> None:
-        from workers import _stash_switch_pop_winner
-        from models import Repo, SmartSyncCheckout
+        from core.workers import _stash_switch_pop_winner
+        from core.models import Repo, SmartSyncCheckout
         # Set up a repo with a master branch and a dangling commit.
         repo = self.tmp / "winner"
         repo.mkdir()
@@ -777,8 +777,8 @@ class TestDetachedWinnerSwitch(_TempWorkspace):
         helper falls back to stash → checkout → pop. After the dance
         completes, the WT carries the user's edits ON the new branch
         and a subsequent `git commit` lands them on master."""
-        from workers import _stash_switch_pop_winner
-        from models import Repo, SmartSyncCheckout
+        from core.workers import _stash_switch_pop_winner
+        from core.models import Repo, SmartSyncCheckout
         repo = self.tmp / "winner"
         repo.mkdir()
         _run(repo, "git", "init", "-q", "-b", "master")
@@ -842,8 +842,8 @@ class TestDetachedLoserCheckout(_TempWorkspace):
         return winner, loser
 
     def test_dirty_detached_loser_with_redundant_changes_lands_on_origin(self) -> None:
-        from workers import _try_detached_checkout_through_redundant_dirty
-        from models import Repo, SmartSyncCheckout
+        from core.workers import _try_detached_checkout_through_redundant_dirty
+        from core.models import Repo, SmartSyncCheckout
         winner, loser = self._setup_with_pushed_change()
         # Winner publishes a new edit.
         write_file(winner, "shared.py", "def x(): return 99\n")
@@ -857,7 +857,7 @@ class TestDetachedLoserCheckout(_TempWorkspace):
             canonical=Repo(rel="ws", path=loser),
             parent=None, path=loser, branch="(detached)", label="loser",
             dirty=True)
-        from models import State
+        from core.models import State
         state = State(repos=[], workspace_name="test")
         result = _try_detached_checkout_through_redundant_dirty(
             state, c, "master", "loser")
@@ -869,8 +869,8 @@ class TestDetachedLoserCheckout(_TempWorkspace):
             "def x(): return 99\n")
 
     def test_genuinely_diverging_dirty_loser_refuses(self) -> None:
-        from workers import _try_detached_checkout_through_redundant_dirty
-        from models import Repo, SmartSyncCheckout
+        from core.workers import _try_detached_checkout_through_redundant_dirty
+        from core.models import Repo, SmartSyncCheckout
         winner, loser = self._setup_with_pushed_change()
         write_file(winner, "shared.py", "def x(): return 99\n")
         stage_and_commit(winner, "bump")
@@ -883,7 +883,7 @@ class TestDetachedLoserCheckout(_TempWorkspace):
             canonical=Repo(rel="ws", path=loser),
             parent=None, path=loser, branch="(detached)", label="loser",
             dirty=True)
-        from models import State
+        from core.models import State
         state = State(repos=[], workspace_name="test")
         result = _try_detached_checkout_through_redundant_dirty(
             state, c, "master", "loser")
@@ -921,12 +921,12 @@ class TestNoOrphanedCommitsOnSwitch(_TempWorkspace):
         return repo
 
     def test_head_is_ancestor_of_returns_false_when_head_has_unique_commit(self) -> None:
-        from workers import _head_is_ancestor_of
+        from core.workers import _head_is_ancestor_of
         repo = self._detached_with_unique_commit()
         self.assertFalse(_head_is_ancestor_of(repo, "master"))
 
     def test_head_is_ancestor_of_returns_true_when_clean_descendant(self) -> None:
-        from workers import _head_is_ancestor_of
+        from core.workers import _head_is_ancestor_of
         repo = self.tmp / "clean"
         repo.mkdir()
         _run(repo, "git", "init", "-q", "-b", "master")
@@ -944,8 +944,8 @@ class TestNoOrphanedCommitsOnSwitch(_TempWorkspace):
         flow pops a modal asking permission to FF master to HEAD;
         if the user cancels, the file survives in HEAD's tree just
         like the pre-recovery refusal path used to guarantee."""
-        from workers import _stash_switch_pop_winner
-        from models import Repo, SmartSyncCheckout, State
+        from core.workers import _stash_switch_pop_winner
+        from core.models import Repo, SmartSyncCheckout, State
 
         repo = self._detached_with_unique_commit()
         # Add a dirty edit on top so the would-be flow includes the
@@ -979,8 +979,8 @@ class TestNoOrphanedCommitsOnSwitch(_TempWorkspace):
         complete the switch — HEAD ends up on master, master's ref
         moved forward to capture the unique commit, and the unique
         file is on disk via the now-tracked branch."""
-        from workers import _stash_switch_pop_winner
-        from models import Repo, SmartSyncCheckout, State
+        from core.workers import _stash_switch_pop_winner
+        from core.models import Repo, SmartSyncCheckout, State
 
         repo = self._detached_with_unique_commit()
         head_before = _run(repo, "git", "rev-parse", "HEAD").stdout.strip()
@@ -1023,8 +1023,8 @@ class TestNoOrphanedCommitsOnSwitch(_TempWorkspace):
         """Same risk on the loser side: a detached loser with unique
         commits would lose them on `git checkout origin/<branch>`.
         `_align_detached_loser`'s guard refuses; file survives."""
-        from workers import _align_detached_loser
-        from models import Repo, SmartSyncCheckout, State
+        from core.workers import _align_detached_loser
+        from core.models import Repo, SmartSyncCheckout, State
 
         # Build an upstream + clone. Loser detaches and commits
         # a unique file that origin doesn't have.
@@ -1063,7 +1063,7 @@ class TestPostMergeCleanGuard(_TempWorkspace):
     for — the stash stays on the list so the user can recover."""
 
     def test_post_merge_clean_true_on_clean_tree(self) -> None:
-        from workers import _post_merge_clean
+        from core.workers import _post_merge_clean
         repo = self.tmp / "clean"
         repo.mkdir()
         _run(repo, "git", "init", "-q", "-b", "master")
@@ -1072,7 +1072,7 @@ class TestPostMergeCleanGuard(_TempWorkspace):
         self.assertTrue(_post_merge_clean(repo))
 
     def test_post_merge_clean_false_when_anything_dirty(self) -> None:
-        from workers import _post_merge_clean
+        from core.workers import _post_merge_clean
         repo = self.tmp / "dirty"
         repo.mkdir()
         _run(repo, "git", "init", "-q", "-b", "master")
@@ -1103,7 +1103,7 @@ class TestSafeStageAll(_TempWorkspace):
         shows up as a `D` entry in porcelain status. Plain `git add -A`
         stages that deletion as a submodule pointer removal — destroying
         the link. `safe_stage_all` refuses outright."""
-        from git_ops import safe_stage_all
+        from core.git_ops import safe_stage_all
 
         # Outer parent + a registered submodule pointing at a bare
         # remote. The submodule's working dir starts populated.
@@ -1140,7 +1140,7 @@ class TestSafeStageAll(_TempWorkspace):
         nested `.git` at a path that's NOT in `.gitmodules`. Plain
         `git add -A` would commit a gitlink at that bogus path.
         `safe_stage_all` refuses."""
-        from git_ops import safe_stage_all
+        from core.git_ops import safe_stage_all
 
         parent = make_repo(self.tmp, "parent")
         # Drop a fully-formed nested git repo at an unregistered path.
@@ -1161,7 +1161,7 @@ class TestSafeStageAll(_TempWorkspace):
     def test_stages_normal_changes_when_no_risk(self) -> None:
         """Sanity: when the WT has only ordinary edits / additions,
         `safe_stage_all` behaves exactly like `git add -A`."""
-        from git_ops import safe_stage_all
+        from core.git_ops import safe_stage_all
 
         repo = make_repo(self.tmp, "r")
         write_file(repo, "edit.txt", "hello\n")
@@ -1177,7 +1177,7 @@ class TestSafeStageAll(_TempWorkspace):
         """The guard is about D-on-submodule and stray gitlinks ONLY.
         A submodule with an in-WT change (its HEAD moved) still stages
         normally — that's the legitimate update flow."""
-        from git_ops import safe_stage_all
+        from core.git_ops import safe_stage_all
 
         sub_remote = self._bare_remote("sub.git")
         seed = self.tmp / "seed"
@@ -1213,7 +1213,7 @@ class TestSyncSiblingAncestorGuard(_TempWorkspace):
     of the target ref."""
 
     def test_refuses_checkout_when_head_has_unique_commit(self) -> None:
-        from git_ops import sync_sibling
+        from core.git_ops import sync_sibling
 
         bare = self.tmp / "u.git"
         bare.mkdir()
@@ -1241,7 +1241,7 @@ class TestSyncSiblingAncestorGuard(_TempWorkspace):
     def test_allows_checkout_when_head_is_ancestor(self) -> None:
         """The standard happy path: detached HEAD points at the same
         commit as origin/master (or earlier). Sync proceeds."""
-        from git_ops import sync_sibling
+        from core.git_ops import sync_sibling
 
         bare = self.tmp / "u.git"
         bare.mkdir()
@@ -1279,8 +1279,8 @@ class TestStashPreservedAlways(_TempWorkspace):
     def test_ff_through_redundant_dirty_keeps_stash(self) -> None:
         """After the redundant-dirty FF succeeds, the stash entry MUST
         still be on the stash list — pruning is the user's call."""
-        from workers import _try_ff_through_redundant_dirty
-        from models import Repo, SmartSyncCheckout, State
+        from core.workers import _try_ff_through_redundant_dirty
+        from core.models import Repo, SmartSyncCheckout, State
 
         loser = self._seed()
         # Advance origin: another clone pushes a new file.
@@ -1311,8 +1311,8 @@ class TestStashPreservedAlways(_TempWorkspace):
 
     def test_detached_checkout_through_redundant_dirty_keeps_stash(self) -> None:
         """Same guarantee on the detached-loser checkout path."""
-        from workers import _try_detached_checkout_through_redundant_dirty
-        from models import Repo, SmartSyncCheckout, State
+        from core.workers import _try_detached_checkout_through_redundant_dirty
+        from core.models import Repo, SmartSyncCheckout, State
 
         loser = self._seed()
         winner = self.tmp / "winner"
@@ -1349,8 +1349,8 @@ class TestStashPopConflictNoHardReset(_TempWorkspace):
     resolves manually."""
 
     def test_no_hard_reset_after_pop_conflict(self) -> None:
-        from workers import _stash_switch_pop_winner
-        from models import Repo, SmartSyncCheckout, State
+        from core.workers import _stash_switch_pop_winner
+        from core.models import Repo, SmartSyncCheckout, State
 
         # Build a repo with two branches whose 'collide.txt' differs.
         # Detach on 'master' with a dirty edit that conflicts with the
@@ -1408,8 +1408,8 @@ class TestCommitWorkerDetachedGuard(_TempWorkspace):
     def test_commit_worker_refuses_on_detached_head_when_user_cancels(self) -> None:
         """When the auto-recovery modal pops and the user cancels, the
         pipeline must NOT proceed — no stage/commit/push, work intact."""
-        from workers import commit_worker
-        from models import Repo, State
+        from core.workers import commit_worker
+        from core.models import Repo, State
 
         repo_path = make_repo(self.tmp, "r")
         # Stage a real change so the staging step would otherwise have
@@ -1465,8 +1465,8 @@ class TestBranchFromHeadAction(_TempWorkspace):
         return repo
 
     def test_branch_from_head_creates_branch_at_current_commit(self) -> None:
-        from workers import kick_off_action
-        from models import Repo, State
+        from core.workers import kick_off_action
+        from core.models import Repo, State
         import threading
 
         repo_path = self._detached_with_unique()
@@ -1508,8 +1508,8 @@ class TestFFMergeAction(_TempWorkspace):
     merge commit the user didn't ask for."""
 
     def test_ff_merge_succeeds_when_descendant(self) -> None:
-        from workers import kick_off_action
-        from models import Repo, State
+        from core.workers import kick_off_action
+        from core.models import Repo, State
         import threading
 
         repo_path = make_repo(self.tmp, "r")
@@ -1540,8 +1540,8 @@ class TestFFMergeAction(_TempWorkspace):
                          "FF merge should advance master to topic's tip")
 
     def test_ff_merge_refuses_on_divergence(self) -> None:
-        from workers import kick_off_action
-        from models import Repo, State
+        from core.workers import kick_off_action
+        from core.models import Repo, State
         import threading
 
         repo_path = make_repo(self.tmp, "r")
@@ -1579,8 +1579,8 @@ class TestFFMergeAction(_TempWorkspace):
 
 class TestGitOperationHardening(_TempWorkspace):
     def test_manual_pull_uses_ff_only_and_refuses_divergence(self) -> None:
-        from workers import kick_off_action
-        from models import State
+        from core.workers import kick_off_action
+        from core.models import State
 
         remote = make_repo(self.tmp, "remote")
         _run(self.tmp, "git", "clone", str(remote), "r")
@@ -1611,8 +1611,8 @@ class TestGitOperationHardening(_TempWorkspace):
         self.assertIn("pull --ff-only", labels)
 
     def test_option_like_branch_name_is_rejected_before_checkout(self) -> None:
-        from workers import kick_off_action
-        from models import State
+        from core.workers import kick_off_action
+        from core.models import State
 
         repo_path = make_repo(self.tmp, "r")
         head = _run(repo_path, "git", "rev-parse", "HEAD").stdout.strip()
@@ -1648,8 +1648,8 @@ class TestGitOperationHardening(_TempWorkspace):
 
 class TestPromptHardening(unittest.TestCase):
     def test_detached_recovery_prompt_timeout_clears_slot(self) -> None:
-        import workers
-        from models import DetachedRecoveryPrompt, State
+        from core import workers
+        from core.models import DetachedRecoveryPrompt, State
 
         state = State(repos=[], workspace_name="test")
         prompt = DetachedRecoveryPrompt(
@@ -1671,8 +1671,8 @@ class TestPromptHardening(unittest.TestCase):
         self.assertIsNone(state.detached_recovery_prompt)
 
     def test_action_refusal_still_refreshes_target_state(self) -> None:
-        import workers
-        from models import Repo, State
+        from core import workers
+        from core.models import Repo, State
 
         repo = Repo(rel="r", path=Path("/tmp/repo"))
         state = State(repos=[repo], workspace_name="test")

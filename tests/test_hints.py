@@ -18,9 +18,9 @@ for _p in (str(_HERE.parent), str(_HERE)):
 from _helpers import (  # noqa: E402
     make_repo_model as _make_repo, make_state as _state,
 )
-from models import (  # noqa: E402
+from core.models import (  # noqa: E402
     State, Workspace, WorkspaceCreator, WorkspaceDraft, WorkspaceMenu,
-    WorkspacesPicker,
+    AppMenu,
 )
 
 # UI imports curses at module load — skip on headless.
@@ -33,7 +33,7 @@ try:
         _task_panel_hints, _toggle_row_hints, _workspace_row_hints,
     )
     from ui.modals.workspace_creator import _hints as creator_hints
-    from ui.modals.workspaces_picker import _hints as picker_hints
+    from ui.modals.app_menu import _hints as picker_hints
     from ui.modals.workspace_menu import (
         _hints_edit_mode, _hints_nav_mode,
     )
@@ -281,7 +281,7 @@ class TestConfirmHints(unittest.TestCase):
 @unittest.skipUnless(UI_AVAILABLE, "ui module unavailable")
 class TestBranchPickerHints(unittest.TestCase):
     def _picker(self, branches=("main", "dev"), current="main", selected=0):
-        from models import BranchPicker
+        from core.models import BranchPicker
         return BranchPicker(
             target_label="x", target_path=Path("/tmp"),
             branches=list(branches), current=current, selected=selected)
@@ -305,7 +305,7 @@ class TestBranchPickerHints(unittest.TestCase):
 @unittest.skipUnless(UI_AVAILABLE, "ui module unavailable")
 class TestResetPromptHints(unittest.TestCase):
     def _prompt(self, typed=""):
-        from models import ResetPrompt
+        from core.models import ResetPrompt
         return ResetPrompt(target_label="x", target_path=Path("/tmp"),
                            typed=typed)
 
@@ -325,7 +325,7 @@ class TestResetPromptHints(unittest.TestCase):
 @unittest.skipUnless(UI_AVAILABLE, "ui module unavailable")
 class TestWorkflowPickerHints(unittest.TestCase):
     def test_runnable_row_describes_branch_target(self) -> None:
-        from models import WorkflowInfo, WorkflowPicker
+        from core.models import WorkflowInfo, WorkflowPicker
         wf = WorkflowInfo(
             name="ci", path=".github/workflows/ci.yml",
             state="active", dispatchable=True)
@@ -335,7 +335,7 @@ class TestWorkflowPickerHints(unittest.TestCase):
         self.assertIn("run on main", actions)
 
     def test_disabled_workflow_marks_unavailable(self) -> None:
-        from models import WorkflowInfo, WorkflowPicker
+        from core.models import WorkflowInfo, WorkflowPicker
         wf = WorkflowInfo(
             name="ci", path=".github/workflows/ci.yml",
             state="disabled_manually", dispatchable=True)
@@ -348,7 +348,7 @@ class TestWorkflowPickerHints(unittest.TestCase):
 @unittest.skipUnless(UI_AVAILABLE, "ui module unavailable")
 class TestAlignHeadsHints(unittest.TestCase):
     def test_branch_chosen_names_target(self) -> None:
-        from models import AlignHeadsPrompt
+        from core.models import AlignHeadsPrompt
         p = AlignHeadsPrompt(canonical_label="x", winner_label="y",
                              winner_sha="deadbeef",
                              branches=["main", "dev"], selected=1)
@@ -357,11 +357,11 @@ class TestAlignHeadsHints(unittest.TestCase):
 
 
 @unittest.skipUnless(UI_AVAILABLE, "ui module unavailable")
-class TestWorkspacesPickerHints(unittest.TestCase):
+class TestAppMenuHints(unittest.TestCase):
     def test_create_row_says_create(self) -> None:
         ws = Workspace(name="A", folders=[Path("/a")])
         s = _state(_make_repo("r"), workspaces=[ws])
-        s.workspaces_picker = WorkspacesPicker(selected=1)  # past last
+        s.app_menu = AppMenu(selected=1)  # past last
         actions = [h.action for h in picker_hints(s)]
         self.assertIn("create new workspace…", actions)
 
@@ -369,7 +369,7 @@ class TestWorkspacesPickerHints(unittest.TestCase):
         ws = Workspace(name="A", folders=[Path("/a")])
         s = _state(_make_repo("r"), workspaces=[ws],
                    active_workspace_index=0)
-        s.workspaces_picker = WorkspacesPicker(selected=0)
+        s.app_menu = AppMenu(selected=0)
         actions = [h.action for h in picker_hints(s)]
         self.assertIn("stay (already active)", actions)
 
@@ -378,7 +378,7 @@ class TestWorkspacesPickerHints(unittest.TestCase):
         b = Workspace(name="B", folders=[Path("/b")])
         s = _state(_make_repo("r"), workspaces=[a, b],
                    active_workspace_index=0)
-        s.workspaces_picker = WorkspacesPicker(selected=1)
+        s.app_menu = AppMenu(selected=1)
         actions = [h.action for h in picker_hints(s)]
         self.assertIn("switch to B", actions)
 
@@ -408,7 +408,7 @@ class TestWorkspaceCreatorHints(unittest.TestCase):
 @unittest.skipUnless(UI_AVAILABLE, "ui module unavailable")
 class TestWorkspaceMenuHints(unittest.TestCase):
     def _state_with_menu(self, folders) -> State:
-        from config import Config
+        from core.config import Config
         ws = Workspace(name="W", folders=list(folders))
         s = _state(_make_repo("r"), workspaces=[ws],
                    active_workspace_index=0, base_config=Config())

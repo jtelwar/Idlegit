@@ -12,12 +12,12 @@ import time
 from typing import List, Optional
 from urllib.parse import urlparse
 
-from models import State, Task, TaskActionMenu, TaskActionMenuItem
-from git_ops import cancel_run
+from core.models import State, Task, TaskActionMenu, TaskActionMenuItem
+from core.git_ops import cancel_run
 
 from ..colors import (
-    PAIR_SB_CYAN, PAIR_SB_ERR,
-    PAIR_SB_FG, PAIR_SB_OK, PAIR_SB_WARN,
+    PAIR_DLG_CYAN, PAIR_DLG_ERR,
+    PAIR_DLG_FG, PAIR_DLG_OK, PAIR_DLG_WARN,
 )
 from ..geometry import draw_modal_fill, modal_geometry, safe_addstr
 from ..hints import (
@@ -188,11 +188,11 @@ def open_task_action_menu(state: State, task: Task) -> None:
 
 
 _STATUS_COLOURS = {
-    "running": PAIR_SB_CYAN,
-    "pending": PAIR_SB_CYAN,
-    "ok": PAIR_SB_OK,
-    "fail": PAIR_SB_ERR,
-    "warn": PAIR_SB_WARN,
+    "running": PAIR_DLG_CYAN,
+    "pending": PAIR_DLG_CYAN,
+    "ok": PAIR_DLG_OK,
+    "fail": PAIR_DLG_ERR,
+    "warn": PAIR_DLG_WARN,
 }
 
 
@@ -216,7 +216,7 @@ def draw_task_action_menu(stdscr, state: State, sidebar_x: int) -> None:
     meta = state.tasks.get_meta(task)
     children = state.tasks.children_of(task)
 
-    sb = curses.color_pair(PAIR_SB_FG)
+    sb = curses.color_pair(PAIR_DLG_FG)
 
     # Compute layout: a fixed header block, a variable sub-task list,
     # then the actions list. Cap heights so the modal stays readable
@@ -242,13 +242,13 @@ def draw_task_action_menu(stdscr, state: State, sidebar_x: int) -> None:
     inner_x = x + 2
     line = y + 1
     safe_addstr(stdscr, line, inner_x, "Task detail",
-                curses.A_BOLD | curses.color_pair(PAIR_SB_CYAN))
+                curses.A_BOLD | curses.color_pair(PAIR_DLG_CYAN))
     line += 2
 
     # Task label + status
     safe_addstr(stdscr, line, inner_x, task.label[: w - 4], sb)
     line += 1
-    status_pair = _STATUS_COLOURS.get(task.status, PAIR_SB_FG)
+    status_pair = _STATUS_COLOURS.get(task.status, PAIR_DLG_FG)
     elapsed = max(0.0, time.monotonic() - task.started_at)
     if _is_terminal(task.status) and task.finished_at is not None:
         duration = task.finished_at - task.started_at
@@ -309,7 +309,7 @@ def draw_task_action_menu(stdscr, state: State, sidebar_x: int) -> None:
             line_text = f"{cell} {tail}"
             safe_addstr(stdscr, line, inner_x, line_text[: w - 4],
                         curses.color_pair(
-                            _STATUS_COLOURS.get(child.status, PAIR_SB_FG)))
+                            _STATUS_COLOURS.get(child.status, PAIR_DLG_FG)))
             line += 1
         if len(children) > 8:
             safe_addstr(stdscr, line, inner_x,
@@ -357,12 +357,12 @@ def _draw_sub_picker(stdscr, state: State, sidebar_x: int) -> None:
     # +2 for blank rows above title and below the footer hint.
     content_h = 1 + 1 + body_h + 1 + 1 + 2
     x, y, w, h = modal_geometry(stdscr, sidebar_x, 60, content_h)
-    sb = curses.color_pair(PAIR_SB_FG)
+    sb = curses.color_pair(PAIR_DLG_FG)
     draw_modal_fill(stdscr, x, y, w, h, sb)
     inner_x = x + 2
 
     safe_addstr(stdscr, y + 1, inner_x, "Pick then-run target",
-                curses.A_BOLD | curses.color_pair(PAIR_SB_CYAN))
+                curses.A_BOLD | curses.color_pair(PAIR_DLG_CYAN))
     for i, name in enumerate(menu.sub_picker_options):
         focused = i == menu.sub_picker_selected
         prefix = "→ " if focused else "  "

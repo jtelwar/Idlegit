@@ -1,8 +1,8 @@
-"""Workspace settings — opened with Space/Enter on the title-row
-workspace selector. Lets the user edit the active workspace's folder
-list (add / remove / rename) and override per-workspace settings
-against the global idlegit.conf defaults. Saves immediately on every
-edit so a crash mid-session doesn't lose intent."""
+"""Workspace settings — opened with Tab on the workspace selector
+row. Lets the user edit the active workspace's folder list (add /
+remove / rename) and override per-workspace settings against the
+global idlegit.conf defaults. Saves immediately on every edit so a
+crash mid-session doesn't lose intent."""
 from __future__ import annotations
 
 import curses
@@ -10,21 +10,25 @@ import threading
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-from config import (
-    APP_DISPLAY_NAME,
+from core.config import (
     TRUNCATION_MODES,
-    VERSION,
     WORKSPACE_OVERRIDE_TARGETS,
     WORKSPACE_OVERRIDE_TYPES,
     base_value_for_override,
     save_workspaces,
     state_attr_value_from_override,
 )
-from git_ops import discover_repos
-from models import State, Workspace, WorkspaceDraft, WorkspaceMenu, WorkspaceMenuRow
+from core.git_ops import discover_repos
+from core.models import State, Workspace, WorkspaceDraft, WorkspaceMenu, WorkspaceMenuRow
 
-from ..colors import PAIR_BRANCH, PAIR_OK, PAIR_SB_CYAN, PAIR_SB_FG, PAIR_WARN
-from ..geometry import draw_modal_fill, modal_geometry, safe_addstr, truncate
+from ..colors import (
+    PAIR_DLG_CYAN, PAIR_DLG_FG, PAIR_DLG_FG_HINT_TEXT, PAIR_DLG_OK,
+    PAIR_DLG_WARN,
+)
+from ..geometry import (
+    draw_modal_fill, draw_scroll_overflow, modal_geometry, safe_addstr,
+    truncate,
+)
 from ..hints import (
     KEY_BACKSPACE, KEY_ENTER, KEY_ESC, KEY_LEFT_RIGHT, KEY_SPACE,
     KEY_UP_DOWN, Hint, render_hints,
@@ -254,7 +258,7 @@ def _rebuild_rows(state: State) -> None:
             break
     if new_idx == -1:
         for i, row in enumerate(menu.rows):
-            if row.kind != "header":
+            if _is_focusable(row):
                 new_idx = i
                 break
     if new_idx == -1:
@@ -512,12 +516,12 @@ def _folder_status_pair(draft: WorkspaceDraft) -> Tuple[str, int]:
     if not text:
         return ("", 0)
     if draft.error:
-        return (draft.error, PAIR_WARN)
+        return (draft.error, PAIR_DLG_WARN)
     if draft.repo_count > 0:
         return (f"✓ {draft.repo_count} repo"
-                f"{'s' if draft.repo_count != 1 else ''}", PAIR_OK)
+                f"{'s' if draft.repo_count != 1 else ''}", PAIR_DLG_OK)
     if draft.repo_count == 0:
-        return ("(no repos)", PAIR_WARN)
+        return ("(no repos)", PAIR_DLG_WARN)
     return ("", 0)
 
 
@@ -531,28 +535,24 @@ def draw_workspace_menu(stdscr, state: State, sidebar_x: int) -> None:
         return
     n_rows = len(menu.rows)
     body_h = max(3, min(BODY_TARGET_ROWS, n_rows))
-    # blank-top (1) + app-row (1) + blank (1) + title (1) + spacer (1)
-    # + body + spacer/scroll-↓ (1) + hint-text (1) + blank (1)
-    # + footer (1) + blank-bottom (1). The hint-text row is sandwiched
-    # between two blank rows so the explainer reads as a separate
-    # block, not as an extension of the body or the hints footer.
-    content_h = 1 + 1 + 1 + 1 + 1 + body_h + 1 + 1 + 1 + 1 + 1
+    # blank-top (1) + title (1) + blank (1) + spacer/scroll-↑ (1)
+    # + body + spacer/scroll-↓ (1) + blank (1) + hint-text (1)
+    # + footer (1) + blank-bottom (1). The blank under the title
+    # gives the header room to breathe; the blank above hint-text
+    # separates the per-row tooltip from the body without colliding
+    # with the scroll-down indicator.
+    content_h = 1 + 1 + 1 + 1 + body_h + 1 + 1 + 1 + 1 + 1
     x, y, w, h = modal_geometry(stdscr, sidebar_x, MODAL_W, content_h)
-    sb = curses.color_pair(PAIR_SB_FG)
+    sb = curses.color_pair(PAIR_DLG_FG)
     draw_modal_fill(stdscr, x, y, w, h, sb)
 
     inner_x = x + 2
     inner_w = w - 4
 
-    safe_addstr(stdscr, y + 1, inner_x, APP_DISPLAY_NAME,
-                curses.A_BOLD | curses.color_pair(PAIR_SB_CYAN))
-    safe_addstr(stdscr, y + 1, inner_x + len(APP_DISPLAY_NAME), f"  v{VERSION}",
-                curses.color_pair(PAIR_BRANCH) | curses.A_DIM)
-
     ws = state.active_workspace
     title = f"Workspace settings — {ws.name if ws else '(no workspace)'}"
-    safe_addstr(stdscr, y + 3, inner_x, title[:inner_w],
-                curses.A_BOLD | curses.color_pair(PAIR_SB_CYAN))
+    safe_addstr(stdscr, y + 1, inner_x, title[:inner_w],
+                curses.A_BOLD | curses.color_pair(PAIR_DLG_CYAN))
 
     if menu.selected < menu.scroll:
         menu.scroll = menu.selected
@@ -570,7 +570,7 @@ def draw_workspace_menu(stdscr, state: State, sidebar_x: int) -> None:
         if idx >= n_rows:
             break
         row = menu.rows[idx]
-        line_y = y + 5 + i
+        line_y = y + 4 + i
         focused = (idx == menu.selected)
 
         if row.kind == "header":
@@ -578,7 +578,7 @@ def draw_workspace_menu(stdscr, state: State, sidebar_x: int) -> None:
             # eye can quickly find each block in the long row list.
             safe_addstr(stdscr, line_y, inner_x,
                         row.label.ljust(inner_w)[:inner_w],
-                        curses.color_pair(PAIR_BRANCH) | curses.A_DIM)
+                        curses.color_pair(PAIR_DLG_CYAN) | curses.A_DIM)
             continue
 
         if row.kind == "folder":
@@ -589,9 +589,9 @@ def draw_workspace_menu(stdscr, state: State, sidebar_x: int) -> None:
         if row.kind in ("add_folder", "clone"):
             prefix = "→ " if focused else "  "
             text = (prefix + row.label).ljust(inner_w)[:inner_w]
-            attr = (curses.color_pair(PAIR_BRANCH) | curses.A_BOLD
+            attr = (curses.color_pair(PAIR_DLG_CYAN) | curses.A_BOLD
                     if focused else
-                    curses.color_pair(PAIR_BRANCH) | curses.A_DIM)
+                    curses.color_pair(PAIR_DLG_CYAN) | curses.A_DIM)
             if focused:
                 attr |= curses.A_REVERSE
             safe_addstr(stdscr, line_y, inner_x, text, attr)
@@ -609,10 +609,10 @@ def draw_workspace_menu(stdscr, state: State, sidebar_x: int) -> None:
 
         value_x = inner_x + label_w + 2
         if row.kind == "bool":
-            val_attr = (curses.color_pair(PAIR_OK) if _read_value(state, row)
+            val_attr = (curses.color_pair(PAIR_DLG_OK) if _read_value(state, row)
                         else sb | curses.A_DIM)
         elif overridden:
-            val_attr = curses.color_pair(PAIR_SB_CYAN) | curses.A_BOLD
+            val_attr = curses.color_pair(PAIR_DLG_CYAN) | curses.A_BOLD
         else:
             val_attr = sb
         if focused:
@@ -624,12 +624,12 @@ def draw_workspace_menu(stdscr, state: State, sidebar_x: int) -> None:
                         sb | curses.A_DIM)
 
     if menu.scroll > 0:
-        safe_addstr(stdscr, y + 4, inner_x,
-                    f"↑ {menu.scroll} more above", sb | curses.A_DIM)
+        draw_scroll_overflow(stdscr, y + 3, inner_x, inner_w,
+                             menu.scroll, "up", sb | curses.A_DIM)
     if menu.scroll + body_h < n_rows:
         below = n_rows - (menu.scroll + body_h)
-        safe_addstr(stdscr, y + 5 + body_h, inner_x,
-                    f"↓ {below} more below", sb | curses.A_DIM)
+        draw_scroll_overflow(stdscr, y + 4 + body_h, inner_x, inner_w,
+                             below, "down", sb | curses.A_DIM)
 
     # Per-row explainer — sits two rows above the hints footer with a
     # blank row above and below, only when the focused row carries a
@@ -639,9 +639,14 @@ def draw_workspace_menu(stdscr, state: State, sidebar_x: int) -> None:
     if 0 <= menu.selected < n_rows:
         hint_text = menu.rows[menu.selected].hint_text
     if hint_text:
-        safe_addstr(stdscr, y + h - 4, inner_x,
+        # Mid-grey (`PAIR_DLG_FG_HINT_TEXT`) so the explainer reads a
+        # shade lighter than the dim key labels in the hints footer
+        # immediately below, but doesn't go all the way to bright
+        # white — visually distinct as "this row's tooltip" vs
+        # "global keymap reminders".
+        safe_addstr(stdscr, y + h - 3, inner_x,
                     truncate(hint_text, inner_w, "end"),
-                    sb | curses.A_DIM)
+                    curses.color_pair(PAIR_DLG_FG_HINT_TEXT))
 
     _draw_menu_hints(stdscr, state, menu, y + h - 2, inner_x, inner_w,
                      sb | curses.A_DIM)
@@ -673,7 +678,7 @@ def _draw_folder_row(stdscr, line_y: int, inner_x: int, inner_w: int,
             visible = text[start:start + field_w - 1]
             cur_x_off = cur - start
         body = visible.ljust(field_w)
-        attr = curses.color_pair(PAIR_BRANCH) | curses.A_BOLD | curses.A_UNDERLINE
+        attr = curses.color_pair(PAIR_DLG_CYAN) | curses.A_BOLD | curses.A_UNDERLINE
         safe_addstr(stdscr, line_y, inner_x, prefix, attr)
         safe_addstr(stdscr, line_y, inner_x + len(prefix), body, attr)
         try:

@@ -8,7 +8,7 @@ from __future__ import annotations
 import curses
 from typing import Tuple
 
-from config import DEFAULT_TRUNCATION_MODE
+from core.config import DEFAULT_TRUNCATION_MODE
 
 
 SIDEBAR_W = 50          # task panel keeps a constant width across resizes
@@ -147,10 +147,44 @@ def modal_geometry(stdscr, sidebar_x: int, content_w: int,
 
 
 def draw_modal_fill(stdscr, x: int, y: int, w: int, h: int, sb: int) -> None:
-    """Paint the background rectangle for a modal at (x, y, w, h)."""
+    """Paint the background rectangle for a modal at (x, y, w, h)
+    and trace a border around it that sits flush against the cell
+    edges. We can't get a true thin (1-pixel) line *and* keep both
+    sides of it colour-correct — box-drawing glyphs (┌─│┐) draw
+    their line down the middle of the cell, so half a cell of
+    background always leaks past the line. Half-block glyphs
+    (▀▄▌▐ + the 3/4 corner blocks ▛▜▙▟) instead fill exactly half
+    or three-quarters of the cell, putting the coloured region
+    flush with the cell's outer edge. The trade-off is a chunkier
+    border (half a cell thick), but it lets us deliver the user's
+    request: no terminal-default ring outside the line, and no
+    dlg_bg extending past it.
+
+    The border pair uses fg=border-grey, bg=dlg_bg, so the unfilled
+    portion of each glyph (the half/quadrant the block doesn't
+    cover) reads as part of the dialog interior. Modals already
+    leave one cell of inner padding on every edge so content
+    doesn't collide with the border."""
+    # Lazy import — colors.py and geometry.py are siblings under
+    # `ui/`, but keeping the import inside the function dodges any
+    # accidental top-level cycle if the colour module ever grows
+    # to need a geometry helper of its own.
+    from .colors import PAIR_DLG_BORDER
     fill = " " * w
     for row in range(y, y + h):
         safe_addstr(stdscr, row, x, fill, sb)
+    if w < 2 or h < 2:
+        return
+    border_attr = curses.color_pair(PAIR_DLG_BORDER)
+    # Corners are 3/4 blocks (the missing quadrant is the inner
+    # one, where dlg_bg shows through); edges are halves.
+    top = "▛" + "▀" * (w - 2) + "▜"
+    bot = "▙" + "▄" * (w - 2) + "▟"
+    safe_addstr(stdscr, y, x, top, border_attr)
+    safe_addstr(stdscr, y + h - 1, x, bot, border_attr)
+    for row in range(y + 1, y + h - 1):
+        safe_addstr(stdscr, row, x, "▌", border_attr)
+        safe_addstr(stdscr, row, x + w - 1, "▐", border_attr)
 
 
 def clamp_scroll(selected: int, scroll: int, n_items: int,
@@ -170,11 +204,21 @@ def clamp_scroll(selected: int, scroll: int, n_items: int,
 
 def draw_scroll_overflow(stdscr, y: int, x: int, w: int, count: int,
                          direction: str, attr: int) -> None:
-    """Render '  ↑ N more above' or '  ↓ N more below' at (y, x), end-
-    truncated to width `w`. The leading 2-space pad mirrors the row
-    indent of the item rows this indicator replaces in scrollable
-    pickers (branch_picker, workflow_picker, align_heads_prompt)."""
+    """Render '↑ N more above' or '↓ N more below' right-aligned
+    within the (y, x, w) cell range, with one cell of trailing
+    padding so the label sits flush with — but not touching — the
+    rightmost column. End-truncated when the message is wider than
+    the slot so it never overflows.
+
+    Used by every scrollable list / pane in the app (workspace
+    menu, picker modals, review file list, diff viewer, …) so the
+    "more above / below" affordance reads consistently regardless
+    of which surface the user is on. Pass `attr` so each caller
+    keeps its own focus / dim styling."""
     arrow = "↑" if direction == "up" else "↓"
     where = "above" if direction == "up" else "below"
-    msg = f"  {arrow} {count} more {where}"
-    safe_addstr(stdscr, y, x, end_truncate(msg, w), attr)
+    msg = end_truncate(f"{arrow} {count} more {where}", max(0, w - 1))
+    if not msg:
+        return
+    pad_x = max(x, x + w - len(msg) - 1)
+    safe_addstr(stdscr, y, pad_x, msg, attr)

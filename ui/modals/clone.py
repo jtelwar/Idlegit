@@ -11,10 +11,10 @@ import curses
 from pathlib import Path
 from typing import List
 
-from models import CloneModal, State
-from workers import kick_off_clone
+from core.models import CloneModal, State
+from core.workers import kick_off_clone
 
-from ..colors import PAIR_SB_CYAN, PAIR_SB_FG
+from ..colors import PAIR_DLG_CYAN, PAIR_DLG_FG
 from ..geometry import (
     draw_modal_fill, end_truncate, modal_geometry, safe_addstr,
     wrap_label_value,
@@ -187,7 +187,7 @@ def draw_clone_modal(stdscr, state: State, sidebar_x: int) -> None:
     if modal is None:
         return
 
-    sb = curses.color_pair(PAIR_SB_FG)
+    sb = curses.color_pair(PAIR_DLG_FG)
     target_inner_w = max(1, _MODAL_W - 2 * _PAD_X)
     title_rows = _title_lines(modal, target_inner_w)
 
@@ -211,7 +211,7 @@ def draw_clone_modal(stdscr, state: State, sidebar_x: int) -> None:
 
     line = y + _PAD_TOP
     for i, text in enumerate(title_rows):
-        attr = (curses.A_BOLD | curses.color_pair(PAIR_SB_CYAN)
+        attr = (curses.A_BOLD | curses.color_pair(PAIR_DLG_CYAN)
                 if i == 0 else sb)
         safe_addstr(stdscr, line, inner_x,
                     end_truncate(text, inner_w), attr)

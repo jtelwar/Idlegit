@@ -4,8 +4,8 @@ from __future__ import annotations
 import curses
 from typing import Optional
 
-from models import State
-from workers import (
+from core.models import State
+from core.workers import (
     _build_recovery_prompt,
     execute_detached_recovery,
     kick_off_bulk_suggest,
@@ -24,7 +24,7 @@ from .modals import (
     open_diff_viewer,
     open_task_action_menu,
     open_workspace_menu,
-    open_workspaces_picker,
+    open_app_menu,
 )
 from .review import (
     _collect_review_focusables,
@@ -131,7 +131,7 @@ def _cycle_workspace(state: State, direction: int) -> Optional[str]:
     # Imported lazily — workers depends on git_ops which is fine at
     # module load, but keeping the import local mirrors how other key
     # handlers in this file pull worker entry points on demand.
-    from workers import switch_workspace
+    from core.workers import switch_workspace
     switch_workspace(state, new_idx)
     return "switch-workspace"
 
@@ -172,7 +172,7 @@ def handle_main_key(state: State, key: int) -> Optional[str]:
             _reset_field_cursor(state)
             return None
         if key == 9:  # Tab — opens the workspaces picker
-            open_workspaces_picker(state)
+            open_app_menu(state)
             return None
         if key == 27:
             return "confirm-quit" if state.has_messages else "quit"
@@ -384,7 +384,7 @@ def _next_detached_review_target(state: State):
     a queued message, or None when none remain. Walks top-level repos
     first, then submodule children — so the modal sequence is stable
     and predictable."""
-    from git_ops import git
+    from core.git_ops import git
     for repo in state.repos:
         if not repo.message.strip():
             continue
@@ -605,7 +605,7 @@ def handle_confirm(stdscr, state: State) -> None:
                         # block's currently-checked files. Lazy import
                         # to keep workers off the main_loop import
                         # cycle.
-                        from workers import kick_off_review_suggest
+                        from core.workers import kick_off_review_suggest
                         kick_off_review_suggest(state, obj)
                     continue
                 if key == curses.KEY_UP and focus > 0:

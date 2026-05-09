@@ -8,9 +8,9 @@ from __future__ import annotations
 import curses
 from typing import List, Tuple
 
-from models import AlignHeadsPrompt, State
+from core.models import AlignHeadsPrompt, State
 
-from ..colors import PAIR_BRANCH, PAIR_SB_CYAN, PAIR_SB_FG
+from ..colors import PAIR_DLG_CYAN, PAIR_DLG_FG
 from ..geometry import (
     clamp_scroll, draw_modal_fill, draw_scroll_overflow, end_truncate,
     modal_geometry, safe_addstr, wrap_label_value,
@@ -92,7 +92,7 @@ def draw_align_heads_prompt(stdscr, state: State, sidebar_x: int) -> None:
     if prompt is None:
         return
 
-    sb = curses.color_pair(PAIR_SB_FG)
+    sb = curses.color_pair(PAIR_DLG_FG)
     term_h, _ = stdscr.getmaxyx()
 
     # Pre-build header rows against the eventual inner width. The
@@ -151,7 +151,7 @@ def draw_align_heads_prompt(stdscr, state: State, sidebar_x: int) -> None:
             line += 1
             continue
         if kind == "title":
-            attr = curses.A_BOLD | curses.color_pair(PAIR_SB_CYAN)
+            attr = curses.A_BOLD | curses.color_pair(PAIR_DLG_CYAN)
         elif kind == "subline_dim":
             attr = sb | curses.A_DIM
         else:  # "subline"
@@ -193,7 +193,7 @@ def draw_align_heads_prompt(stdscr, state: State, sidebar_x: int) -> None:
             branch = prompt.branches[i]
             focused = (i == prompt.selected)
             prefix = "→ " if focused else "  "
-            attr = (curses.color_pair(PAIR_BRANCH) | curses.A_BOLD
+            attr = (curses.color_pair(PAIR_DLG_CYAN) | curses.A_BOLD
                     if focused else sb)
             text = end_truncate(f"{prefix}{branch}", inner_w)
             safe_addstr(stdscr, row_y, inner_x, text, attr)

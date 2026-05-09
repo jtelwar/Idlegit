@@ -13,7 +13,7 @@ for _p in (str(_HERE.parent), str(_HERE)):
         sys.path.insert(0, _p)
 
 from _helpers import make_repo_model as _make_repo  # noqa: E402
-from models import (  # noqa: E402
+from core.models import (  # noqa: E402
     ChildRef, Repo, State, SubtreeSpec, TaskMetadata, Tasks, WorkflowInfo,
     WorkflowToggle,
 )

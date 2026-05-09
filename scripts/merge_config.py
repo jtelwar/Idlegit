@@ -112,8 +112,14 @@ def main() -> int:
         print(f"merge: template missing: {template_path}", file=sys.stderr)
         return 1
 
-    sys.path.insert(0, str(ROOT))
-    import config as idlegit_config  # noqa: E402
+    # Dev tree: `core/` lives at PROJECT_ROOT (one level above this
+    # script in `scripts/`). Post-install: `core/` lives next to this
+    # script (flat install). Adding both candidates keeps the import
+    # working in either layout without us probing the filesystem.
+    for _candidate in (ROOT, ROOT.parent):
+        if str(_candidate) not in sys.path:
+            sys.path.insert(0, str(_candidate))
+    from core import config as idlegit_config  # noqa: E402
 
     dest = idlegit_config.CONFIG_FILE
     dest.parent.mkdir(parents=True, exist_ok=True)

@@ -43,7 +43,7 @@ ROOT = Path(__file__).resolve().parent
 # working in either layout without us probing the filesystem.
 for _candidate in (ROOT, ROOT.parent):
     sys.path.insert(0, str(_candidate))
-from config import APP_DISPLAY_NAME, GITHUB_REPO, VERSION  # noqa: E402
+from core.config import APP_DISPLAY_NAME, GITHUB_REPO, VERSION  # noqa: E402
 
 
 # ---------- ANSI colors --------------------------------------------------

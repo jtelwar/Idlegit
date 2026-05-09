@@ -17,12 +17,14 @@ See README.md for config locations and the keymap.
 """
 from __future__ import annotations
 
+import contextlib
 import curses
+import os
 import sys
 import termios
 import time
 
-from config import (
+from core.config import (
     APP_DISPLAY_NAME,
     apply_workspace_overrides,
     load_config,
@@ -30,8 +32,8 @@ from config import (
     save_workspaces,
     get_load_warnings,
 )
-from git_ops import discover_repos
-from models import State
+from core.git_ops import discover_repos
+from core.models import State
 from ui import (
     SPINNER_FRAMES,
     confirm_quit,
@@ -51,18 +53,62 @@ from ui import (
     handle_workflow_picker_key,
     handle_workspace_creator_key,
     handle_workspace_menu_key,
-    handle_workspaces_picker_key,
+    handle_app_menu_key,
     init_colors,
     refresh_all_workspaces,
     safe_addstr,
+    tick_app_menu_update_check,
     tick_creator_checks,
     tick_menu_path_checks,
 )
-from workers import (
+from core.workers import (
     kick_off_inline_refresh,
     kick_off_sync_siblings,
     switch_workspace,
 )
+
+
+@contextlib.contextmanager
+def _silenced_stderr_fd():
+    """Redirect file descriptor 2 (stderr) to /dev/null for the
+    duration of the with-block, restoring the original fd on exit.
+
+    Why this is fd-level rather than `sys.stderr =` Python-level:
+    `logging.StreamHandler` (and the C-level OpenSSL stack invoked
+    by urllib's TLS) cache the original stderr fd at handler /
+    library setup time, so swapping `sys.stderr` afterward doesn't
+    redirect their output. Curses owns the screen during the
+    session and any stderr write would corrupt the layout
+    (pyenv's broken-OpenSSL `code for hash blake2b was not found`
+    spam from `hashlib`'s logging is the canonical example), so
+    silencing fd 2 wholesale is the safe default. Real fatal
+    errors that need user attention are surfaced via curses
+    modals, not stderr."""
+    if not hasattr(os, "dup") or not hasattr(os, "dup2"):
+        yield
+        return
+    devnull = None
+    saved = None
+    try:
+        saved = os.dup(2)
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, 2)
+        yield
+    finally:
+        if saved is not None:
+            try:
+                os.dup2(saved, 2)
+            except OSError:
+                pass
+            try:
+                os.close(saved)
+            except OSError:
+                pass
+        if devnull is not None:
+            try:
+                os.close(devnull)
+            except OSError:
+                pass
 
 
 def _disable_flow_control() -> None:
@@ -106,7 +152,7 @@ def _run_workspace_creator_subloop(stdscr, cfg, startup_warnings=None):
     blank welcome backdrop with the creator modal overlaid until the
     user either commits at least one workspace (returns the list, also
     persisted via save_workspaces) or cancels with Esc (returns [])."""
-    from models import State
+    from core.models import State
     from ui import (
         PAIR_HEADER, draw_workspace_creator,
         open_workspace_creator,
@@ -271,6 +317,14 @@ def run(stdscr, cfg, workspaces, initial_active_idx: int = 0,
         menu_checking = (
             tick_menu_path_checks(state)
             if state.workspace_menu is not None else False)
+        # The global app menu's APPLICATION section runs an async
+        # GitHub Releases query when the user fires "Check for
+        # updates". The tick rebuilds rows on `checking → done /
+        # failed` transitions and reports True while the worker is
+        # still in flight so the spinner glyph keeps animating.
+        app_menu_checking = (
+            tick_app_menu_update_check(state)
+            if state.app_menu is not None else False)
         # Runtime commit: if the creator finished while open as a
         # modal (e.g. via the "+ Create new workspace" picker entry),
         # consume its result here — append the new workspaces, persist,
@@ -283,7 +337,7 @@ def run(stdscr, cfg, workspaces, initial_active_idx: int = 0,
             if new_ws:
                 first_new_index = len(state.workspaces)
                 state.workspaces = list(state.workspaces) + list(new_ws)
-                state.workspaces_picker = None
+                state.app_menu = None
                 switch_workspace(state, first_new_index)
                 # switch_workspace now persists the post-switch active
                 # index; mirror it here for the append+save case so the
@@ -316,6 +370,7 @@ def run(stdscr, cfg, workspaces, initial_active_idx: int = 0,
                                for r in state.repos for c in r.children)
                         or creator_checking
                         or menu_checking
+                        or app_menu_checking
                         or action_menu_loading
                         or commit_view_loading
                         or (state.diff_viewer is not None
@@ -405,8 +460,8 @@ def run(stdscr, cfg, workspaces, initial_active_idx: int = 0,
         if state.workspace_creator is not None:
             handle_workspace_creator_key(state, key)
             continue
-        if state.workspaces_picker is not None:
-            handle_workspaces_picker_key(state, key)
+        if state.app_menu is not None:
+            handle_app_menu_key(state, key)
             continue
 
         action = handle_main_key(state, key)
@@ -488,10 +543,14 @@ def main() -> int:
     _set_terminal_title(
         f"{APP_DISPLAY_NAME} · {title_name}" if title_name else APP_DISPLAY_NAME)
     try:
-        curses.wrapper(
-            lambda stdscr: run(
-                stdscr, cfg, workspaces, initial_active_idx,
-                startup_warnings=startup_warnings))
+        # _silenced_stderr_fd swallows interpreter / library noise
+        # (broken-OpenSSL hashlib spam, etc.) for the lifetime of
+        # the curses session — see the helper's docstring.
+        with _silenced_stderr_fd():
+            curses.wrapper(
+                lambda stdscr: run(
+                    stdscr, cfg, workspaces, initial_active_idx,
+                    startup_warnings=startup_warnings))
     except KeyboardInterrupt:
         pass
     finally:

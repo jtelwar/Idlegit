@@ -9,12 +9,12 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
 
-from models import (
+from .models import (
     AlignHeadsPrompt, ChildRef, DetachedRecoveryPrompt, LFSCandidate,
     Repo, ReviewBlock, SmartSyncCheckout, State,
     Task,
 )
-from git_ops import (
+from .git_ops import (
     apply_lfs_tracking, discover_repos, dispatch_workflow, first_line,
     get_run_view, gh_available, git, link_siblings, list_branches,
     list_recent_runs, merge_remote_workflow_states, parse_github_slug,
@@ -871,7 +871,7 @@ def kick_off_load_commit_view(state: State, modal) -> None:
     placeholders. Each field flips its respective `*_loading` flag
     False as it lands; `cancel_event` short-circuits if the user
     closes the modal while the queries are in flight."""
-    from git_ops import (
+    from .git_ops import (
         get_commit_details, list_tags_at, query_commit_files,
         query_commit_reflog,
     )
@@ -956,7 +956,7 @@ def kick_off_clone(state: State, url: str, dest: Path, branch: str,
     sidebar. `on_done` is called with `(ok, message)` once the clone
     settles, on the worker thread — caller wires it up to refresh the
     workspace's repo list and close the modal."""
-    from git_ops import clone_repo
+    from .git_ops import clone_repo
     label = dest.name or "clone"
     t = state.tasks.add(f"{label}: clone")
 
@@ -1051,7 +1051,7 @@ def _apply_staging_plan(target_path: Path,
     are filtered out by intersecting with current `git status` so
     they don't trigger `pathspec did not match any files`. Returns
     (ok, error_msg)."""
-    from git_ops import _iter_porcelain_z_entries  # local: avoid circ
+    from .git_ops import _iter_porcelain_z_entries  # local: avoid circ
     if not staged_paths:
         return True, ""
     rc, status_out, _ = git(target_path,
@@ -2843,7 +2843,7 @@ def switch_workspace(state: State, new_index: int) -> None:
     # Re-apply settings from base config + this workspace's overrides.
     # Imported here to avoid a hard config dependency in workers' module
     # namespace (workers is a leaf used by tests that don't load config).
-    from config import apply_workspace_overrides
+    from .config import apply_workspace_overrides
     if state.base_config is not None:
         apply_workspace_overrides(state, state.base_config, ws)
     else:
@@ -2870,7 +2870,7 @@ def switch_workspace(state: State, new_index: int) -> None:
     # the user back here automatically. Save failures are non-fatal —
     # the in-memory switch already happened, the file just won't
     # remember it; on next launch we'll default to the first workspace.
-    from config import save_workspaces
+    from .config import save_workspaces
     try:
         save_workspaces(state.workspaces, state.active_workspace_index)
     except OSError:
@@ -2878,3 +2878,83 @@ def switch_workspace(state: State, new_index: int) -> None:
 
     if kick_refresh:
         kick_off_inline_refresh(state)
+
+
+# ---------- Update check (GitHub Releases API) ---------------------------
+
+
+def kick_off_check_for_updates(menu) -> None:
+    """Query the GitHub Releases API for the latest tag in a daemon
+    thread, then write the result back onto `menu` (an WorkspaceMenu) so
+    the modal can re-render. Synchronously flips
+    `menu.update_check = "checking"` before returning so the next
+    redraw shows the spinner.
+
+    Result lifecycle on `menu`:
+      - `update_check`        — "checking" → "done" / "failed"
+      - `latest_version`      — set on "done" (e.g. "v0.8.9")
+      - `update_check_error`  — set on "failed" (short reason
+        suitable for a single hint-line)
+
+    No exceptions ever escape — network / HTTP / decode errors all
+    land in `update_check_error`. Stdlib-only so the menu doesn't
+    drag in a `requests` dependency. Curses-screen protection
+    against noisy interpreter-side warnings (pyenv's broken-OpenSSL
+    `blake2b/blake2s not found` errors from `hashlib`'s logging,
+    for example) lives at the curses-entrypoint level
+    (`idlegit.run`), which redirects fd 2 for the whole session —
+    redirecting `sys.stderr` here wouldn't catch them because
+    `logging.StreamHandler` captured the original stderr fd at
+    startup."""
+    import json
+    import urllib.error
+    import urllib.request
+    from .config import GITHUB_REPO, VERSION
+
+    menu.update_check = "checking"
+    menu.update_check_error = ""
+    menu.latest_version = ""
+
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+    user_agent = f"idlegit/{VERSION} (+https://github.com/{GITHUB_REPO})"
+
+    def worker() -> None:
+        try:
+            req = urllib.request.Request(url, headers={
+                "User-Agent": user_agent,
+                "Accept": "application/vnd.github+json",
+            })
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                raw = resp.read()
+            data = json.loads(raw.decode("utf-8"))
+            if not isinstance(data, dict) or not data.get("tag_name"):
+                menu.update_check_error = (
+                    "release response missing tag_name")
+                menu.update_check = "failed"
+                return
+            menu.latest_version = str(data["tag_name"])
+            menu.update_check = "done"
+        except urllib.error.HTTPError as e:
+            # GitHub returns 404 from /releases/latest when the repo
+            # exists but has zero published releases — not the same
+            # as "the repo isn't there." Surface that as a softer
+            # informational state so the menu reads "No releases
+            # published yet" instead of a scary HTTP 404.
+            if e.code == 404:
+                menu.latest_version = ""
+                menu.update_check_error = ""
+                menu.update_check = "no_releases"
+            else:
+                menu.update_check_error = f"HTTP {e.code} {e.reason}"
+                menu.update_check = "failed"
+        except urllib.error.URLError as e:
+            menu.update_check_error = f"network: {e.reason}"
+            menu.update_check = "failed"
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            menu.update_check_error = f"parse error: {e}"
+            menu.update_check = "failed"
+        except OSError as e:
+            menu.update_check_error = f"i/o: {e}"
+            menu.update_check = "failed"
+
+    threading.Thread(target=worker, daemon=True).start()

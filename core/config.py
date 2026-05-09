@@ -28,25 +28,35 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List
 
-from models import SubtreeSpec, Workspace
+from .models import SubtreeSpec, Workspace
 
-TOOL_DIR = Path(__file__).resolve().parent
+# Project root from this module's perspective. config.py lives in
+# `core/`; the VERSION file and `idlegit.default.conf` template both
+# sit one level up (alongside `core/`), in both the dev tree and the
+# post-install layout. Resolved once at import time.
+TOOL_DIR = Path(__file__).resolve().parent.parent
 
 
 def _read_version() -> str:
-    """Pull the version string from the `VERSION` file beside this
-    module. Only the first non-blank, non-comment line counts —
-    anything below is free-form (release notes, scratch space) and
-    is ignored. Falls back to `"0.0.0"` if the file is missing or
-    empty so a broken install fails loudly later (e.g. the updater
-    will think every release is newer) rather than at import time."""
+    """Pull the version string from the `VERSION` file at the project
+    root. Streams the file: the line iterator reads lazily and we
+    return as soon as we have the first non-blank line's leading
+    token, so the rest of the file (free-form changelog / release
+    notes) is never read. Falls back to `"0.0.0"` if the file is
+    missing or empty — a broken install fails loudly later (e.g.
+    the updater treats every release as newer) rather than crashing
+    at import."""
     path = TOOL_DIR / "VERSION"
     try:
-        for line in path.read_text(encoding="utf-8").splitlines():
-            stripped = line.strip()
-            if not stripped or stripped.startswith("#"):
-                continue
-            return stripped
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                token = line.strip()
+                if token:
+                    # First whitespace-separated token of the first
+                    # non-blank line — `0.8.4 (2026-05-08)` reads
+                    # as `0.8.4` and anything after becomes free-
+                    # form changelog territory.
+                    return token.split()[0]
     except OSError:
         pass
     return "0.0.0"

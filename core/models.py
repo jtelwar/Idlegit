@@ -998,18 +998,62 @@ class TargetState:
 
 
 @dataclass
-class WorkspacesPicker:
-    """Tab-on-workspace-row dialogue. Lists every configured workspace
-    plus a trailing "+ Create new workspace…" sentinel that opens the
-    creator. Enter on a workspace switches the active index; Enter on
-    the sentinel hands off to WorkspaceCreator and the picker auto-
-    closes once the new workspace lands.
+class AppMenuRow:
+    """One row of the global app menu. `kind` drives input handling
+    and rendering:
+      - "header"           — section divider (e.g. "APPLICATION")
+      - "app_info"         — non-interactive informational row
+                             (version label, update-check result)
+      - "app_action"       — action button; `attr_name` is the action
+                             id ("check_for_updates", "update_now")
+      - "workspace"        — one configured workspace; `attr_name`
+                             holds the workspace index as a string
+      - "create_workspace" — trailing "+ Create new workspace…"
+                             sentinel that hands off to the creator
+    `label` is the human-readable text shown to the user; the
+    renderer composes any extra metadata (folder count, "active",
+    paths) on top from the live state."""
+    label: str
+    attr_name: str
+    kind: str
 
-    `selected` indexes into `state.workspaces` (0..N-1) or equals N for
-    the create-new pseudo-row. `scroll` keeps the focused row visible
-    when there are more workspaces than fit in the modal."""
+
+@dataclass
+class AppMenu:
+    """Global app menu, opened with Tab on the title row. Two
+    sections:
+      - APPLICATION: app name + version, Check for updates button,
+        and (after a check) latest-release info plus an Update now
+        button when the installed version is behind.
+      - WORKSPACES: the existing workspaces picker (active workspace
+        marked, "+ Create new workspace…" trailing sentinel). Enter
+        on a workspace switches the active index; Enter on the
+        create sentinel hands off to WorkspaceCreator.
+
+    Rows are dynamically rebuilt whenever the update-check state
+    flips (`update_check` ↔ `update_check_rendered`) so a worker
+    completing in the background surfaces immediately.
+
+    `update_check` lifecycle:
+      - "idle"         — nothing fetched yet, button is offered
+      - "checking"     — async worker is in flight, spinner shows
+      - "done"         — `latest_version` populated; Update now
+                         appears when behind
+      - "no_releases"  — repo exists but has no published releases
+                         yet (GitHub returns 404 from /releases/
+                         latest in that case — distinct from a
+                         real failure)
+      - "failed"       — `update_check_error` carries a short
+                         reason
+    `update_check_rendered` is what the row list was last rebuilt
+    against; the main-loop tick rebuilds rows when it diverges."""
+    rows: List[AppMenuRow] = field(default_factory=list)
     selected: int = 0
     scroll: int = 0
+    update_check: str = "idle"
+    latest_version: str = ""
+    update_check_error: str = ""
+    update_check_rendered: str = "idle"
 
 
 @dataclass
@@ -1054,18 +1098,29 @@ class WorkspaceCreator:
 
 @dataclass
 class WorkspaceMenuRow:
-    """One row of the workspace-overrides modal. `kind` drives input
-    handling: "bool" toggles with Space, "trunc_mode" cycles through
-    (start, middle, end) with ←/→, "int" adjusts with ←/→ at `step`,
-    bounded by `min_value`/`max_value`. `label` is the human-readable
-    setting name shown on the left of the row; `attr_name` names the
-    State attribute the row drives (and indirectly the workspace
-    overrides key once persisted). `hint_text` is the muted one-line
-    explanation shown above the hints footer when the row is
-    focused — empty for rows that don't need an explainer."""
+    """One row of the global app menu modal. `kind` drives input
+    handling and rendering:
+      - "header"     — section divider (e.g. "APPLICATION", "FOLDERS")
+      - "app_info"   — non-interactive informational row (version,
+                       update-check result)
+      - "app_action" — action button (e.g. "Check for updates",
+                       "Update now"); `attr_name` is the action id
+      - "folder"     — workspace folder path (editable)
+      - "add_folder" — "+ Add folder…" sentinel
+      - "clone"      — "+ Clone repository…" launcher
+      - "bool"       — toggled with Space
+      - "trunc_mode" — cycled (start/middle/end) with ←/→
+      - "int"        — adjusted with ←/→ at `step`, bounded by
+                       `min_value`/`max_value`
+
+    `label` is the human-readable setting name shown on the left;
+    `attr_name` names the State attribute the row drives (or, for
+    app_action rows, the action id). `hint_text` is the muted
+    one-line explanation shown above the hints footer when the row
+    is focused — empty for rows that don't need an explainer."""
     label: str
     attr_name: str
-    kind: str  # "bool" | "trunc_mode" | "int"
+    kind: str
     min_value: int = 0
     max_value: int = 999
     step: int = 1
@@ -1074,9 +1129,10 @@ class WorkspaceMenuRow:
 
 @dataclass
 class WorkspaceMenu:
-    """Modal opened with Space/Enter on the workspace title-row selector.
-    Lets the user override per-workspace settings against the global
-    idlegit.conf defaults AND edit the workspace's folder list.
+    """Per-workspace settings modal, opened with Tab on the workspace
+    selector row. Lets the user override per-workspace settings
+    against the global idlegit.conf defaults AND edit the workspace's
+    folder list.
 
     The rows are dynamically rebuilt on open so the modal reflects the
     current `ws.folders` list — folder rows interleave with override
@@ -1275,7 +1331,7 @@ class State:
     task_action_menu: Optional[TaskActionMenu] = None
     workspace_menu: Optional["WorkspaceMenu"] = None
     workspace_creator: Optional["WorkspaceCreator"] = None
-    workspaces_picker: Optional["WorkspacesPicker"] = None
+    app_menu: Optional["AppMenu"] = None
     remotes_modal: Optional[RemotesModal] = None
     clone_modal: Optional[CloneModal] = None
     # Sub-modal of the action menu's commits pane — Tab on a focused

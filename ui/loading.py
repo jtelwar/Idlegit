@@ -5,10 +5,10 @@ import curses
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Tuple
 
-from models import Repo
-from config import APP_DISPLAY_NAME, DEFAULT_TRUNCATION_MODE, VERSION
-from git_ops import MAX_PARALLEL_GIT_JOBS, link_siblings
-from workers import refresh_repo_with_remote_state
+from core.models import Repo
+from core.config import APP_DISPLAY_NAME, DEFAULT_TRUNCATION_MODE, VERSION
+from core.git_ops import MAX_PARALLEL_GIT_JOBS, link_siblings
+from core.workers import refresh_repo_with_remote_state
 
 from .colors import PAIR_BRANCH, PAIR_HEADER, PAIR_OK
 from .geometry import safe_addstr

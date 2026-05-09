@@ -7,9 +7,9 @@ from __future__ import annotations
 
 import curses
 
-from models import DetachedRecoveryPrompt, State
+from core.models import DetachedRecoveryPrompt, State
 
-from ..colors import PAIR_SB_CYAN, PAIR_SB_FG
+from ..colors import PAIR_DLG_CYAN, PAIR_DLG_FG
 from ..geometry import (
     draw_modal_fill, end_truncate, modal_geometry, safe_addstr,
     wrap_label_value,
@@ -44,7 +44,7 @@ def draw_detached_recovery_prompt(stdscr, state: State, sidebar_x: int) -> None:
     if prompt is None:
         return
 
-    sb = curses.color_pair(PAIR_SB_FG)
+    sb = curses.color_pair(PAIR_DLG_FG)
     target_inner_w = max(1, _MODAL_W - 2 * _PAD_X)
     title_rows = wrap_label_value("Recover detached HEAD",
                                   prompt.target_label, target_inner_w)
@@ -73,7 +73,7 @@ def draw_detached_recovery_prompt(stdscr, state: State, sidebar_x: int) -> None:
 
     line = y + _PAD_TOP
     for i, text in enumerate(title_rows):
-        attr = (curses.A_BOLD | curses.color_pair(PAIR_SB_CYAN)
+        attr = (curses.A_BOLD | curses.color_pair(PAIR_DLG_CYAN)
                 if i == 0 else sb)
         safe_addstr(stdscr, line, inner_x,
                     end_truncate(text, inner_w), attr)

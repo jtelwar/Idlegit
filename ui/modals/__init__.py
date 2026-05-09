@@ -55,9 +55,9 @@ from .workspace_menu import (
     draw_workspace_menu, handle_workspace_menu_key, open_workspace_menu,
     tick_menu_path_checks,
 )
-from .workspaces_picker import (
-    draw_workspaces_picker, handle_workspaces_picker_key,
-    open_workspaces_picker,
+from .app_menu import (
+    draw_app_menu, handle_app_menu_key, open_app_menu,
+    tick_app_menu_update_check,
 )
 
 __all__ = [
@@ -84,6 +84,6 @@ __all__ = [
     "tick_creator_checks",
     "draw_workspace_menu", "handle_workspace_menu_key",
     "open_workspace_menu", "tick_menu_path_checks",
-    "draw_workspaces_picker", "handle_workspaces_picker_key",
-    "open_workspaces_picker",
+    "draw_app_menu", "handle_app_menu_key",
+    "open_app_menu", "tick_app_menu_update_check",
 ]

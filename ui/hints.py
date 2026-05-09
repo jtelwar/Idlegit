@@ -17,7 +17,9 @@ import curses
 from dataclasses import dataclass
 from typing import Iterable, List, Optional
 
-from .colors import PAIR_BRANCH, PAIR_SB_CYAN, PAIR_SB_FG
+from .colors import (
+    PAIR_BRANCH, PAIR_DLG_CYAN, PAIR_DLG_FG, PAIR_SB_CYAN, PAIR_SB_FG,
+)
 from .geometry import safe_addstr
 
 
@@ -25,12 +27,17 @@ def _default_key_attr(action_attr: int) -> int:
     """Pick a 'subtle cyan' attr for the keybinding glyph that pairs
     with the action attr the caller passed. Reads the colour pair
     embedded in `action_attr` to decide which background we're
-    rendering on: the sidebar's dark bg gets the SB_CYAN tone, the
-    default terminal bg gets the regular branch CYAN. Both come back
-    DIM so they read as muted next to the bright child-branch colour
-    (which uses the same pairs without DIM)."""
+    rendering on: dialogs get DLG_CYAN, the sidebar gets SB_CYAN,
+    the main panel's default-bg gets the regular branch CYAN. All
+    come back DIM so they read as muted next to the bright child-
+    branch colour (which uses the same pairs without DIM)."""
     pair_num = curses.pair_number(action_attr) if action_attr else 0
-    base_pair = PAIR_SB_CYAN if pair_num == PAIR_SB_FG else PAIR_BRANCH
+    if pair_num == PAIR_DLG_FG:
+        base_pair = PAIR_DLG_CYAN
+    elif pair_num == PAIR_SB_FG:
+        base_pair = PAIR_SB_CYAN
+    else:
+        base_pair = PAIR_BRANCH
     return curses.color_pair(base_pair) | curses.A_DIM
 
 

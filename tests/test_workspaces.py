@@ -14,16 +14,16 @@ for _p in (str(_HERE.parent), str(_HERE)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-import config  # noqa: E402
+from core import config  # noqa: E402
 from _helpers import (  # noqa: E402
     make_repo_model as _make_repo, make_state as _state,
 )
-from config import (  # noqa: E402
+from core.config import (  # noqa: E402
     Config, apply_workspace_overrides, base_value_for_override,
     coerce_override_value, get_load_warnings, load_config,
     load_workspaces, save_workspaces, state_attr_value_from_override,
 )
-from models import (  # noqa: E402
+from core.models import (  # noqa: E402
     State, Workspace, WorkspaceCreator, WorkspaceDraft,
     WorkspaceMenu,
 )
@@ -40,8 +40,8 @@ try:
     from ui.modals.workspace_menu import (  # noqa: F401
         handle_workspace_menu_key, open_workspace_menu,
     )
-    from ui.modals.workspaces_picker import (  # noqa: F401
-        handle_workspaces_picker_key, open_workspaces_picker,
+    from ui.modals.app_menu import (  # noqa: F401
+        handle_app_menu_key, open_app_menu,
     )
     UI_AVAILABLE = True
 except Exception:  # pragma: no cover
@@ -365,7 +365,7 @@ class TestSwitchWorkspaceCache(unittest.TestCase):
         self._patches = [
             mock.patch.object(config, "WORKSPACES_FILE",
                               Path(self._tmp.name) / "idlegit.workspaces"),
-            mock.patch("workers.kick_off_inline_refresh"),
+            mock.patch("core.workers.kick_off_inline_refresh"),
         ]
         for p in self._patches:
             p.start()
@@ -381,14 +381,14 @@ class TestSwitchWorkspaceCache(unittest.TestCase):
         return s
 
     def test_cache_hit_skips_discovery_and_async_refresh(self) -> None:
-        from workers import switch_workspace
+        from core.workers import switch_workspace
         a_repos = [_make_repo("a1"), _make_repo("a2")]
         b_repos = [_make_repo("b1")]
         a = Workspace(name="A", folders=[Path("/a")], cached_repos=a_repos)
         b = Workspace(name="B", folders=[Path("/b")], cached_repos=b_repos)
         s = self._state(a, b)
-        with mock.patch("workers.discover_repos") as disc, \
-             mock.patch("workers.kick_off_inline_refresh") as kick:
+        with mock.patch("core.workers.discover_repos") as disc, \
+             mock.patch("core.workers.kick_off_inline_refresh") as kick:
             switch_workspace(s, 1)
             disc.assert_not_called()
             kick.assert_not_called()
@@ -396,14 +396,14 @@ class TestSwitchWorkspaceCache(unittest.TestCase):
         self.assertEqual(s.workspace_name, "B")
 
     def test_cache_miss_falls_back_to_discover_plus_async_refresh(self) -> None:
-        from workers import switch_workspace
+        from core.workers import switch_workspace
         a_repos = [_make_repo("a1")]
         a = Workspace(name="A", folders=[Path("/a")], cached_repos=a_repos)
         b = Workspace(name="B", folders=[Path("/b")])
         s = self._state(a, b)
         fresh = [_make_repo("b1"), _make_repo("b2")]
-        with mock.patch("workers.discover_repos", return_value=fresh) as disc, \
-             mock.patch("workers.kick_off_inline_refresh") as kick:
+        with mock.patch("core.workers.discover_repos", return_value=fresh) as disc, \
+             mock.patch("core.workers.kick_off_inline_refresh") as kick:
             switch_workspace(s, 1)
             disc.assert_called_once()
             kick.assert_called_once()
@@ -411,14 +411,14 @@ class TestSwitchWorkspaceCache(unittest.TestCase):
         self.assertEqual([r.rel for r in b.cached_repos], ["b1", "b2"])
 
     def test_in_place_repo_mutations_persist_across_switches(self) -> None:
-        from workers import switch_workspace
+        from core.workers import switch_workspace
         a_repos = [_make_repo("a1")]
         a_repos[0].message = "pending edit"
         a = Workspace(name="A", folders=[Path("/a")], cached_repos=a_repos)
         b = Workspace(name="B", folders=[Path("/b")],
                       cached_repos=[_make_repo("b1")])
         s = self._state(a, b)
-        with mock.patch("workers.kick_off_inline_refresh"):
+        with mock.patch("core.workers.kick_off_inline_refresh"):
             switch_workspace(s, 1)  # A → B
             switch_workspace(s, 0)  # B → A
         # Coming back to A surfaces the unsaved message exactly as it
@@ -468,7 +468,7 @@ class TestWorkspaceRowKeys(unittest.TestCase):
 
     def test_left_right_cycle_workspace_calls_switch(self) -> None:
         s = self._state_two_ws()
-        with mock.patch("workers.switch_workspace") as m:
+        with mock.patch("core.workers.switch_workspace") as m:
             handle_main_key(s, curses.KEY_RIGHT)
             self.assertEqual(m.call_count, 1)
             self.assertEqual(m.call_args.args[1], 1)
@@ -481,7 +481,7 @@ class TestWorkspaceRowKeys(unittest.TestCase):
         ws_a = Workspace(name="A", folders=[Path("/a")])
         s = _state(_make_repo("r"), workspaces=[ws_a])
         s.selected = -1
-        with mock.patch("workers.switch_workspace") as m:
+        with mock.patch("core.workers.switch_workspace") as m:
             handle_main_key(s, curses.KEY_RIGHT)
             handle_main_key(s, curses.KEY_LEFT)
             self.assertEqual(m.call_count, 0)
@@ -632,16 +632,16 @@ class TestTitleRowTab(unittest.TestCase):
         ws_b = Workspace(name="B", folders=[Path("/b")])
         s = _state(_make_repo("r"), workspaces=[ws_a, ws_b])
         s.selected = -2
-        self.assertIsNone(s.workspaces_picker)
+        self.assertIsNone(s.app_menu)
         handle_main_key(s, 9)  # Tab
-        self.assertIsNotNone(s.workspaces_picker)
+        self.assertIsNotNone(s.app_menu)
 
 
 # ---------- Workspaces picker --------------------------------------------
 
 
 @unittest.skipUnless(UI_AVAILABLE, "ui module unavailable")
-class TestWorkspacesPicker(unittest.TestCase):
+class TestAppMenu(unittest.TestCase):
     def _state(self) -> State:
         ws_a = Workspace(name="A", folders=[Path("/a")])
         ws_b = Workspace(name="B", folders=[Path("/b")])
@@ -650,67 +650,87 @@ class TestWorkspacesPicker(unittest.TestCase):
                    active_workspace_index=1)
         return s
 
+    def _focused(self, s: State):
+        """The focused row of the global app menu — used in place of
+        bare-index assertions so tests don't break each time the
+        APPLICATION section adds or removes a row above the
+        WORKSPACES list."""
+        menu = s.app_menu
+        assert menu is not None
+        return menu.rows[menu.selected]
+
     def test_open_lands_on_active_workspace(self) -> None:
         s = self._state()
-        open_workspaces_picker(s)
-        self.assertEqual(s.workspaces_picker.selected, 1)
+        open_app_menu(s)
+        row = self._focused(s)
+        self.assertEqual(row.kind, "workspace")
+        self.assertEqual(row.attr_name, "1")  # active_workspace_index
 
     def test_down_lands_on_next_workspace_then_create_row(self) -> None:
         s = self._state()
-        open_workspaces_picker(s)
-        handle_workspaces_picker_key(s, curses.KEY_DOWN)  # 1 → 2
-        self.assertEqual(s.workspaces_picker.selected, 2)
-        handle_workspaces_picker_key(s, curses.KEY_DOWN)  # 2 → 3 (Create)
-        self.assertEqual(s.workspaces_picker.selected, 3)
+        open_app_menu(s)
+        handle_app_menu_key(s, curses.KEY_DOWN)  # active (1) → ws 2
+        row = self._focused(s)
+        self.assertEqual(row.kind, "workspace")
+        self.assertEqual(row.attr_name, "2")
+        handle_app_menu_key(s, curses.KEY_DOWN)  # ws 2 → Create
+        row = self._focused(s)
+        self.assertEqual(row.kind, "create_workspace")
         # Down at the bottom doesn't overshoot.
-        handle_workspaces_picker_key(s, curses.KEY_DOWN)
-        self.assertEqual(s.workspaces_picker.selected, 3)
+        handle_app_menu_key(s, curses.KEY_DOWN)
+        row = self._focused(s)
+        self.assertEqual(row.kind, "create_workspace")
 
     def test_enter_on_workspace_calls_switch(self) -> None:
         s = self._state()
-        open_workspaces_picker(s)
-        handle_workspaces_picker_key(s, curses.KEY_DOWN)  # land on idx 2
-        with mock.patch("workers.switch_workspace") as m:
-            handle_workspaces_picker_key(s, 10)  # Enter
+        open_app_menu(s)
+        handle_app_menu_key(s, curses.KEY_DOWN)  # land on idx 2
+        with mock.patch("core.workers.switch_workspace") as m:
+            handle_app_menu_key(s, 10)  # Enter
         # Picker closes, switch is invoked.
-        self.assertIsNone(s.workspaces_picker)
+        self.assertIsNone(s.app_menu)
         self.assertEqual(m.call_count, 1)
         self.assertEqual(m.call_args.args[1], 2)
 
     def test_enter_on_active_index_does_not_switch(self) -> None:
         s = self._state()
-        open_workspaces_picker(s)
+        open_app_menu(s)
         # Cursor starts on the active workspace (index 1).
-        with mock.patch("workers.switch_workspace") as m:
-            handle_workspaces_picker_key(s, 10)
-        self.assertIsNone(s.workspaces_picker)
+        with mock.patch("core.workers.switch_workspace") as m:
+            handle_app_menu_key(s, 10)
+        self.assertIsNone(s.app_menu)
         self.assertEqual(m.call_count, 0)
 
     def test_enter_on_create_row_opens_creator(self) -> None:
         s = self._state()
-        open_workspaces_picker(s)
-        # Move to the Create row.
-        for _ in range(3):
-            handle_workspaces_picker_key(s, curses.KEY_DOWN)
-        self.assertEqual(s.workspaces_picker.selected, 3)
+        open_app_menu(s)
+        # Walk down until the cursor lands on the Create row. The
+        # exact step count depends on whatever rows the APPLICATION
+        # section emits above the workspace list, so loop on the
+        # focused row's kind rather than baking in a magic number.
+        for _ in range(20):
+            if self._focused(s).kind == "create_workspace":
+                break
+            handle_app_menu_key(s, curses.KEY_DOWN)
+        self.assertEqual(self._focused(s).kind, "create_workspace")
         self.assertIsNone(s.workspace_creator)
-        handle_workspaces_picker_key(s, 10)
+        handle_app_menu_key(s, 10)
         self.assertIsNotNone(s.workspace_creator)
         # Picker stays open underneath; the main loop closes it once
         # the creator commits.
-        self.assertIsNotNone(s.workspaces_picker)
+        self.assertIsNotNone(s.app_menu)
 
     def test_esc_closes_picker(self) -> None:
         s = self._state()
-        open_workspaces_picker(s)
-        handle_workspaces_picker_key(s, 27)
-        self.assertIsNone(s.workspaces_picker)
+        open_app_menu(s)
+        handle_app_menu_key(s, 27)
+        self.assertIsNone(s.app_menu)
 
     def test_open_with_no_workspaces_falls_back_to_creator(self) -> None:
         s = _state(_make_repo("r"))  # no workspaces
-        open_workspaces_picker(s)
+        open_app_menu(s)
         # No picker, but the creator should be open instead.
-        self.assertIsNone(s.workspaces_picker)
+        self.assertIsNone(s.app_menu)
         self.assertIsNotNone(s.workspace_creator)
 
 

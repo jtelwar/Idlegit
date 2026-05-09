@@ -26,18 +26,18 @@ import threading
 from pathlib import Path
 from typing import List
 
-from models import DiffViewer, State
-from git_ops import (
+from core.models import DiffViewer, State
+from core.git_ops import (
     git_bounded_output, query_file_blame, query_file_log,
 )
 
 from ..colors import (
-    PAIR_PASTEL_BLUE, PAIR_PASTEL_GREEN, PAIR_PASTEL_RED,
-    PAIR_PASTEL_YELLOW, PAIR_SB_CYAN, PAIR_SB_FG,
+    PAIR_DLG_PASTEL_BLUE, PAIR_DLG_PASTEL_GREEN, PAIR_DLG_PASTEL_RED,
+    PAIR_DLG_PASTEL_YELLOW, PAIR_DLG_CYAN, PAIR_DLG_FG,
 )
 from ..geometry import (
-    draw_modal_fill, end_truncate, modal_geometry, safe_addstr,
-    wrap_label_value,
+    draw_modal_fill, draw_scroll_overflow, end_truncate, modal_geometry,
+    safe_addstr, wrap_label_value,
 )
 from ..hints import (
     KEY_ESC, KEY_LEFT_RIGHT, KEY_TAB, KEY_UP_DOWN, Hint, render_hints,
@@ -285,13 +285,13 @@ def _diff_line_attr(line: str, sb: int) -> int:
     Headers (`diff --git`, `index …`, `--- …`, `+++ …`) keep the
     default attr so the structural lines read as quiet context."""
     if line.startswith("@@"):
-        return curses.color_pair(PAIR_PASTEL_YELLOW) | curses.A_BOLD
+        return curses.color_pair(PAIR_DLG_PASTEL_YELLOW) | curses.A_BOLD
     if line.startswith("+++") or line.startswith("---"):
         return sb | curses.A_DIM
     if line.startswith("+"):
-        return curses.color_pair(PAIR_PASTEL_GREEN)
+        return curses.color_pair(PAIR_DLG_PASTEL_GREEN)
     if line.startswith("-"):
-        return curses.color_pair(PAIR_PASTEL_RED)
+        return curses.color_pair(PAIR_DLG_PASTEL_RED)
     return sb
 
 
@@ -308,11 +308,11 @@ def _draw_log_row(stdscr, y: int, x: int, w: int, row: str,
         return
     sha = parts[0]
     safe_addstr(stdscr, y, x, sha,
-                curses.color_pair(PAIR_PASTEL_YELLOW))
+                curses.color_pair(PAIR_DLG_PASTEL_YELLOW))
     if len(parts) >= 2:
         date = parts[1]
         safe_addstr(stdscr, y, x + len(sha) + 1, date,
-                    curses.color_pair(PAIR_PASTEL_BLUE))
+                    curses.color_pair(PAIR_DLG_PASTEL_BLUE))
 
 
 def _draw_blame_row(stdscr, y: int, x: int, w: int, row: str,
@@ -326,7 +326,7 @@ def _draw_blame_row(stdscr, y: int, x: int, w: int, row: str,
     # First token is the sha (8 hex chars typically). Re-paint it.
     if len(text) >= 8 and text[8:9] in (" ", ""):
         safe_addstr(stdscr, y, x, text[:8],
-                    curses.color_pair(PAIR_PASTEL_YELLOW))
+                    curses.color_pair(PAIR_DLG_PASTEL_YELLOW))
     # Find the matching `)` after the metadata block to dim it.
     open_paren = text.find("(")
     close_paren = text.find(")", open_paren) if open_paren != -1 else -1
@@ -385,7 +385,7 @@ def draw_diff_viewer(stdscr, state: State, sidebar_x: int = 0) -> None:
     x, y, box_w, box_h = modal_geometry(
         stdscr, sidebar_x, target_w, target_h)
 
-    sb = curses.color_pair(PAIR_SB_FG)
+    sb = curses.color_pair(PAIR_DLG_FG)
     draw_modal_fill(stdscr, x, y, box_w, box_h, sb)
 
     inner_x = x + 2
@@ -399,7 +399,7 @@ def draw_diff_viewer(stdscr, state: State, sidebar_x: int = 0) -> None:
     title_rows = wrap_label_value("View", viewer.label, inner_w)
     line = y + pad_top
     for i, text in enumerate(title_rows):
-        attr = (curses.A_BOLD | curses.color_pair(PAIR_SB_CYAN)
+        attr = (curses.A_BOLD | curses.color_pair(PAIR_DLG_CYAN)
                 if i == 0 else sb)
         safe_addstr(stdscr, line, inner_x,
                     end_truncate(text, inner_w), attr)
@@ -450,17 +450,14 @@ def draw_diff_viewer(stdscr, state: State, sidebar_x: int = 0) -> None:
                                 inner_w, row, sb)
         # Above / below scroll affordances.
         if scroll > 0:
-            msg = f"  ↑ {scroll} more above"
-            safe_addstr(stdscr, line,
-                        inner_x + max(0, inner_w - len(msg) - 1),
-                        msg, sb | curses.A_DIM)
+            draw_scroll_overflow(stdscr, line, inner_x, inner_w,
+                                 scroll, "up", sb | curses.A_DIM)
         end = min(len(lines), scroll + body_h)
         if end < len(lines):
             below = len(lines) - end
-            msg = f"  ↓ {below} more below"
-            safe_addstr(stdscr, line + body_h - 1,
-                        inner_x + max(0, inner_w - len(msg) - 1),
-                        msg, sb | curses.A_DIM)
+            draw_scroll_overflow(stdscr, line + body_h - 1,
+                                 inner_x, inner_w, below, "down",
+                                 sb | curses.A_DIM)
 
     render_hints(stdscr, hint_y, inner_x, inner_w,
                  _hints(), attr=sb | curses.A_DIM)

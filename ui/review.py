@@ -5,7 +5,7 @@ import curses
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
-from models import (
+from core.models import (
     ChildRef,
     FileEntry,
     LFSCandidate,
@@ -15,8 +15,8 @@ from models import (
     ThenRunSelector,
     WorkflowToggle,
 )
-from config import APP_DISPLAY_NAME
-from git_ops import (
+from core.config import APP_DISPLAY_NAME
+from core.git_ops import (
     find_lfs_warnings,
     gh_available,
     parse_github_slug,
@@ -41,7 +41,7 @@ from .colors import (
     PAIR_SB_FG_ACTIVE,
     PAIR_SB_FG_DISABLED,
 )
-from .geometry import clamp_scroll, safe_addstr
+from .geometry import clamp_scroll, draw_scroll_overflow, safe_addstr
 from .hints import (
     KEY_ENTER,
     KEY_ESC,
@@ -1021,15 +1021,13 @@ def _draw_right_pane(stdscr, x: int, y: int, w: int, h: int,
         _render_review_file_row(stdscr, line + slot, x, w, fe, focused,
                                 checked, pane_focused)
     if block.file_scroll > 0:
-        msg = f"  ↑ {block.file_scroll} more above"
-        safe_addstr(stdscr, line, x + max(0, w - len(msg) - 1),
-                    msg, dim_attr)
+        draw_scroll_overflow(stdscr, line, x, w,
+                             block.file_scroll, "up", dim_attr)
     end = min(len(block.files), block.file_scroll + list_h)
     if end < len(block.files):
         below = len(block.files) - end
-        msg = f"  ↓ {below} more below"
-        safe_addstr(stdscr, line + list_h - 1, x + max(0, w - len(msg) - 1),
-                    msg, dim_attr)
+        draw_scroll_overflow(stdscr, line + list_h - 1, x, w,
+                             below, "down", dim_attr)
 
 
 def _review_hints(focusables: List[Tuple[int, str, object]],

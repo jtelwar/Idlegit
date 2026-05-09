@@ -16,7 +16,7 @@ for _p in (str(_HERE.parent), str(_HERE)):
 from _helpers import (  # noqa: E402
     make_repo_model as _make_repo, make_state as _state,
 )
-from models import (  # noqa: E402
+from core.models import (  # noqa: E402
     ActionMenu, ActionMenuItem, BranchNamePrompt, BranchPicker, CommitEntry,
     FileEntry, ResetPrompt, State,
 )

@@ -11,13 +11,13 @@ for _p in (str(_HERE.parent), str(_HERE)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from git_ops import (  # noqa: E402
+from core.git_ops import (  # noqa: E402
     _format_suggestion, _parse_on_block, canonicalize_url,
     derive_lfs_pattern, first_line, format_size, format_time_ago,
     parse_github_slug, would_run_on_push,
 )
-from models import FileChange, WorkflowInfo  # noqa: E402
-from workers import (  # noqa: E402
+from core.models import FileChange, WorkflowInfo  # noqa: E402
+from core.workers import (  # noqa: E402
     _current_step_label, _format_job_label, _format_run_label,
     _gh_run_status_to_task,
 )

@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from models import (
+from .models import (
     ChildRef, CommitEntry, FileChange, FileEntry, LFSCandidate, Repo,
     SubtreeSpec, TargetState,
 )
@@ -823,7 +823,7 @@ import json  # noqa: E402 — section-local convenience
 import re  # noqa: E402
 import shutil  # noqa: E402
 
-from models import WorkflowInfo, WorkflowInput  # noqa: E402
+from .models import WorkflowInfo, WorkflowInput  # noqa: E402
 
 
 _GH_PATH: Optional[str] = shutil.which("gh")

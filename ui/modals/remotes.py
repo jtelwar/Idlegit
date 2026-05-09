@@ -9,11 +9,11 @@ from __future__ import annotations
 import curses
 from typing import List
 
-from models import RemotesModal, RemoteRow, State
-from git_ops import list_remotes
-from workers import _compute_remote_ops, kick_off_remote_changes
+from core.models import RemotesModal, RemoteRow, State
+from core.git_ops import list_remotes
+from core.workers import _compute_remote_ops, kick_off_remote_changes
 
-from ..colors import PAIR_SB_CYAN, PAIR_SB_FG, PAIR_WARN
+from ..colors import PAIR_DLG_CYAN, PAIR_DLG_FG, PAIR_DLG_WARN
 from ..geometry import (
     clamp_scroll, draw_modal_fill, draw_scroll_overflow, end_truncate,
     modal_geometry, safe_addstr, wrap_label_value,
@@ -205,7 +205,7 @@ def draw_remotes_modal(stdscr, state: State, sidebar_x: int) -> None:
     if modal is None:
         return
 
-    sb = curses.color_pair(PAIR_SB_FG)
+    sb = curses.color_pair(PAIR_DLG_FG)
     target_inner_w = max(1, _MODAL_W - 2 * _PAD_X)
     title_rows = _title_lines(modal, target_inner_w)
 
@@ -237,7 +237,7 @@ def draw_remotes_modal(stdscr, state: State, sidebar_x: int) -> None:
     # Title.
     line = y + _PAD_TOP
     for i, text in enumerate(title_rows):
-        attr = (curses.A_BOLD | curses.color_pair(PAIR_SB_CYAN)
+        attr = (curses.A_BOLD | curses.color_pair(PAIR_DLG_CYAN)
                 if i == 0 else sb)
         safe_addstr(stdscr, line, inner_x,
                     end_truncate(text, inner_w), attr)
@@ -290,7 +290,7 @@ def draw_remotes_modal(stdscr, state: State, sidebar_x: int) -> None:
                   "[y]es  [n]o  [Esc] cancel")
         safe_addstr(stdscr, line, inner_x,
                     end_truncate(prompt, inner_w),
-                    curses.color_pair(PAIR_WARN) | curses.A_BOLD)
+                    curses.color_pair(PAIR_DLG_WARN) | curses.A_BOLD)
         line += 1
         for s in summary_lines:
             safe_addstr(stdscr, line, inner_x,

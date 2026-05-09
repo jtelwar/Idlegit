@@ -7,8 +7,8 @@ from __future__ import annotations
 import curses
 import time
 
-from models import State
-from git_ops import format_time_ago
+from core.models import State
+from core.git_ops import format_time_ago
 
 from .colors import (
     PAIR_SB_CYAN, PAIR_SB_CYAN_ACTIVE,

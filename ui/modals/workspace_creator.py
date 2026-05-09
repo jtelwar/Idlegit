@@ -15,11 +15,11 @@ import threading
 from pathlib import Path
 from typing import List
 
-from git_ops import discover_repos
-from models import State, Workspace, WorkspaceCreator, WorkspaceDraft
+from core.git_ops import discover_repos
+from core.models import State, Workspace, WorkspaceCreator, WorkspaceDraft
 
 from ..colors import (
-    PAIR_BRANCH, PAIR_OK, PAIR_SB_CYAN, PAIR_SB_FG, PAIR_WARN,
+    PAIR_DLG_OK, PAIR_DLG_CYAN, PAIR_DLG_FG, PAIR_DLG_WARN,
 )
 from ..geometry import draw_modal_fill, modal_geometry, safe_addstr
 from ..hints import (
@@ -204,12 +204,12 @@ def _row_status(draft: WorkspaceDraft) -> "tuple[str, int]":
     if not text:
         return ("", 0)
     if draft.error:
-        return (draft.error, PAIR_WARN)
+        return (draft.error, PAIR_DLG_WARN)
     if draft.repo_count > 0:
         return (f"✓ {draft.repo_count} repo"
-                f"{'s' if draft.repo_count != 1 else ''} found", PAIR_OK)
+                f"{'s' if draft.repo_count != 1 else ''} found", PAIR_DLG_OK)
     if draft.repo_count == 0:
-        return ("(no repos found)", PAIR_WARN)
+        return ("(no repos found)", PAIR_DLG_WARN)
     return ("", 0)
 
 
@@ -225,14 +225,14 @@ def draw_workspace_creator(stdscr, state: State, sidebar_x: int) -> None:
     content_h = (1 + 1 + 1 + 2 + 1 + max(1, n_drafts)
                  + 1 + 1 + 1 + 1 + 1 + 1)
     x, y, w, h = modal_geometry(stdscr, sidebar_x, 80, content_h)
-    sb = curses.color_pair(PAIR_SB_FG)
+    sb = curses.color_pair(PAIR_DLG_FG)
     draw_modal_fill(stdscr, x, y, w, h, sb)
 
     inner_x = x + 2
     inner_w = w - 4
 
     safe_addstr(stdscr, y + 1, inner_x, creator.title[:inner_w],
-                curses.A_BOLD | curses.color_pair(PAIR_SB_CYAN))
+                curses.A_BOLD | curses.color_pair(PAIR_DLG_CYAN))
 
     # Wrap the intro across two rows so a long sentence doesn't get
     # clipped to a single field's width.
@@ -278,7 +278,7 @@ def draw_workspace_creator(stdscr, state: State, sidebar_x: int) -> None:
         body = visible.ljust(field_w)
         field_attr = curses.A_UNDERLINE
         if focused:
-            field_attr |= curses.color_pair(PAIR_BRANCH) | curses.A_BOLD
+            field_attr |= curses.color_pair(PAIR_DLG_CYAN) | curses.A_BOLD
         else:
             field_attr |= curses.A_DIM
         field_x = inner_x + 2 + len(label)
@@ -311,11 +311,11 @@ def draw_workspace_creator(stdscr, state: State, sidebar_x: int) -> None:
     else:
         text = "  (add at least one path above to continue)"
     if done_focused and nonempty:
-        attr = curses.color_pair(PAIR_BRANCH) | curses.A_BOLD | curses.A_REVERSE
+        attr = curses.color_pair(PAIR_DLG_CYAN) | curses.A_BOLD | curses.A_REVERSE
     elif done_focused:
         attr = sb | curses.A_DIM | curses.A_REVERSE
     elif nonempty:
-        attr = curses.color_pair(PAIR_BRANCH) | curses.A_BOLD
+        attr = curses.color_pair(PAIR_DLG_CYAN) | curses.A_BOLD
     else:
         attr = sb | curses.A_DIM
     safe_addstr(stdscr, done_y, inner_x, text.ljust(inner_w)[:inner_w], attr)
