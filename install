@@ -18,7 +18,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALLER="$ROOT/scripts/install.py"
 
 if [[ ! -f "$INSTALLER" ]]; then
-    echo "install.sh: missing scripts/install.py (got ROOT=$ROOT)" >&2
+    echo "install: missing scripts/install.py (got ROOT=$ROOT)" >&2
     exit 1
 fi
 
@@ -27,14 +27,14 @@ if command -v python3 >/dev/null 2>&1; then
 elif command -v python >/dev/null 2>&1; then
     PY="$(command -v python)"
 else
-    echo "install.sh: python3 not found on PATH" >&2
+    echo "install: python3 not found on PATH" >&2
     echo "       • macOS:  brew install python3   or   https://www.python.org/" >&2
     echo "       • Debian/Ubuntu:  sudo apt install python3" >&2
     exit 1
 fi
 
 if ! "$PY" -c 'import sys; sys.exit(0 if sys.version_info[:2] >= (3, 9) else 1)' 2>/dev/null; then
-    echo "install.sh: need Python 3.9 or newer (found: $("$PY" -V 2>&1))" >&2
+    echo "install: need Python 3.9 or newer (found: $("$PY" -V 2>&1))" >&2
     exit 1
 fi
 

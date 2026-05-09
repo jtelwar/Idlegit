@@ -1,20 +1,19 @@
 #!/usr/bin/env python3
-"""Idlegit installer — Python rewrite of the old bash install.sh.
+"""Idlegit installer.
 
-Drives the same checks-then-install pipeline: verifies the repo
-layout, the local toolchain (git / gh / git-lfs), copies the app
-under IDLEGIT_HOME, symlinks the launcher into IDLEGIT_BINDIR
-(preferring the writable Homebrew bindir on macOS so the launcher
-lands on the default PATH), merges new idlegit.conf keys into the
-user config, and offers to add the bindir to PATH when it isn't
-already.
+Drives the checks-then-install pipeline: verifies the repo layout,
+the local toolchain (git / gh / git-lfs), copies the app under
+IDLEGIT_HOME, symlinks the launcher into IDLEGIT_BINDIR (preferring
+the writable Homebrew bindir on macOS so the launcher lands on the
+default PATH), merges new idlegit.conf keys into the user config,
+and offers to add the bindir to PATH when it isn't already.
 
 Output is colored when stderr is a TTY and `NO_COLOR` is unset:
 green ✓ for OK, yellow ⚠ for missing-but-optional deps (with a
 prompt), red ✗ for hard failures.
 
-Run via the thin `install.sh` launcher (which checks the Python
-toolchain first). Same env vars and flags as before:
+Run via the thin `./install` launcher at the repo root (which
+checks the Python toolchain first). Same env vars and flags:
 
   -y / --yes                         Don't prompt (treat warns as accepted)
   IDLEGIT_HOME                       App directory
@@ -189,11 +188,11 @@ def check_repo_layout(summary: "list[str]") -> None:
     ]
     for name in required_files:
         if not (PROJECT_ROOT / name).is_file():
-            die(f"missing \"{name}\" — run install.sh from the "
+            die(f"missing \"{name}\" — run ./install from the "
                 f"idlegit repo root (got PROJECT_ROOT={PROJECT_ROOT})")
     for pkg in ("core", "ui"):
         if not (PROJECT_ROOT / pkg).is_dir():
-            die(f"missing {pkg}/ — run install.sh from the idlegit repo root")
+            die(f"missing {pkg}/ — run ./install from the idlegit repo root")
     ok("repo layout", str(PROJECT_ROOT))
     summary.append(f"Verified repo layout under {PROJECT_ROOT}")
 

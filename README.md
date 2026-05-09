@@ -12,27 +12,77 @@ Because clicking through a painfully inefficient GUI git tool to commit-and-push
 
 And because the name lazygit was already taken, but it's just not lazy enough for me...
 
-## Run
+## Install
 
-Clone or copy the repository and run the launcher from the root; everything is on one
-keyboard-driven screen.
+Clone the repo and run `./install` from the root:
 
 ```sh
-./idlegit
+git clone https://github.com/jtelwar/idlegit.git
+cd idlegit
+./install
 ```
 
-On first launch it pops a setup dialog asking you to type one or more
-folder paths to scan; each one becomes a named workspace you can switch
-between at runtime (Up to the title row, ←/→ to cycle, Space to edit
-that workspace's overrides). Settings live in a per-user directory:
-**macOS** `~/Library/Application Support/idlegit/`, **Windows**
-`%APPDATA%\idlegit\`, **Linux** `$XDG_CONFIG_HOME/idlegit` or
-`~/.config/idlegit/` (`idlegit.conf` and `idlegit.workspaces`). Override
-with `IDLEGIT_CONFIG_DIR` if needed. If you previously kept those files next
-to the app, they are copied into the new location on first run.
-Relative `folders` paths are resolved against the directory containing
-`idlegit.workspaces` (not the install path); prefer absolute paths if you
-move machines.
+The installer copies the app into a stable home directory and
+symlinks the launcher onto your `$PATH` so you can invoke it as
+`idlegit` from anywhere. It also drops `idlegit-update` next to it
+for in-place upgrades. If your bindir isn't already on `$PATH` it
+asks before editing your shell profile; pass `-y` to accept the
+prompts non-interactively.
+
+Defaults can be overridden with environment variables:
+
+| Variable             | What it controls                                  |
+| -------------------- | ------------------------------------------------- |
+| `IDLEGIT_HOME`       | App directory (where files are copied to)         |
+| `IDLEGIT_BINDIR`     | Directory the `idlegit` symlink lands in          |
+| `IDLEGIT_CONFIG_DIR` | User config directory (see **Run** below)         |
+
+If you'd rather not install, you can run directly from the cloned
+tree with `./idlegit` — the install step is only there to put it on
+`$PATH` and wire up `idlegit-update`.
+
+## Run
+
+```sh
+idlegit
+```
+
+Everything is on one keyboard-driven screen. On first launch a
+setup dialog asks for one or more folder paths to scan; each path
+becomes a named workspace you can switch between at runtime.
+
+Settings live in a per-user directory:
+
+- **macOS:** `~/Library/Application Support/idlegit/`
+- **Windows:** `%APPDATA%\idlegit\`
+- **Linux:** `$XDG_CONFIG_HOME/idlegit` or `~/.config/idlegit/`
+
+Two files: `idlegit.conf` (defaults) and `idlegit.workspaces`
+(folder lists + per-workspace overrides). Override the directory
+with `IDLEGIT_CONFIG_DIR` if you need to. If you previously kept
+those files next to the app, they're copied into the new location
+on first run. Relative `folders` paths are resolved against the
+directory containing `idlegit.workspaces` (not the install path);
+prefer absolute paths if you move machines.
+
+## Update
+
+In-app: press `Tab` on the title row to open the menu, then
+`Enter` on **Check for updates** — and **Update now** when one is
+offered. The app exits cleanly and re-execs the updater.
+
+From a shell:
+
+```sh
+idlegit-update          # check, then prompt before installing
+idlegit-update -y       # check + install without prompting
+idlegit-update --check  # just print whether an update is available
+idlegit-update --force  # reinstall the latest tag even if already current
+```
+
+The updater downloads the latest release tarball, extracts it to a
+temp dir, and re-runs `install` against that source — your config
+in `IDLEGIT_CONFIG_DIR` is left alone (only new keys are merged in).
 
 ## Design Goals
 
