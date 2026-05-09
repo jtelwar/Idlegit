@@ -96,6 +96,35 @@ def _format_job_label(job_name: str, current_step: str = "") -> str:
     return f"  ↳ {job_name}"
 
 
+def _create_and_push_tag(tasks, task_obj, repo_path: Path,
+                         tag_name: str, sha: str) -> None:
+    """Create `tag_name` at `sha` in `repo_path`, then push it to
+    origin. Updates `task_obj` to ok/fail in place. Used by both the
+    after-push and after-workflow `__add_tag__` then-run handlers —
+    the chain's whole purpose is to land a tag upstream (so a
+    tag-triggered workflow like release.yml can fire), so an unpushed
+    local tag isn't a useful end-state. Push failure leaves the
+    local tag in place; the user can rerun the push manually after
+    fixing the cause (auth, network, etc.)."""
+    if not tag_name or tag_name.startswith("-"):
+        tasks.update(task_obj, "fail", "tag name empty or unsafe")
+        return
+    if not sha:
+        tasks.update(task_obj, "fail", "no sha to tag")
+        return
+    rc_t, _, err_t = git(repo_path, ["tag", tag_name, sha])
+    if rc_t != 0:
+        tasks.update(task_obj, "fail", first_line(err_t) or "git tag failed")
+        return
+    rc_p, _, err_p = git(repo_path, ["push", "origin", tag_name])
+    if rc_p != 0:
+        tasks.update(
+            task_obj, "fail",
+            f"push: {first_line(err_p) or 'failed'}")
+        return
+    tasks.update(task_obj, "ok")
+
+
 def _poll_run(state: State, slug: str, run_id: int,
               repo: Repo, workflow_name: str,
               run_task: Task,
@@ -241,20 +270,8 @@ def _poll_run(state: State, slug: str, run_id: int,
                     else:
                         tag_task = state.tasks.add(tag_label,
                                                    parent=run_task)
-                    if not tag_name or tag_name.startswith("-"):
-                        state.tasks.update(
-                            tag_task, "fail",
-                            "tag name empty or unsafe")
-                    elif not sha:
-                        state.tasks.update(
-                            tag_task, "fail", "no sha to tag")
-                    else:
-                        rc_t, _, err_t = git(
-                            repo.path, ["tag", tag_name, sha])
-                        state.tasks.update(
-                            tag_task,
-                            "ok" if rc_t == 0 else "fail",
-                            "" if rc_t == 0 else first_line(err_t))
+                    _create_and_push_tag(
+                        state.tasks, tag_task, repo.path, tag_name, sha)
                 elif next_target:
                     branch = repo.branch or "main"
                     # Pop the per-workflow input buffer the same
@@ -1311,17 +1328,8 @@ def _commit_worker_inner(state: State, repo: Repo, msg: str,
         tag_name = after_push_params.get("tag", "").strip()
         tag_label = state.task_repo_label(repo)
         t_tag = tasks.add(f"{tag_label}: tag {tag_name or '(empty)'}")
-        if not tag_name or tag_name.startswith("-"):
-            tasks.update(t_tag, "fail", "tag name empty or unsafe")
-        elif not pushed_sha:
-            tasks.update(t_tag, "fail", "no pushed sha")
-        else:
-            rc_tag, _, err_tag = git(repo.path, [
-                "tag", tag_name, pushed_sha,
-            ])
-            tasks.update(
-                t_tag, "ok" if rc_tag == 0 else "fail",
-                "" if rc_tag == 0 else first_line(err_tag))
+        _create_and_push_tag(
+            tasks, t_tag, repo.path, tag_name, pushed_sha)
     elif after_push_target:
         # `after_push_params` carries the buffered values for
         # `workflow_dispatch.inputs` — non-empty entries get
@@ -1481,17 +1489,8 @@ def _commit_worker_for_child_inner(state: State, parent: Repo,
         tag_label = (f"{state.task_repo_label(ref.repo)} "
                      f"(in {state.task_repo_label(parent)})")
         t_tag = tasks.add(f"{tag_label}: tag {tag_name or '(empty)'}")
-        if not tag_name or tag_name.startswith("-"):
-            tasks.update(t_tag, "fail", "tag name empty or unsafe")
-        elif not pushed_sha:
-            tasks.update(t_tag, "fail", "no pushed sha")
-        else:
-            rc_tag, _, err_tag = git(ref.nested_path, [
-                "tag", tag_name, pushed_sha,
-            ])
-            tasks.update(
-                t_tag, "ok" if rc_tag == 0 else "fail",
-                "" if rc_tag == 0 else first_line(err_tag))
+        _create_and_push_tag(
+            tasks, t_tag, ref.nested_path, tag_name, pushed_sha)
     elif after_push_target:
         # `after_push_params` was popped above and holds buffered
         # `workflow_dispatch.inputs` values; forward as -F flags so

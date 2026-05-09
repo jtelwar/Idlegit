@@ -876,7 +876,8 @@ def gh(args: List[str],
 def _parse_on_block(text: str) -> dict:
     """Best-effort parse of a workflow file's `on:` block. Returns a dict
     with: 'push' (bool), 'workflow_dispatch' (bool), 'push_branches'
-    (List[str]), 'push_branches_ignore' (List[str]).
+    (List[str]), 'push_branches_ignore' (List[str]), 'push_tags'
+    (List[str]), 'push_tags_ignore' (List[str]).
 
     Handles the three common YAML forms:
         on: push                                # scalar
@@ -886,17 +887,21 @@ def _parse_on_block(text: str) -> dict:
             branches: [a, b]
         on:                                     # mapping w/ block list
           push:
-            branches:
-            - master
-            - develop
-    Anything more exotic (anchors, multi-document files, deeply mixed
-    flow/block) falls through to "trigger detected" without branch info,
-    which keeps the predicate permissive rather than wrongly excluding."""
+            tags:
+            - 'v*.*.*'
+    Tag filters matter because `on: push: tags: [...]` with no
+    `branches:` means the workflow only fires on tag push — branch
+    pushes don't trigger it. Anything more exotic (anchors,
+    multi-document files, deeply mixed flow/block) falls through to
+    "trigger detected" without branch / tag info, which keeps the
+    predicate permissive rather than wrongly excluding."""
     result: dict = {
         "push": False,
         "workflow_dispatch": False,
         "push_branches": [],
         "push_branches_ignore": [],
+        "push_tags": [],
+        "push_tags_ignore": [],
     }
     lines = text.splitlines()
 
@@ -967,7 +972,10 @@ def _parse_on_block(text: str) -> dict:
             continue
 
         result["push"] = True
-        # Walk push:'s sub-block for `branches:` / `branches-ignore:`.
+        # Walk push:'s sub-block for `branches:` / `branches-ignore:`
+        # / `tags:` / `tags-ignore:`. Tags share the same shape as
+        # branches — same inline-flow / inline-single / block-list
+        # parsing applies, just into a different result bucket.
         sub = i + 1
         while sub < len(children) and children[sub][0] > indent:
             sub_indent, sub_line = children[sub]
@@ -983,6 +991,10 @@ def _parse_on_block(text: str) -> dict:
                 target_field = "push_branches"
             elif sub_key == "branches-ignore":
                 target_field = "push_branches_ignore"
+            elif sub_key == "tags":
+                target_field = "push_tags"
+            elif sub_key == "tags-ignore":
+                target_field = "push_tags_ignore"
             if target_field is None:
                 sub += 1
                 continue
@@ -1211,6 +1223,8 @@ def discover_workflows_local(repo_path: Path) -> List[WorkflowInfo]:
             triggers_push=on_info["push"],
             push_branches=on_info["push_branches"],
             push_branches_ignore=on_info["push_branches_ignore"],
+            push_tags=on_info["push_tags"],
+            push_tags_ignore=on_info["push_tags_ignore"],
             inputs=wf_inputs,
         ))
     return found
@@ -1221,6 +1235,9 @@ def would_run_on_push(wf: WorkflowInfo, branch: str) -> bool:
       - whether the workflow declares `on: push` at all
       - GitHub workflow state (`disabled_*` short-circuits to False)
       - branches / branches-ignore glob patterns
+      - tag-only filtering (`on: push: tags: […]` with no
+        `branches:` only fires on tag pushes — branch pushes don't
+        trigger it)
     `branch` matching uses fnmatch so the standard `feature/*` style
     patterns work. State is treated permissively when unknown (empty
     string = "we haven't queried gh yet"); only an explicit
@@ -1228,6 +1245,12 @@ def would_run_on_push(wf: WorkflowInfo, branch: str) -> bool:
     if not wf.triggers_push:
         return False
     if wf.state.startswith("disabled"):
+        return False
+    # Tag-only push filter: `tags:` is set but `branches:` isn't.
+    # GitHub's semantics here are that a branch push never triggers
+    # the workflow, regardless of branch name — so the predicate
+    # short-circuits to False for the branch-push prediction.
+    if (wf.push_tags or wf.push_tags_ignore) and not wf.push_branches:
         return False
     if wf.push_branches:
         if not any(fnmatch.fnmatchcase(branch, p) for p in wf.push_branches):

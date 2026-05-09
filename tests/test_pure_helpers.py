@@ -536,6 +536,47 @@ class TestParseOnBlock(unittest.TestCase):
         self.assertTrue(out["push"])
         self.assertEqual(out["push_branches"], ["master"])
 
+    def test_push_tags_block_list(self) -> None:
+        # `on: push: tags:` is the release-workflow shape — must be
+        # captured into push_tags so would_run_on_push can recognise
+        # it as tag-only and exclude branch pushes.
+        text = (
+            "on:\n"
+            "  push:\n"
+            "    tags:\n"
+            "    - 'v*.*.*'\n"
+        )
+        out = _parse_on_block(text)
+        self.assertTrue(out["push"])
+        self.assertEqual(out["push_tags"], ["v*.*.*"])
+        self.assertEqual(out["push_branches"], [])
+
+    def test_push_tags_inline(self) -> None:
+        text = "on:\n  push:\n    tags: [v1.*, v2.*]\n"
+        out = _parse_on_block(text)
+        self.assertEqual(out["push_tags"], ["v1.*", "v2.*"])
+
+    def test_push_tags_ignore(self) -> None:
+        text = (
+            "on:\n"
+            "  push:\n"
+            "    tags-ignore:\n"
+            "    - 'rc-*'\n"
+        )
+        out = _parse_on_block(text)
+        self.assertEqual(out["push_tags_ignore"], ["rc-*"])
+
+    def test_branches_and_tags_together(self) -> None:
+        text = (
+            "on:\n"
+            "  push:\n"
+            "    branches: [master]\n"
+            "    tags: [v*]\n"
+        )
+        out = _parse_on_block(text)
+        self.assertEqual(out["push_branches"], ["master"])
+        self.assertEqual(out["push_tags"], ["v*"])
+
 
 class TestWouldRunOnPush(unittest.TestCase):
     def _wf(self, **kwargs) -> WorkflowInfo:
@@ -583,6 +624,27 @@ class TestWouldRunOnPush(unittest.TestCase):
         # don't false-negative on workflows we haven't queried yet.
         wf = self._wf(state="")
         self.assertTrue(would_run_on_push(wf, "master"))
+
+    def test_tag_only_filter_excludes_branch_push(self) -> None:
+        # `on: push: tags: […]` with no `branches:` means the workflow
+        # only fires on tag pushes — a regular branch push must not
+        # show this workflow as runnable. This is the bug that
+        # caused release.yml to falsely appear as a track-toggle on
+        # the review screen.
+        wf = self._wf(push_tags=["v*.*.*"])
+        self.assertFalse(would_run_on_push(wf, "master"))
+        self.assertFalse(would_run_on_push(wf, "develop"))
+
+    def test_tag_ignore_only_excludes_branch_push(self) -> None:
+        wf = self._wf(push_tags_ignore=["rc-*"])
+        self.assertFalse(would_run_on_push(wf, "master"))
+
+    def test_branches_and_tags_together_runs_on_branch_match(self) -> None:
+        # When both filters are declared, the branch push half is
+        # honoured normally; tags don't blanket-exclude.
+        wf = self._wf(push_branches=["master"], push_tags=["v*"])
+        self.assertTrue(would_run_on_push(wf, "master"))
+        self.assertFalse(would_run_on_push(wf, "develop"))
 
 
 if __name__ == "__main__":

@@ -38,9 +38,14 @@ class WorkflowInfo:
     Repo so the review screen and the action menu can list them without
     re-hitting the API on every redraw.
 
-    `triggers_push` / `push_branches` / `push_branches_ignore` are derived
-    from the YAML's `on:` block so we can predict whether the workflow
-    will fire on a push to the repo's current branch.
+    `triggers_push` / `push_branches` / `push_branches_ignore` /
+    `push_tags` / `push_tags_ignore` are derived from the YAML's `on:`
+    block so we can predict whether the workflow will fire on a push
+    to the repo's current branch. `tags`-only filtering matters
+    because `on: push: tags: [...]` (with no `branches:`) means the
+    workflow fires *only* on tag push, not on branch push — review-
+    screen tracking and after-push then-run wiring needs to skip
+    those workflows when the user is pushing a regular commit.
 
     `inputs` holds the `workflow_dispatch.inputs` entries parsed from
     the same YAML; when the user picks this workflow as a then-run
@@ -57,6 +62,8 @@ class WorkflowInfo:
     triggers_push: bool = False  # has `on: push` in any form
     push_branches: List[str] = field(default_factory=list)
     push_branches_ignore: List[str] = field(default_factory=list)
+    push_tags: List[str] = field(default_factory=list)
+    push_tags_ignore: List[str] = field(default_factory=list)
     inputs: List[WorkflowInput] = field(default_factory=list)
 
 
