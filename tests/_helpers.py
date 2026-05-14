@@ -34,8 +34,8 @@ def _run(cwd: Path, *args: str, check: bool = True) -> subprocess.CompletedProce
     env.setdefault("GIT_AUTHOR_EMAIL", "test@idlegit.local")
     env.setdefault("GIT_COMMITTER_NAME", "idlegit-test")
     env.setdefault("GIT_COMMITTER_EMAIL", "test@idlegit.local")
-    env.setdefault("GIT_CONFIG_GLOBAL", "/dev/null")
-    env.setdefault("GIT_CONFIG_SYSTEM", "/dev/null")
+    env.setdefault("GIT_CONFIG_GLOBAL", os.devnull)
+    env.setdefault("GIT_CONFIG_SYSTEM", os.devnull)
     cmd = list(args)
     if cmd and cmd[0] == "git":
         cmd = ["git", "-c", "protocol.file.allow=always", *cmd[1:]]

@@ -10,28 +10,71 @@ from typing import Tuple
 
 from core.config import DEFAULT_TRUNCATION_MODE
 
+try:
+    from wcwidth import wcswidth as _wcswidth, wcwidth as _wcwidth
+except ImportError:
+    _wcswidth = None
+    _wcwidth = None
+
 
 SIDEBAR_W = 50          # task panel keeps a constant width across resizes
 SIDEBAR_W_NARROW = 30   # smaller terminals get a shrunk panel
 
 
+def _display_width(s: str) -> int:
+    """Display columns occupied by `s` on a fixed-width terminal. Uses
+    wcwidth when available so CJK / wide chars count as 2 cells; falls
+    back to len() — accurate for ASCII, off for wide-char strings."""
+    if _wcswidth is None:
+        return len(s)
+    w = _wcswidth(s)
+    return w if w >= 0 else len(s)
+
+
+def _slice_to_width(s: str, max_w: int, from_end: bool = False) -> str:
+    """Slice `s` so it fits in `max_w` display cells. With from_end=True,
+    take cells from the right of `s`. Negative/zero-width control chars
+    are counted as 1 cell so the result never widens past `max_w`."""
+    if max_w <= 0:
+        return ""
+    if _wcwidth is None:
+        return s[-max_w:] if from_end else s[:max_w]
+    chars = reversed(s) if from_end else iter(s)
+    out: list[str] = []
+    total = 0
+    for ch in chars:
+        cw = _wcwidth(ch)
+        if cw < 0:
+            cw = 1
+        if total + cw > max_w:
+            break
+        out.append(ch)
+        total += cw
+    if from_end:
+        out.reverse()
+    return "".join(out)
+
+
 def truncate(text: str, max_len: int,
              mode: str = DEFAULT_TRUNCATION_MODE) -> str:
-    """Cap text at max_len (incl. ellipsis). `mode` is one of "start",
-    "middle", or "end". Unknown modes fall back to "middle". max_len <= 0
-    disables truncation entirely."""
-    if max_len <= 0 or len(text) <= max_len:
+    """Cap text at max_len display cells (incl. ellipsis). `mode` is one
+    of "start", "middle", or "end". Unknown modes fall back to "middle".
+    max_len <= 0 disables truncation entirely. Width is measured in
+    display cells so CJK / wide chars don't blow past the budget."""
+    if max_len <= 0 or _display_width(text) <= max_len:
         return text
     if max_len == 1:
         return "…"
     keep = max_len - 1
     if mode == "start":
-        return "…" + text[-keep:]
+        return "…" + _slice_to_width(text, keep, from_end=True)
     if mode == "end":
-        return text[:keep] + "…"
+        return _slice_to_width(text, keep) + "…"
     head = (keep + 1) // 2
     tail = keep - head
-    return text[:head] + "…" + text[-tail:]
+    return (_slice_to_width(text, head)
+            + "…"
+            + _slice_to_width(text, tail, from_end=True))
 
 
 def field_visible(message: str, cursor: int, inner_w: int,
@@ -54,14 +97,15 @@ def end_truncate(text: str, max_w: int) -> str:
     ellipsis. Differs from `truncate(..., mode="end")` only in how it
     behaves at degenerate widths — `max_w <= 0` returns ``""`` instead
     of pass-through, which is what callers laying out modal content
-    actually want when their available width has shrunk to zero."""
+    actually want when their available width has shrunk to zero. Width
+    is measured in display cells."""
     if max_w <= 0:
         return ""
-    if len(text) <= max_w:
+    if _display_width(text) <= max_w:
         return text
     if max_w == 1:
         return "…"
-    return text[: max_w - 1] + "…"
+    return _slice_to_width(text, max_w - 1) + "…"
 
 
 def wrap_label_value(label: str, value: str, max_w: int) -> "list[str]":
@@ -94,24 +138,25 @@ def wrap_label_value(label: str, value: str, max_w: int) -> "list[str]":
         return []
     label_part = f"{label}:" if label else ""
     one_liner = f"{label_part} {value}".strip()
-    if len(one_liner) <= max_w:
+    if _display_width(one_liner) <= max_w:
         return [one_liner]
     if not label_part:
         # No label: there's no two-line form, so just end-truncate the
         # value and return.
         return [end_truncate(value, max_w)]
     indent = "  "
-    value_room = max_w - len(indent)
+    value_room = max_w - _display_width(indent)
     return [label_part, indent + end_truncate(value, value_room)]
 
 
 def safe_addstr(stdscr, y: int, x: int, text: str, attr: int = 0) -> None:
     """addstr that swallows errors when writing to the bottom-right corner
-    or off-screen after a resize."""
+    or off-screen after a resize. Clips by display cells so wide-char
+    content doesn't trip curses' "writing past right edge" error."""
     h, w = stdscr.getmaxyx()
     if y < 0 or y >= h or x >= w:
         return
-    text = text[: max(0, w - x)]
+    text = _slice_to_width(text, max(0, w - x))
     try:
         stdscr.addstr(y, x, text, attr)
     except curses.error:

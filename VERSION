@@ -1,1 +1,55 @@
-0.11.2
+0.12.0
+
+### 0.12.0
+- 2026-05-14: cross-platform phase 3 — wcwidth-aware `_display_width`/`_slice_to_width` helpers in `ui/geometry.py` so `truncate`/`end_truncate`/`safe_addstr`/`wrap_label_value` measure CJK + wide chars in display cells (fallback to `len()` if wcwidth unavailable); new `ui/glyphs.py` centralises spinner with locale-aware ASCII fallback (`IDLEGIT_ASCII_GLYPHS=1` env override); added `pyproject.toml` for `pipx install ".[windows]"` install path; README gains Windows install section
+
+### 0.11.4
+- 2026-05-14: cross-platform phase 2 — `_open_in_browser` routes via stdlib `webbrowser` (adds Windows support, drops subprocess shell-out); tests use `os.devnull` not `/dev/null` literal; `scripts/install.py` splits PATH on `os.pathsep` and gates Homebrew bindir hints + shell-rc edits behind non-win32
+
+### 0.11.3
+- 2026-05-14: cross-platform phase 1 — move `import termios` inline behind `sys.platform != "win32"` guard so idlegit.py is importable on Windows
+
+### 0.11.2
+- 2026-05-14: workers refactor, expanded git integration tests, main_screen polish
+
+### 0.10.7
+- 2026-05-09: install script rewritten in Python; README updated, install.sh removed
+
+### 0.10.6
+- 2026-05-09: workers and git_ops refinements; added pure_helpers tests
+
+### 0.10.4
+- 2026-05-09: scripts extracted; menus split out
+
+### 0.9.0
+- 2026-05-09: restructured into core/ package;
+
+### 0.8.7
+- 2026-05-08: added commit_view, install.py, update.py; review.py and git_ops hardened; removed legacy idlegit.workspaces
+
+### 0.8.0
+- 2026-05-08: added review screen, main_screen, main_loop; action_menu and workers reworked
+
+### 0.7.0
+- 2026-05-05: audit review documented; config, git_ops and integration tests hardened
+
+### 0.6.0
+- 2026-05-03: added diff_viewer; models and config tweaks
+
+### 0.5.0
+- 2026-05-02: added branch_name_prompt and detached_recovery_prompt; align_heads_prompt updated
+
+### 0.4.0
+- 2026-05-02: added workspace_menu and workspace/hints test coverage; action_menu updated
+
+### 0.3.1
+- 2026-05-01: README rewrite; ui/__init__.py tweaks
+
+### 0.3.0
+- 2026-04-30: core scaffolding — workers.py, git_ops.py, models.py introduced
+
+### 0.2.0
+- 2026-04-28: major idlegit.py expansion (~1100 lines); README and conf updates
+
+### 0.1.0
+- 2026-04-28: initial commit

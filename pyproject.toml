@@ -1,0 +1,41 @@
+# Used by `pipx install .` and `pip install -e .` — primarily the
+# install path on Windows (where the bash launcher at the repo root
+# doesn't apply). Unix users keep using `./install` and `./idlegit`;
+# this file is additive and doesn't replace that flow.
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "idlegit"
+description = "TUI for managing git repo workspaces"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Joel Elwar" }]
+dependencies = [
+    "wcwidth>=0.2",
+]
+# Version is read from the project-root VERSION file (single source of
+# truth — see `core.config._read_version`). `dynamic.attr` imports
+# `core.config` at build time and reads the `VERSION` module attribute.
+dynamic = ["version"]
+
+[project.optional-dependencies]
+# `pipx install ".[windows]"` pulls windows-curses on Windows; the
+# marker makes it a no-op on macOS/Linux so the same extra is safe to
+# specify cross-platform.
+windows = ["windows-curses ; sys_platform == 'win32'"]
+
+[project.scripts]
+idlegit = "idlegit:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "core.config.VERSION" }
+
+[tool.setuptools]
+py-modules = ["idlegit"]
+
+[tool.setuptools.packages.find]
+include = ["core*", "ui*"]
+exclude = ["tests*", "scripts*", "agents*"]

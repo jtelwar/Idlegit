@@ -21,7 +21,6 @@ import contextlib
 import curses
 import os
 import sys
-import termios
 import time
 
 from core.config import (
@@ -118,9 +117,11 @@ def _disable_flow_control() -> None:
     reaches our getch loop. Clearing IXON/IXOFF on stdin makes both
     keys deliverable like any other control char. No-op if stdin
     isn't a real tty (CI, pipes, ...) or if termios is unavailable
-    (Windows; we're already curses so this should never fire there)."""
-    if not sys.stdin.isatty():
+    (Windows: XON/XOFF is a POSIX terminal-driver concept; there's
+    nothing to clear)."""
+    if sys.platform == "win32" or not sys.stdin.isatty():
         return
+    import termios
     try:
         attrs = termios.tcgetattr(sys.stdin)
         attrs[0] &= ~(termios.IXON | termios.IXOFF)

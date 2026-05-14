@@ -5,10 +5,9 @@ open the run in a browser, or remove a finished task from the panel."""
 from __future__ import annotations
 
 import curses
-import subprocess
-import sys
 import threading
 import time
+import webbrowser
 from typing import List, Optional
 from urllib.parse import urlparse
 
@@ -533,24 +532,22 @@ def _clear_then_run(state: State) -> None:
 
 
 def _open_in_browser(state: State, url: str) -> None:
-    """Spawn `open` (macOS) or `xdg-open` (linux) for `url`. Failures
-    surface as a warn task in the panel rather than crashing or
-    silently swallowing — the user expects feedback."""
-    cmd = "open" if sys.platform == "darwin" else "xdg-open"
-
+    """Hand `url` off to the platform's default browser via stdlib
+    `webbrowser` (uses `open` on macOS, `xdg-open`/`gio` on Linux,
+    `start` on Windows). Failures surface as a warn task in the
+    panel rather than crashing or silently swallowing — the user
+    expects feedback."""
     def worker() -> None:
         t = state.tasks.add(f"open {url}"[:60])
         try:
-            rc = subprocess.run(
-                [cmd, url], stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL, timeout=5).returncode
-        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+            opened = webbrowser.open(url, new=2)
+        except Exception as e:
             state.tasks.update(t, "warn", str(e))
             return
-        if rc == 0:
+        if opened:
             state.tasks.update(t, "ok", "opened")
         else:
-            state.tasks.update(t, "warn", f"{cmd} returned {rc}")
+            state.tasks.update(t, "warn", "no browser available")
 
     threading.Thread(target=worker, daemon=True).start()
 

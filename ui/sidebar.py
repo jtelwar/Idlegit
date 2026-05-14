@@ -18,10 +18,8 @@ from .colors import (
     PAIR_SB_WARN, PAIR_SB_WARN_ACTIVE,
 )
 from .geometry import safe_addstr
+from .glyphs import SPINNER_FRAMES
 from .hints import KEY_CTRL_R, KEY_SHIFT_TAB, Hint, render_hints
-
-
-SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
 
 def _empty_panel_hints(focused: bool) -> list:

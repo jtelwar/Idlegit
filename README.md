@@ -14,6 +14,8 @@ And because the name lazygit was already taken, but it's just not lazy enough fo
 
 ## Install
 
+### macOS / Linux
+
 Clone the repo and run `./install` from the root:
 
 ```sh
@@ -28,6 +30,26 @@ symlinks the launcher onto your `$PATH` so you can invoke it as
 for in-place upgrades. If your bindir isn't already on `$PATH` it
 asks before editing your shell profile; pass `-y` to accept the
 prompts non-interactively.
+
+### Windows
+
+Install with [pipx](https://pipx.pypa.io/) into Windows Terminal
+(the legacy `conhost.exe` works but isn't recommended):
+
+```powershell
+git clone https://github.com/jtelwar/idlegit.git
+cd idlegit
+pipx install ".[windows]"
+```
+
+The `[windows]` extra pulls in `windows-curses`, which Python on
+Windows needs to render the curses UI. The bash `./install` script
+and the `idlegit-update` updater are Unix-only; on Windows, update
+with `git pull && pipx reinstall .`.
+
+If a non-UTF-8 locale (e.g. `LANG=C`) makes the Braille spinner
+render as tofu, set `IDLEGIT_ASCII_GLYPHS=1` to force the ASCII
+fallback.
 
 Defaults can be overridden with environment variables:
 
@@ -106,10 +128,14 @@ Defaults are sensible — you can run with no config at all.
 
 ## Requirements
 
-- Python 3.9+ (stdlib only: `configparser`, `curses`, `concurrent.futures`)
+- Python 3.9+
+- [`wcwidth`](https://pypi.org/project/wcwidth/) — the one runtime
+  dependency; falls back to `len()`-based width if missing, with mild
+  layout drift on CJK / wide-char repo names
 - `git` on `$PATH`
 - `git-lfs` on `$PATH` if you want to use the LFS toggle on the review screen
 - `gh` on `$PATH` if you want github action running/tracking
+- On Windows: `windows-curses` (the `[windows]` extra installs it)
 
 
 ## License

@@ -141,17 +141,25 @@ def _default_home() -> str:
 
 def _default_bindir() -> str:
     """Prefer a Homebrew bindir on macOS so the launcher lands on
-    PATH without dotfile munging; fall back to ~/.local/bin."""
-    for candidate in ("/opt/homebrew/bin", "/usr/local/bin"):
-        if os.path.isdir(candidate) and os.access(candidate, os.W_OK):
-            return candidate
+    PATH without dotfile munging; fall back to ~/.local/bin. On
+    Windows there is no equivalent system-wide bindir convention,
+    so go straight to ~/.local/bin (users on Windows should prefer
+    `pipx install` — see README)."""
+    if sys.platform != "win32":
+        for candidate in ("/opt/homebrew/bin", "/usr/local/bin"):
+            if os.path.isdir(candidate) and os.access(candidate, os.W_OK):
+                return candidate
     return os.path.join(os.path.expanduser("~"), ".local", "bin")
 
 
 def _shell_rcfile() -> "tuple[Path | None, str]":
     """Return `(rcfile, hint)` for the current login shell. `hint`
     is set when we can't auto-edit (fish has its own command;
-    unknown shells fall back to a printed export line)."""
+    unknown shells fall back to a printed export line). Windows
+    has no Unix-style rc file to edit — we point the user at the
+    pipx install flow instead."""
+    if sys.platform == "win32":
+        return None, "Windows detected — prefer `pipx install .` (see README)"
     shell = os.environ.get("SHELL", "")
     home = Path(os.path.expanduser("~"))
     if shell.endswith("zsh"):
@@ -334,7 +342,7 @@ def merge_config(summary: list) -> None:
 
 def update_path(bindir: Path, assume_yes: bool, summary: list) -> None:
     section("PATH check")
-    path_dirs = (os.environ.get("PATH") or "").split(":")
+    path_dirs = (os.environ.get("PATH") or "").split(os.pathsep)
     if str(bindir) in path_dirs:
         ok(f"PATH already includes {bindir}")
         summary.append(f"PATH already includes {bindir}")
