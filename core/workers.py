@@ -11,8 +11,7 @@ from typing import Iterable, List, Optional, Tuple
 
 from .models import (
     AlignHeadsPrompt, ChildRef, DetachedRecoveryPrompt, LFSCandidate,
-    Repo, ReviewBlock, SmartSyncCheckout, State,
-    Task,
+    Repo, ReviewBlock, SmartSyncCheckout, State, Task, Tasks,
 )
 from .git_ops import (
     apply_lfs_tracking, discover_repos, dispatch_workflow, first_line,
@@ -29,6 +28,42 @@ PROMPT_WAIT_SECONDS = 15 * 60
 MIN_ACTION_REFRESH_SECONDS = 0.35
 _detached_recovery_prompt_lock = threading.Lock()
 _align_heads_prompt_lock = threading.Lock()
+
+
+def _pull_prefer_ff_then_merge(
+        path: Path, tasks: Tasks, name: str, *,
+        allow_merge_fallback: bool) -> bool:
+    """`git pull --ff-only`, then optionally `git pull --no-rebase --no-edit`
+    when the caller allows merge commits. No rebase / no force. Returns
+    False on failure (a task row records the error). On success: when HEAD
+    moved, adds an ok task; when already up to date, no task (matches the
+    commit pipeline's historical no-noise behaviour)."""
+    _, head_before, _ = git(path, ["rev-parse", "HEAD"])
+    rc, _, err = git(path, ["pull", "--ff-only"])
+    _, head_after, _ = git(path, ["rev-parse", "HEAD"])
+    if rc == 0:
+        if head_before.strip() != head_after.strip():
+            t = tasks.add(f"{name}: pull")
+            tasks.update(t, "ok")
+        return True
+    if not allow_merge_fallback:
+        t = tasks.add(f"{name}: pull --ff-only")
+        tasks.update(t, "fail",
+                     first_line(err) or "cannot fast-forward")
+        return False
+    rc2, _, err2 = git(path, ["pull", "--no-rebase", "--no-edit"])
+    _, head_after2, _ = git(path, ["rev-parse", "HEAD"])
+    if rc2 != 0:
+        t = tasks.add(f"{name}: pull")
+        tasks.update(t, "fail",
+                     first_line(err2) or first_line(err) or "pull failed")
+        return False
+    t = tasks.add(f"{name}: pull")
+    detail = ""
+    if head_before.strip() != head_after2.strip():
+        detail = "merged upstream"
+    tasks.update(t, "ok", detail)
+    return True
 
 
 def refresh_repo_with_remote_state(repo: Repo) -> None:
@@ -564,11 +599,11 @@ def kick_off_action(state: State, action_id: str, *,
                 t, "ok" if rc == 0 else "fail",
                 "" if rc == 0 else first_line(err))
         elif action_id == "pull":
-            t = state.tasks.add(f"{target_label}: pull --ff-only")
-            rc, _, err = git(target_path, ["pull", "--ff-only"])
-            state.tasks.update(
-                t, "ok" if rc == 0 else "fail",
-                "" if rc == 0 else first_line(err))
+            ok = _pull_prefer_ff_then_merge(
+                target_path, state.tasks, target_label,
+                allow_merge_fallback=True)
+            if not ok:
+                return
         elif action_id == "push":
             t = state.tasks.add(f"{target_label}: push")
             rc_b, b_out, _ = git(target_path, ["branch", "--show-current"])
@@ -580,21 +615,15 @@ def kick_off_action(state: State, action_id: str, *,
                 "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
             has_upstream = rc_u == 0 and bool(u_out.strip())
             if has_upstream:
-                _, head_before, _ = git(target_path, ["rev-parse", "HEAD"])
-                rc_pull, _, pull_err = git(target_path, ["pull", "--ff-only"])
-                _, head_after, _ = git(target_path, ["rev-parse", "HEAD"])
-                if rc_pull != 0:
-                    t_pull = state.tasks.add(f"{target_label}: pull --ff-only")
-                    state.tasks.update(t_pull, "fail",
-                                       first_line(pull_err) or "cannot fast-forward")
-                    state.tasks.update(t, "fail", "skipped: cannot fast-forward")
-                else:
-                    if head_before.strip() != head_after.strip():
-                        t_pull = state.tasks.add(f"{target_label}: pull --ff-only")
-                        state.tasks.update(t_pull, "ok")
-                    rc, _, err = git(target_path, ["push"])
-                    state.tasks.update(t, "ok" if rc == 0 else "fail",
-                                       "" if rc == 0 else first_line(err))
+                ok_pull = _pull_prefer_ff_then_merge(
+                    target_path, state.tasks, target_label,
+                    allow_merge_fallback=True)
+                if not ok_pull:
+                    state.tasks.update(t, "fail", "skipped: cannot pull")
+                    return
+                rc, _, err = git(target_path, ["push"])
+                state.tasks.update(t, "ok" if rc == 0 else "fail",
+                                   "" if rc == 0 else first_line(err))
             elif cur_branch:
                 rc, _, err = git(target_path, [
                     "push", "--set-upstream", "origin", cur_branch])
@@ -1219,22 +1248,15 @@ def _commit_worker_inner(state: State, repo: Repo, msg: str,
         t = tasks.add(f"{name}: recovered detached HEAD")
         tasks.update(t, "ok", "branch fast-forwarded to HEAD")
 
-    # Fast-forward before staging — once we have a local commit we'll be
-    # diverged and --ff-only will refuse. Pull also fetches, so we catch
-    # commits that arrived after the last refresh. Only surface a task
-    # when HEAD actually moved or the pull itself fails.
+    # Integrate upstream before staging — once we have a local commit a
+    # strict FF may refuse; try merge pull when needed (never rebase).
+    # Only surface a task when HEAD actually moved or the pull itself
+    # fails.
     if repo.upstream:
-        _, head_before, _ = git(repo.path, ["rev-parse", "HEAD"])
-        rc_pull, _, pull_err = git(repo.path, ["pull", "--ff-only"])
-        _, head_after, _ = git(repo.path, ["rev-parse", "HEAD"])
-        if rc_pull != 0:
-            t_pull = tasks.add(f"{name}: pull --ff-only")
-            tasks.update(t_pull, "fail",
-                         first_line(pull_err) or "cannot fast-forward")
+        ok_pull = _pull_prefer_ff_then_merge(
+            repo.path, tasks, name, allow_merge_fallback=True)
+        if not ok_pull:
             return
-        if head_before.strip() != head_after.strip():
-            t_pull = tasks.add(f"{name}: pull --ff-only")
-            tasks.update(t_pull, "ok")
 
     # Staging: per-file plan when the review screen handed us a
     # staged_paths dict (the new path); fall back to legacy auto_stage
@@ -1628,9 +1650,10 @@ def kick_off_workers(state: State, blocks: List[ReviewBlock]) -> None:
 # checkouts are also pulled into line: off means "skip them with a
 # warning", on means "pop a modal that asks the user which branch to
 # push the winner's changes to, then sync everyone to that branch".
-# In either mode the only git verbs used are fetch / merge --ff-only /
-# checkout — git itself refuses on conflict, so we never overwrite
-# uncommitted work or unique commits.
+# In either mode the only git verbs used are fetch / merge (--ff-only,
+# optionally a non-FF merge when aligning losers unless prevented by
+# config) / checkout — git itself refuses on conflict, so we never
+# overwrite uncommitted work or unique commits.
 
 
 def _checkout_label(state: State, canonical: Repo,
@@ -2277,11 +2300,17 @@ def _stash_switch_pop_winner(state: State, winner: SmartSyncCheckout,
 
 def _align_loser_ff(state: State, c: SmartSyncCheckout,
                     winner_branch: str, name: str) -> bool:
-    """Bring a same-branch loser up to the winner's commit via
-    `fetch + merge --ff-only`. Refuses (warn-skip) when the WT has
-    changes that would conflict with the new commit, OR when the
-    loser has local commits not in the winner. Both cases preserve
-    the loser's state — the user resolves manually."""
+    """Bring a same-branch loser up to the winner's published branch tip
+    via `fetch`, then `merge --ff-only origin/<branch>`. When FF refuses,
+    we try the redundant-dirty stash helper; when that does not apply or
+    fails, and `state.prevent_smart_sync_silent_merge` is False (default),
+    we run `merge --no-edit` so divergent histories get a merge commit.
+
+    With `prevent_smart_sync_silent_merge` True, behaviour matches the
+    historical FF-only alignment (warn-skip when FF is impossible).
+
+    Refuses (warn-skip) on merge conflicts; the loser's state is never
+    hard-reset or rebased."""
     t = state.tasks.add(f"  ↳ align {name}: ff {c.label}")
     if not is_safe_ref_arg(winner_branch):
         state.tasks.update(t, "fail", "unsafe branch name")
@@ -2306,6 +2335,14 @@ def _align_loser_ff(state: State, c: SmartSyncCheckout,
     if redundant is True:
         state.tasks.update(t, "ok", "merged identical dirty changes")
         return True
+    allow_merge = not state.prevent_smart_sync_silent_merge
+    if allow_merge:
+        rc_m, _, err_m = git(
+            c.path, ["merge", "--no-edit", f"origin/{winner_branch}"])
+        if rc_m == 0:
+            state.tasks.update(t, "ok", "merged origin")
+            return True
+        err = err_m
     state.tasks.update(t, "warn", first_line(err))
     return False
 
@@ -2411,8 +2448,9 @@ def _align_canonical(state: State, canonical: Repo) -> Tuple[int, int]:
       4. None ahead, none dirty, but HEADs differ → most-recent commit
          time wins; the others FF up to it.
 
-    All loser-alignment ops use `merge --ff-only` (same-branch) or
-    `checkout origin/<branch>` (detached) — git itself refuses on
+    All loser-alignment ops use `merge --ff-only` first for same-branch
+    checkouts (then `merge --no-edit` when allowed by workspace config),
+    or `checkout origin/<branch>` (detached) - git itself refuses on
     conflict, so we never overwrite uncommitted work."""
     name = state.task_repo_label(canonical)
 
@@ -2571,6 +2609,19 @@ def _align_canonical(state: State, canonical: Repo) -> Tuple[int, int]:
     return ok, fail
 
 
+def _smart_sync_set_canonical_tree_refreshing(canonical: Repo, value: bool
+                                             ) -> None:
+    """Mark a canonical repo and every nested submodule ChildRef that
+    points at it as refreshing (or clear). Smart-sync aligns multiple
+    on-disk checkouts of the same URL; without flipping ChildRef flags,
+    only the top-level row shows the working spinner."""
+    canonical.refreshing = value
+    for parent, _nested_path in canonical.siblings:
+        for ref in parent.children:
+            if ref.kind == "submodule" and ref.repo is canonical:
+                ref.refreshing = value
+
+
 def kick_off_sync_siblings(state: State) -> None:
     """Entry point for Ctrl+S — align every canonical's submodule
     checkouts (and pull subtrees). Non-destructive throughout.
@@ -2595,67 +2646,71 @@ def kick_off_sync_siblings(state: State) -> None:
     work_count = len(canonicals_with_siblings) + len(subtree_items)
     header = state.tasks.add(f"smart-sync ({work_count})")
 
-    # Lock synchronously so the very next redraw shows spinners.
+    # Lock synchronously so the very next redraw shows spinners on every
+    # checkout involved (canonical row + nested submodule ChildRefs).
     for canonical in canonicals_with_siblings:
-        canonical.refreshing = True
+        _smart_sync_set_canonical_tree_refreshing(canonical, True)
     for _parent, ref in subtree_items:
         ref.refreshing = True
 
     def worker() -> None:
         ok_total = 0
         fail_total = 0
-
-        for canonical in canonicals_with_siblings:
-            try:
-                ok, fail = _align_canonical(state, canonical)
-            except Exception as e:
-                t = state.tasks.add(
-                    f"  ↳ align {state.task_repo_label(canonical)}")
-                state.tasks.update(t, "fail", first_line(str(e)))
-                ok, fail = 0, 1
-            finally:
-                refresh_repo(canonical)
-                canonical.refreshing = False
-            ok_total += ok
-            fail_total += fail
-
-        for parent, ref in subtree_items:
-            t = state.tasks.add(
-                f"  ⊕ {state.task_repo_label(ref.repo)} "
-                f"in {state.task_repo_label(parent)}")
-            try:
+        try:
+            for canonical in canonicals_with_siblings:
                 try:
-                    prefix = str(ref.nested_path.relative_to(parent.path))
-                except ValueError:
-                    prefix = ""
-                ok, msg = sync_subtree(
-                    parent.path, prefix,
-                    ref.repo.remote_url_raw or "", ref.repo.branch)
-                state.tasks.update(t, "ok" if ok else "fail", msg)
-                if ok:
-                    ok_total += 1
-                else:
-                    fail_total += 1
-            finally:
-                refresh_repo(parent)
+                    ok, fail = _align_canonical(state, canonical)
+                except Exception as e:
+                    t = state.tasks.add(
+                        f"  ↳ align {state.task_repo_label(canonical)}")
+                    state.tasks.update(t, "fail", first_line(str(e)))
+                    ok, fail = 0, 1
+                finally:
+                    refresh_repo(canonical)
+                ok_total += ok
+                fail_total += fail
+
+            for parent, ref in subtree_items:
+                t = state.tasks.add(
+                    f"  ⊕ {state.task_repo_label(ref.repo)} "
+                    f"in {state.task_repo_label(parent)}")
+                try:
+                    try:
+                        prefix = str(ref.nested_path.relative_to(parent.path))
+                    except ValueError:
+                        prefix = ""
+                    ok, msg = sync_subtree(
+                        parent.path, prefix,
+                        ref.repo.remote_url_raw or "", ref.repo.branch)
+                    state.tasks.update(t, "ok" if ok else "fail", msg)
+                    if ok:
+                        ok_total += 1
+                    else:
+                        fail_total += 1
+                finally:
+                    refresh_repo(parent)
+        finally:
+            for canonical in canonicals_with_siblings:
+                _smart_sync_set_canonical_tree_refreshing(canonical, False)
+            for _parent, ref in subtree_items:
                 ref.refreshing = False
 
-        total = ok_total + fail_total
-        if total == 0:
-            state.tasks.update(header, "ok", "all aligned")
-        elif fail_total == 0:
-            state.tasks.update(header, "ok", f"{ok_total} synced")
-        elif ok_total == 0:
-            state.tasks.update(header, "fail", f"{fail_total} failed")
-        else:
-            state.tasks.update(
-                header, "warn", f"{ok_total} ok / {fail_total} failed")
+            total = ok_total + fail_total
+            if total == 0:
+                state.tasks.update(header, "ok", "all aligned")
+            elif fail_total == 0:
+                state.tasks.update(header, "ok", f"{ok_total} synced")
+            elif ok_total == 0:
+                state.tasks.update(header, "fail", f"{fail_total} failed")
+            else:
+                state.tasks.update(
+                    header, "warn", f"{ok_total} ok / {fail_total} failed")
 
-        # Final full refresh + sibling-link rebuild to catch any repos
-        # not covered by the per-item refreshes above.
-        for r in state.repos:
-            refresh_repo(r)
-        link_siblings(state.repos, state.subtrees)
+            # Final full refresh + sibling-link rebuild to catch any repos
+            # not covered by the per-item refreshes above.
+            for r in state.repos:
+                refresh_repo(r)
+            link_siblings(state.repos, state.subtrees)
 
     threading.Thread(target=worker, daemon=True).start()
 

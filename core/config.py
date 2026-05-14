@@ -180,6 +180,9 @@ DEFAULT_MAX_COMMIT_MESSAGE_LENGTH_IN_REVIEW = 480
 DEFAULT_ALIGN_HEADS = True
 DEFAULT_AUTO_FF = True
 DEFAULT_PROMPT_FOR_BRANCH = True
+# When True, smart-sync refuses non-FF merges when aligning losers (strict
+# FF-only). Default False allows an automatic merge commit after FF fails.
+DEFAULT_PREVENT_SMART_SYNC_SILENT_MERGE = False
 
 
 def _warn_config(message: str) -> None:
@@ -235,6 +238,8 @@ class Config:
     default_align_heads: bool = DEFAULT_ALIGN_HEADS
     default_auto_ff: bool = DEFAULT_AUTO_FF
     default_prompt_for_branch: bool = DEFAULT_PROMPT_FOR_BRANCH
+    default_prevent_smart_sync_silent_merge: bool = (
+        DEFAULT_PREVENT_SMART_SYNC_SILENT_MERGE)
 
 
 def load_config() -> Config:
@@ -264,6 +269,8 @@ def load_config() -> Config:
     default_align_heads = DEFAULT_ALIGN_HEADS
     default_auto_ff = DEFAULT_AUTO_FF
     default_prompt_for_branch = DEFAULT_PROMPT_FOR_BRANCH
+    default_prevent_smart_sync_silent_merge = (
+        DEFAULT_PREVENT_SMART_SYNC_SILENT_MERGE)
 
     _CONFIG_WARNINGS.clear()
     _ensure_config_ready()
@@ -328,6 +335,9 @@ def load_config() -> Config:
             default_prompt_for_branch = cp.getboolean(
                 "idlegit", "default_prompt_for_branch",
                 fallback=DEFAULT_PROMPT_FOR_BRANCH)
+            default_prevent_smart_sync_silent_merge = cp.getboolean(
+                "idlegit", "default_prevent_smart_sync_silent_merge",
+                fallback=DEFAULT_PREVENT_SMART_SYNC_SILENT_MERGE)
         except (configparser.Error, OSError, ValueError) as e:
             _warn_config(f"{CONFIG_FILE.name}: using defaults ({e})")
 
@@ -365,6 +375,8 @@ def load_config() -> Config:
         default_align_heads=default_align_heads,
         default_auto_ff=default_auto_ff,
         default_prompt_for_branch=default_prompt_for_branch,
+        default_prevent_smart_sync_silent_merge=(
+            default_prevent_smart_sync_silent_merge),
     )
 
 
@@ -384,6 +396,7 @@ WORKSPACE_OVERRIDE_TYPES: "dict[str, str]" = {
     "default_align_heads": "bool",
     "default_auto_ff": "bool",
     "default_prompt_for_branch": "bool",
+    "default_prevent_smart_sync_silent_merge": "bool",
     "suggest_added": "int",
     "suggest_updated": "int",
     "suggest_deleted": "int",
@@ -414,6 +427,8 @@ WORKSPACE_OVERRIDE_TARGETS: "dict[str, str]" = {
     "default_align_heads": "align_heads",
     "default_auto_ff": "auto_ff",
     "default_prompt_for_branch": "prompt_for_branch",
+    "default_prevent_smart_sync_silent_merge": (
+        "prevent_smart_sync_silent_merge"),
     "suggest_added": "suggest_added",
     "suggest_updated": "suggest_updated",
     "suggest_deleted": "suggest_deleted",
@@ -727,6 +742,8 @@ def apply_workspace_overrides(state, cfg: Config, ws: Workspace) -> None:
     state.align_heads = cfg.default_align_heads
     state.auto_ff = cfg.default_auto_ff
     state.prompt_for_branch = cfg.default_prompt_for_branch
+    state.prevent_smart_sync_silent_merge = (
+        cfg.default_prevent_smart_sync_silent_merge)
     state.subtrees = list(ws.subtrees)
     # Now overlay the workspace's overrides.
     for key, value in ws.overrides.items():

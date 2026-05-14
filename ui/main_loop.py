@@ -496,6 +496,13 @@ def handle_confirm(stdscr, state: State) -> None:
                 return
             if key in (10, 13, curses.KEY_ENTER):
                 if panel_focus == "left":
+                    # Don't fire commits until every block has finished
+                    # loading its files — without files we'd race the
+                    # staging step and bail with "nothing staged". The
+                    # left-pane Enter hint is hidden in the same
+                    # condition so this is just defence in depth.
+                    if any(b.files_loading for b in blocks):
+                        continue
                     kick_off_workers(state, blocks)
                     return  # async pipeline takes over the sidebar
                 # Right pane: Enter fires the focused toolbar button

@@ -1310,9 +1310,14 @@ class State:
     # pushes). prompt_for_branch: open a modal asking which branch the
     # detached winner should push to (when False, we resolve
     # origin/HEAD and use that branch unattended).
+    # prevent_smart_sync_silent_merge: when True, same-branch loser
+    # alignment uses `merge --ff-only` only (no automatic merge commits).
+    # When False (default), after FF fails we run `merge --no-edit` when
+    # histories diverged.
     align_heads: bool = True
     auto_ff: bool = True
     prompt_for_branch: bool = True
+    prevent_smart_sync_silent_merge: bool = False
     tasks: Tasks = field(default_factory=Tasks)
     spinner_frame: int = 0
     field_cursor: int = 0

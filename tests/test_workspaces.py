@@ -63,6 +63,12 @@ class TestOverrideCoercion(unittest.TestCase):
     def test_bool_garbage_returns_none(self) -> None:
         self.assertIsNone(coerce_override_value("default_auto_stage", "maybe"))
 
+    def test_prevent_merge_key_coerces(self) -> None:
+        self.assertTrue(coerce_override_value(
+            "default_prevent_smart_sync_silent_merge", "true"))
+        self.assertFalse(coerce_override_value(
+            "default_prevent_smart_sync_silent_merge", "false"))
+
     def test_int_round_trips(self) -> None:
         self.assertEqual(coerce_override_value("suggest_added", "5"), 5)
         self.assertIsNone(coerce_override_value("suggest_added", "five"))
@@ -140,6 +146,15 @@ class TestApplyWorkspaceOverrides(unittest.TestCase):
         s = _state(_make_repo("a"))
         apply_workspace_overrides(s, cfg, ws)
         self.assertEqual(s.lfs_warn_bytes, 50 * 1024 * 1024)
+
+    def test_prevent_smart_sync_merge_override(self) -> None:
+        cfg = Config()
+        ws = Workspace(
+            name="W", folders=[Path("/tmp")],
+            overrides={"default_prevent_smart_sync_silent_merge": True})
+        s = _state(_make_repo("a"))
+        apply_workspace_overrides(s, cfg, ws)
+        self.assertTrue(s.prevent_smart_sync_silent_merge)
 
 
 class TestBaseValueLookup(unittest.TestCase):

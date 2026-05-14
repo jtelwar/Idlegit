@@ -732,6 +732,66 @@ class TestRedundantDirtyFF(_TempWorkspace):
         self.assertNotEqual(loser_head, upstream_head)
 
 
+class TestAlignLoserMergeFallback(_TempWorkspace):
+    """`_align_loser_ff` tries FF first; when histories diverge it may run
+    `merge --no-edit` unless `prevent_smart_sync_silent_merge` is on."""
+
+    def _divergent_loser_setup(self):
+        upstream = self.tmp / "up.git"
+        upstream.mkdir()
+        _run(upstream, "git", "init", "--bare", "-q", "-b", "main")
+        winner = self.tmp / "winner"
+        _run(self.tmp, "git", "clone", "-q", str(upstream), "winner")
+        write_file(winner, "README.md", "# r\n")
+        stage_and_commit(winner, "init")
+        _run(winner, "git", "push", "-q", "-u", "origin", "main")
+        loser = self.tmp / "loser"
+        _run(self.tmp, "git", "clone", "-q", str(upstream), "loser")
+        write_file(winner, "remote_side.txt", "w\n")
+        stage_and_commit(winner, "winner commit")
+        _run(winner, "git", "push", "-q")
+        write_file(loser, "local_side.txt", "l\n")
+        stage_and_commit(loser, "loser only")
+        _run(loser, "git", "fetch", "-q", "origin")
+        return winner, loser
+
+    def test_merges_divergent_loser_by_default(self) -> None:
+        from core.workers import _align_loser_ff
+        from core.models import Repo, SmartSyncCheckout, State
+
+        winner, loser = self._divergent_loser_setup()
+        state = State(repos=[], workspace_name="test")
+        state.prevent_smart_sync_silent_merge = False
+        c = SmartSyncCheckout(
+            canonical=Repo(rel="c", path=loser),
+            parent=None, path=loser, branch="main", label="in-test",
+        )
+        self.assertTrue(_align_loser_ff(state, c, "main", "ws"))
+        self.assertTrue((loser / "remote_side.txt").exists())
+        winner_tip = _run(winner, "git", "rev-parse", "HEAD").stdout.strip()
+        ok_anc = _run(
+            loser, "git", "merge-base", "--is-ancestor",
+            winner_tip, "HEAD")
+        self.assertEqual(ok_anc.returncode, 0)
+
+    def test_skips_merge_when_prevent_flag_set(self) -> None:
+        from core.workers import _align_loser_ff
+        from core.models import Repo, SmartSyncCheckout, State
+
+        winner, loser = self._divergent_loser_setup()
+        before = _run(loser, "git", "rev-parse", "HEAD").stdout.strip()
+        state = State(repos=[], workspace_name="test")
+        state.prevent_smart_sync_silent_merge = True
+        c = SmartSyncCheckout(
+            canonical=Repo(rel="c", path=loser),
+            parent=None, path=loser, branch="main", label="in-test",
+        )
+        self.assertFalse(_align_loser_ff(state, c, "main", "ws"))
+        self.assertEqual(
+            _run(loser, "git", "rev-parse", "HEAD").stdout.strip(), before)
+        self.assertFalse((loser / "remote_side.txt").exists())
+
+
 class TestDetachedWinnerSwitch(_TempWorkspace):
     """Regression: a dirty, detached-HEAD winner used to be committed
     BEFORE the branch switch, leaving the new commit orphaned and the
@@ -1578,7 +1638,7 @@ class TestFFMergeAction(_TempWorkspace):
 
 
 class TestGitOperationHardening(_TempWorkspace):
-    def test_manual_pull_uses_ff_only_and_refuses_divergence(self) -> None:
+    def test_manual_pull_merges_when_diverged(self) -> None:
         from core.workers import kick_off_action
         from core.models import State
 
@@ -1590,7 +1650,7 @@ class TestGitOperationHardening(_TempWorkspace):
         stage_and_commit(remote, "remote edit")
         write_file(repo_path, "local.txt", "local\n")
         stage_and_commit(repo_path, "local edit")
-        local_head = _run(repo_path, "git", "rev-parse", "HEAD").stdout.strip()
+        remote_tip = _run(remote, "git", "rev-parse", "HEAD").stdout.strip()
 
         repo = Repo(rel="r", path=repo_path)
         state = State(repos=[repo], workspace_name="test")
@@ -1603,12 +1663,15 @@ class TestGitOperationHardening(_TempWorkspace):
             if t.daemon and t is not threading.current_thread():
                 t.join(timeout=5.0)
 
-        self.assertEqual(
-            _run(repo_path, "git", "rev-parse", "HEAD").stdout.strip(),
-            local_head)
+        new_head = _run(repo_path, "git", "rev-parse", "HEAD").stdout.strip()
+        anc = _run(
+            repo_path, "git", "merge-base", "--is-ancestor",
+            remote_tip, new_head)
+        self.assertEqual(anc.returncode, 0)
+        self.assertTrue((repo_path / "remote.txt").exists())
         labels = " ".join(t.label + " " + t.message
                           for t in state.tasks.snapshot())
-        self.assertIn("pull --ff-only", labels)
+        self.assertIn("pull", labels)
 
     def test_option_like_branch_name_is_rejected_before_checkout(self) -> None:
         from core.workers import kick_off_action

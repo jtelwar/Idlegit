@@ -502,7 +502,12 @@ def _collect_review_focusables(
         for tog in block.workflow_toggles:
             out.append((block_index, "toggle", tog))
             emit_chain(block, tog.workflow_name)
-        emit_chain(block, "")
+        # Child (nested-submodule) blocks have no target_repo and no
+        # workflow toggles, so they get no after-push then-run chain
+        # either — skip the walk to avoid creating selectors with a
+        # None repo, which would crash the moment we read their state.
+        if block.target_repo is not None:
+            emit_chain(block, "")
     return out
 
 
@@ -726,9 +731,11 @@ def _block_left_rows(
 
     # After-push chain — its root selector renders at column 2
     # ("then run after push:") and chained continuations step in
-    # by 2 cols each.
-    for sel, depth in _walk_then_run_chain(block, ""):
-        append_then_run(sel, indent_cols=2 + 2 * depth)
+    # by 2 cols each. Child blocks carry no target_repo and aren't
+    # offered a then-run row, matching _collect_review_focusables.
+    if block.target_repo is not None:
+        for sel, depth in _walk_then_run_chain(block, ""):
+            append_then_run(sel, indent_cols=2 + 2 * depth)
     return rows
 
 
@@ -1065,7 +1072,11 @@ def _review_hints(focusables: List[Tuple[int, str, object]],
                 hints.append(Hint(KEY_LEFT_RIGHT,
                                   "cycle then-run target"))
         hints.append(Hint(KEY_SHIFT_TAB, "files panel"))
-        hints.append(Hint(KEY_ENTER, "execute commits"))
+        # Only advertise Enter once every block has finished its file
+        # load — pressing it earlier would race the staging step and
+        # fail with "nothing staged". Matches the gate in main_loop.
+        if blocks is not None and not any(b.files_loading for b in blocks):
+            hints.append(Hint(KEY_ENTER, "execute commits"))
     else:  # right
         # Pull the focused block once so we can swap hints between
         # toolbar focus (top of pane) and file-list focus.

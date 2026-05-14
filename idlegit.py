@@ -366,7 +366,7 @@ def run(stdscr, cfg, workspaces, initial_active_idx: int = 0,
                         or state.tasks.has_pending_auto_remove(
                             state.auto_remove_completed_after)
                         or any(r.suggesting or r.refreshing for r in state.repos)
-                        or any(c.suggesting
+                        or any(c.suggesting or c.refreshing
                                for r in state.repos for c in r.children)
                         or creator_checking
                         or menu_checking

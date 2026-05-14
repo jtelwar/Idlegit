@@ -124,6 +124,10 @@ _OVERRIDE_ROWS: Tuple[WorkspaceMenuRow, ...] = (
         label="Prompt for branch",
         attr_name="default_prompt_for_branch", kind="bool",
         hint_text="ask which branch a detached winner pushes to (default: on)"),
+    WorkspaceMenuRow(
+        label="Prevent silent merge (sync)",
+        attr_name="default_prevent_smart_sync_silent_merge", kind="bool",
+        hint_text="smart-sync: FF-only for losers — no auto merge commits (default: off)"),
     WorkspaceMenuRow(label="DISPLAY", attr_name="", kind="header"),
     WorkspaceMenuRow(
         label="Name truncation",

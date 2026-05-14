@@ -531,7 +531,6 @@ def draw_child_row(stdscr, y: int, child: ChildRef, focused: bool,
                    name_mode: str, branch_mode: str,
                    field_cursor: int = 0,
                    spinner_char: str = " ") -> None:
-    glyph = "↳" if child.kind == "submodule" else "⊕"
     name_attr = curses.A_BOLD if focused else curses.A_DIM
     # Submodule glyph is a composite "needs your attention?" indicator:
     #   pink   — out of sync vs canonical (drift takes precedence — the
@@ -541,20 +540,28 @@ def draw_child_row(stdscr, y: int, child: ChildRef, focused: bool,
     #            (uncommitted edits — easy to miss when scanning if the
     #            glyph were green)
     #   green  — in sync AND clean (truly nothing to do)
-    # Subtree rows have no canonical relationship, so the glyph stays
-    # in the row's normal name attribute.
-    if child.kind == "submodule":
-        if not child.in_sync:
-            glyph_pair = PAIR_BEHIND
-        elif child.dirty:
-            glyph_pair = PAIR_DIRTY
-        else:
-            glyph_pair = PAIR_OK
-        glyph_attr = curses.color_pair(glyph_pair)
+    # Subtree rows use ⊕ in the normal name attribute unless refreshing.
+    # While refreshing, the glyph uses the same spinner as repo rows /
+    # the state column so in-flight work is obvious at a glance.
+    if child.refreshing:
+        glyph = spinner_char
+        glyph_attr = curses.color_pair(PAIR_BRANCH)
         if focused:
             glyph_attr |= curses.A_BOLD
     else:
-        glyph_attr = name_attr
+        glyph = "↳" if child.kind == "submodule" else "⊕"
+        if child.kind == "submodule":
+            if not child.in_sync:
+                glyph_pair = PAIR_BEHIND
+            elif child.dirty:
+                glyph_pair = PAIR_DIRTY
+            else:
+                glyph_pair = PAIR_OK
+            glyph_attr = curses.color_pair(glyph_pair)
+            if focused:
+                glyph_attr |= curses.A_BOLD
+        else:
+            glyph_attr = name_attr
     safe_addstr(stdscr, y, 4, glyph, glyph_attr)
     safe_addstr(stdscr, y, 6,
                 truncate(child.repo.display_name, name_max, name_mode),
