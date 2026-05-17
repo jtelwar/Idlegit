@@ -1,4 +1,7 @@
-0.22.3
+0.22.4
+
+### 0.22.4
+- 2026-05-17: "Add tag" from the recent-commit dialog now pushes the tag iff the commit is reachable from any `origin/*` ref — fixes the case where a tagged commit was created locally but never made it to the remote (workflow never fired); for unpushed commits it leaves the tag local and surfaces a warn task pointing the user at the missing branch push so the tag-via-origin orphan-commit case can't happen
 
 ### 0.22.3
 - 2026-05-17: updated hint texts

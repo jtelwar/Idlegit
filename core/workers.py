@@ -1021,10 +1021,21 @@ def kick_off_add_tag(state: State, target_label: str,
                      target_repo: Optional[Repo],
                      target_parent: Optional[Repo],
                      name: str, sha: str) -> None:
-    """Create a lightweight tag pointing at `sha`. Refuses unsafe
-    name / sha (defence-in-depth). Creating a tag is cardinal-rule
-    safe: it only writes a new ref. Pushing the tag is a separate
-    operation we don't run automatically."""
+    """Create a lightweight tag pointing at `sha`, and push it iff
+    the commit is already reachable from some `origin/*` ref.
+
+    Why conditional push: `git push origin <tag>` happily ships
+    orphan commit objects along with the tag ref when the commit
+    isn't on origin, leaving the new commit reachable on origin
+    only via the tag (not via any branch). That surprises the user
+    — their tag-triggered release workflow fires on a commit that
+    isn't on master. So if the commit isn't on origin yet, we
+    create the tag locally only and surface a warn task pointing
+    at the missing branch push.
+
+    Refuses unsafe name / sha (defence-in-depth). Cardinal-rule
+    safe: tags only add refs, never rewrite history; the push is a
+    plain `push origin <tag>` with no `--force`."""
     target_child = _find_child_at(target_parent, target_path)
     # Same try_acquire / warn-and-bail pattern as kick_off_action — a
     # tag write is a fast ref-only op, but it still mutates `.git/`
@@ -1057,10 +1068,41 @@ def kick_off_add_tag(state: State, target_label: str,
             if not sha or sha.startswith("-"):
                 state.tasks.update(t, "fail", "unsafe sha")
                 return
+
+            # 1) Create the tag locally.
             rc, _, err = git(target_path, ["tag", name, sha])
-            state.tasks.update(
-                t, "ok" if rc == 0 else "fail",
-                "" if rc == 0 else first_line(err))
+            if rc != 0:
+                state.tasks.update(
+                    t, "fail", first_line(err) or "git tag failed")
+                return
+
+            # 2) Check whether the commit is reachable from any
+            # `refs/remotes/origin/*` ref. `for-each-ref --contains`
+            # walks the named refs and returns those whose tip is a
+            # descendant (or equal) of `sha`. Empty output means
+            # "no origin ref reaches this commit yet" — push the
+            # branch first, otherwise we'd be carrying the commit
+            # to origin via the tag.
+            rc, out, _ = git(target_path, [
+                "for-each-ref", "--contains", sha,
+                "--format=%(refname)",
+                "refs/remotes/origin/"])
+            on_origin = rc == 0 and bool(out.strip())
+            if not on_origin:
+                state.tasks.update(
+                    t, "warn",
+                    "tagged locally — commit not on origin yet; "
+                    "push the branch first, then re-add the tag")
+                return
+
+            # 3) Push the tag — safe ref-only operation since the
+            # commit objects it points at are already on origin.
+            rc, _, err = git(target_path, ["push", "origin", name])
+            if rc != 0:
+                state.tasks.update(
+                    t, "fail", f"push: {first_line(err) or 'failed'}")
+                return
+            state.tasks.update(t, "ok")
         finally:
             if repo_acquired and target_repo is not None:
                 target_repo.release_refresh()
