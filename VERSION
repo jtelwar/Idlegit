@@ -1,4 +1,7 @@
-0.22.10
+0.22.11
+
+### 0.22.11
+- 2026-05-17: tests workflow now also triggers on push to master + workflow_dispatch so the status badge actually populates.
 
 ### 0.22.10
 - 2026-05-17: commit_worker shows a "working" task at start so the gesture registers immediately even when the pre-stage pull is slow.

@@ -1,12 +1,18 @@
 name: tests
 
-# Runs the full test suite + ruff lint on every pull request, and on
-# demand from release.yml via `workflow_call` so a release tag can't
-# be cut from a failing tree. Direct pushes to master aren't gated by
-# CI — review-then-merge happens through PRs.
+# Runs the full test suite + ruff lint on every push to master, every
+# pull request, manual Actions-tab dispatch, and on demand from
+# release.yml via `workflow_call` so a release tag can't be cut from
+# a failing tree. The push-to-master trigger is what populates the
+# badge — `workflow_call` runs nest under the caller and don't count
+# as standalone `tests` runs, so without it the badge sits at
+# "no status".
 
 on:
+  push:
+    branches: [master]
   pull_request:
+  workflow_dispatch:
   workflow_call:
 
 permissions:
