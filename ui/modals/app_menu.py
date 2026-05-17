@@ -43,6 +43,18 @@ from ..sidebar import SPINNER_FRAMES
 # than free-form strings.
 _ACTION_CHECK_FOR_UPDATES = "check_for_updates"
 _ACTION_UPDATE_NOW = "update_now"
+_ACTION_OPEN_TASK_LOG = "open_task_log"
+_ACTION_CLEAR_TASK_LOG = "clear_task_log"
+_ACTION_TOGGLE_TASK_LOG = "toggle_task_log"
+_ACTION_TOGGLE_AUTO_REFRESH = "toggle_auto_refresh"
+_ACTION_CYCLE_DEBOUNCE = "cycle_auto_refresh_debounce"
+_ACTION_OPEN_HELP = "open_help"
+
+# Preset debounce values the menu cycles through. The default config
+# value (400 ms) sits in the middle; jumping to a longer setting helps
+# on noisy trees with heavy build artifact churn, jumping shorter buys
+# snappier feedback on quiet repos.
+_DEBOUNCE_PRESETS_MS = (200, 400, 800, 1500)
 
 
 # Modal sizing.
@@ -143,6 +155,79 @@ def _app_section_rows(menu: AppMenu) -> "list[AppMenuRow]":
             rows.append(AppMenuRow(
                 label="Check again",
                 attr_name=_ACTION_CHECK_FOR_UPDATES, kind="app_action"))
+    # "Help" sits at the bottom of the APPLICATION section regardless
+    # of the update-check state — it's always available, and grouping
+    # it here keeps the related "application-level" rows together
+    # before the spacer + WORKSPACES section.
+    rows.append(AppMenuRow(
+        label="Help",
+        attr_name=_ACTION_OPEN_HELP, kind="app_action"))
+    return rows
+
+
+def _auto_refresh_section_rows(state: State) -> "list[AppMenuRow]":
+    """AUTO REFRESH section: toggle row for the fs-watch feature plus a
+    debounce-cycle row when the feature is on. The debounce row hides
+    when the feature is off so the user isn't tweaking a parameter that
+    doesn't apply — re-enabling brings it back."""
+    on = state.auto_refresh_on_fs_change
+    toggle_label = (
+        "Disable filesystem auto-refresh" if on
+        else "Enable filesystem auto-refresh")
+    rows: "list[AppMenuRow]" = [
+        AppMenuRow(label="AUTO REFRESH", attr_name="", kind="header"),
+        AppMenuRow(label=toggle_label,
+                   attr_name=_ACTION_TOGGLE_AUTO_REFRESH, kind="app_action"),
+    ]
+    if on:
+        rows.append(AppMenuRow(
+            label=f"Debounce: {state.auto_refresh_debounce_ms} ms",
+            attr_name=_ACTION_CYCLE_DEBOUNCE, kind="app_action"))
+    return rows
+
+
+def _task_logging_section_rows(state: State) -> "list[AppMenuRow]":
+    """TASK LOGGING section: read-only status / path / size rows plus
+    Open + Clear actions. Path editing is intentionally not surfaced
+    here — the user edits `task_log_path` in idlegit.conf and restarts
+    (the loader path is one-shot at startup, mirroring the rest of the
+    global config). Size is computed on each build_rows so the value
+    stays current as workers write more lines."""
+    from core.task_log import (
+        format_size, task_log_line_count, task_log_size_bytes,
+    )
+
+    path_text = str(state.task_log_path)
+    size_bytes = task_log_size_bytes(state.task_log_path)
+    if size_bytes <= 0:
+        size_text = "0 B (empty)"
+    else:
+        lines = task_log_line_count(state.task_log_path)
+        size_text = f"{format_size(size_bytes)} ({lines:,} lines)"
+    cap = state.task_log_max_lines
+    cap_text = "unlimited" if cap <= 0 else f"{cap:,} lines"
+    # The toggle row is the section's primary action — the label
+    # describes the next state the action lands in ("Enable…" when
+    # off, "Disable…" when on), so a dedicated "Enabled: yes/no"
+    # info row would just duplicate the same signal.
+    toggle_label = (
+        "Disable task logging" if state.task_log_enabled
+        else "Enable task logging")
+    rows: "list[AppMenuRow]" = [
+        AppMenuRow(label="TASK LOGGING", attr_name="", kind="header"),
+        AppMenuRow(label=toggle_label,
+                   attr_name=_ACTION_TOGGLE_TASK_LOG, kind="app_action"),
+        AppMenuRow(label=f"Path: {path_text}",
+                   attr_name="", kind="app_info"),
+        AppMenuRow(label=f"Size: {size_text}",
+                   attr_name="", kind="app_info"),
+        AppMenuRow(label=f"Max lines: {cap_text}",
+                   attr_name="", kind="app_info"),
+        AppMenuRow(label="Open log file",
+                   attr_name=_ACTION_OPEN_TASK_LOG, kind="app_action"),
+        AppMenuRow(label="Clear log contents",
+                   attr_name=_ACTION_CLEAR_TASK_LOG, kind="app_action"),
+    ]
     return rows
 
 
@@ -156,7 +241,7 @@ def _workspaces_section_rows(state: State) -> "list[AppMenuRow]":
     ]
     for i, ws in enumerate(state.workspaces):
         rows.append(AppMenuRow(
-            label=ws.name, attr_name=str(i), kind="workspace"))
+            label=ws.display_name, attr_name=str(i), kind="workspace"))
     rows.append(AppMenuRow(
         label="+ Create new workspace…",
         attr_name="", kind="create_workspace"))
@@ -164,14 +249,20 @@ def _workspaces_section_rows(state: State) -> "list[AppMenuRow]":
 
 
 def _build_rows(state: State, menu: AppMenu) -> "list[AppMenuRow]":
-    """Compose the full row list — update-check rows at the top,
-    one blank spacer row, then the WORKSPACES section. Both
-    sections are rebuilt fresh on every call so changes to either
-    side surface without side-effecting state mutations elsewhere."""
+    """Compose the full row list — update-check rows at the top, then
+    WORKSPACES (the main use-case for opening this menu), then
+    TASK LOGGING at the bottom (occasional diagnostic surface). Each
+    section is rebuilt fresh on every call so changes (update-check
+    transitions, workspace add/remove, log size growth) surface
+    without side-effecting state mutations elsewhere."""
     rows = _app_section_rows(menu)
     if rows:
         rows.append(AppMenuRow(label="", attr_name="", kind="spacer"))
     rows.extend(_workspaces_section_rows(state))
+    rows.append(AppMenuRow(label="", attr_name="", kind="spacer"))
+    rows.extend(_auto_refresh_section_rows(state))
+    rows.append(AppMenuRow(label="", attr_name="", kind="spacer"))
+    rows.extend(_task_logging_section_rows(state))
     return rows
 
 
@@ -259,6 +350,24 @@ def _hints(state) -> list:
         if row.kind == "app_action":
             if row.attr_name == _ACTION_UPDATE_NOW:
                 hints.append(Hint(KEY_ENTER, "exit + run idlegit-update"))
+            elif row.attr_name == _ACTION_OPEN_TASK_LOG:
+                hints.append(Hint(KEY_ENTER, "open in default app"))
+            elif row.attr_name == _ACTION_CLEAR_TASK_LOG:
+                hints.append(Hint(KEY_ENTER, "truncate log file"))
+            elif row.attr_name == _ACTION_OPEN_HELP:
+                hints.append(Hint(KEY_ENTER, "open help"))
+            elif row.attr_name == _ACTION_TOGGLE_TASK_LOG:
+                hints.append(Hint(
+                    KEY_ENTER,
+                    "disable + save" if state.task_log_enabled
+                    else "enable + save"))
+            elif row.attr_name == _ACTION_TOGGLE_AUTO_REFRESH:
+                hints.append(Hint(
+                    KEY_ENTER,
+                    "disable + save" if state.auto_refresh_on_fs_change
+                    else "enable + save"))
+            elif row.attr_name == _ACTION_CYCLE_DEBOUNCE:
+                hints.append(Hint(KEY_ENTER, "cycle preset + save"))
             else:
                 hints.append(Hint(KEY_ENTER, "check for updates"))
         elif row.kind == "workspace":
@@ -270,7 +379,7 @@ def _hints(state) -> list:
                 hints.append(Hint(KEY_ENTER, "stay (already active)"))
             elif 0 <= ws_idx < len(state.workspaces):
                 ws = state.workspaces[ws_idx]
-                hints.append(Hint(KEY_ENTER, f"switch to {ws.name}"))
+                hints.append(Hint(KEY_ENTER, f"switch to {ws.display_name}"))
         elif row.kind == "create_workspace":
             hints.append(Hint(KEY_ENTER, "create new workspace…"))
     hints.append(Hint(KEY_ESC, "close"))
@@ -311,6 +420,166 @@ def _fire_app_action(state: State, action_id: str) -> None:
         return
     if action_id == _ACTION_UPDATE_NOW:
         _exec_idlegit_update()
+        return
+    if action_id == _ACTION_OPEN_TASK_LOG:
+        _fire_open_task_log(state)
+        return
+    if action_id == _ACTION_CLEAR_TASK_LOG:
+        _fire_clear_task_log(state)
+        return
+    if action_id == _ACTION_TOGGLE_TASK_LOG:
+        _fire_toggle_task_log(state)
+        return
+    if action_id == _ACTION_TOGGLE_AUTO_REFRESH:
+        _fire_toggle_auto_refresh(state)
+        return
+    if action_id == _ACTION_CYCLE_DEBOUNCE:
+        _fire_cycle_debounce(state)
+        return
+    if action_id == _ACTION_OPEN_HELP:
+        # Close the app menu first so the help screen owns the modal
+        # stack — opening it on top of the menu would leave the
+        # menu's row chrome bleeding through underneath the help
+        # panes on tight terminal geometries.
+        from .help import open_help_screen
+        state.app_menu = None
+        open_help_screen(state)
+        return
+
+
+def _fire_toggle_task_log(state: State) -> None:
+    """Flip `state.task_log_enabled` and persist the change to
+    idlegit.conf so it survives a restart. Wires / unwires the sink on
+    `state.tasks.on_finished` to match — enabling also touches the log
+    file so the very next "Open log file" lands on something real,
+    rather than reporting "does not exist yet" until the first task
+    finishes."""
+    from core.config import set_conf_value
+    from core.task_log import unwire_task_log, wire_task_log
+
+    new_enabled = not state.task_log_enabled
+    state.task_log_enabled = new_enabled
+    if new_enabled:
+        wire_task_log(state)
+    else:
+        unwire_task_log(state)
+
+    t = state.tasks.add(
+        "enable task logging" if new_enabled else "disable task logging")
+    if set_conf_value("task_log_enabled",
+                       "true" if new_enabled else "false"):
+        state.tasks.update(
+            t, "ok",
+            "logging on" if new_enabled else "logging off")
+    else:
+        state.tasks.update(
+            t, "warn",
+            "applied but conf write failed — won't persist across restart")
+    _rebuild_rows(state)
+
+
+def _fire_toggle_auto_refresh(state: State) -> None:
+    """Flip `state.auto_refresh_on_fs_change`, persist it, and reconcile
+    watchers so the change lands immediately (stopping the Observer on
+    disable, starting it on enable). Mirrors `_fire_toggle_task_log`'s
+    "apply + save + surface a task" pattern so the user gets one-row
+    feedback on whether the conf write actually persisted."""
+    from core.config import set_conf_value
+    from core.fs_watcher import reconcile_repo_watchers
+
+    new_enabled = not state.auto_refresh_on_fs_change
+    state.auto_refresh_on_fs_change = new_enabled
+    reconcile_repo_watchers(state)
+
+    t = state.tasks.add(
+        "enable auto-refresh" if new_enabled else "disable auto-refresh")
+    if set_conf_value("auto_refresh_on_fs_change",
+                      "true" if new_enabled else "false"):
+        state.tasks.update(
+            t, "ok",
+            "watching files" if new_enabled else "Ctrl+R only")
+    else:
+        state.tasks.update(
+            t, "warn",
+            "applied but conf write failed — won't persist across restart")
+    _rebuild_rows(state)
+
+
+def _fire_cycle_debounce(state: State) -> None:
+    """Advance `state.auto_refresh_debounce_ms` to the next entry in
+    `_DEBOUNCE_PRESETS_MS`, wrapping at the end. If the current value
+    isn't in the preset list (e.g. user hand-edited idlegit.conf to a
+    custom number), pick the first preset that's >= current, falling
+    back to the first preset. Persists the new value and surfaces a
+    one-shot task confirming the write landed."""
+    from core.config import set_conf_value
+
+    current = state.auto_refresh_debounce_ms
+    if current in _DEBOUNCE_PRESETS_MS:
+        idx = _DEBOUNCE_PRESETS_MS.index(current)
+        new_value = _DEBOUNCE_PRESETS_MS[
+            (idx + 1) % len(_DEBOUNCE_PRESETS_MS)]
+    else:
+        new_value = next(
+            (p for p in _DEBOUNCE_PRESETS_MS if p > current),
+            _DEBOUNCE_PRESETS_MS[0])
+    state.auto_refresh_debounce_ms = new_value
+
+    t = state.tasks.add(f"debounce → {new_value} ms")
+    if set_conf_value("auto_refresh_debounce_ms", str(new_value)):
+        state.tasks.update(t, "ok", "saved")
+    else:
+        state.tasks.update(
+            t, "warn",
+            "applied but conf write failed — won't persist across restart")
+    _rebuild_rows(state)
+
+
+def _fire_open_task_log(state: State) -> None:
+    """Hand the log file off to the platform's default opener via the
+    same `webbrowser` mechanism used for run URLs. Failures surface as
+    a warn task in the panel so the user gets feedback instead of a
+    silent no-op. Spawns a daemon thread because the dispatch can be
+    slow on some platforms (Linux desktops in particular)."""
+    import threading
+    from core.task_log import open_task_log
+
+    path = state.task_log_path
+
+    def worker() -> None:
+        t = state.tasks.add(f"open {path.name}")
+        # Create-if-missing so opening an "empty log" lands on a real
+        # file instead of "does not exist yet". The installer normally
+        # pre-creates this, but older installs / non-installed runs /
+        # exotic config dirs may not have it yet.
+        if not path.exists():
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.touch()
+            except OSError as e:
+                state.tasks.update(
+                    t, "fail", f"could not create log: {e}")
+                return
+        if open_task_log(path):
+            state.tasks.update(t, "ok", "opened")
+        else:
+            state.tasks.update(t, "warn", "no opener available")
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def _fire_clear_task_log(state: State) -> None:
+    """Truncate the log file to zero bytes. Reports the result as a
+    task row so the user can see it landed (or didn't). Rebuilds the
+    menu rows so the size display refreshes immediately."""
+    from core.task_log import clear_task_log
+
+    t = state.tasks.add(f"clear {state.task_log_path.name}")
+    if clear_task_log(state.task_log_path):
+        state.tasks.update(t, "ok", "log cleared")
+    else:
+        state.tasks.update(t, "fail", "could not write log file")
+    _rebuild_rows(state)
 
 
 def _exec_idlegit_update() -> None:
@@ -351,7 +620,7 @@ def _draw_workspace_row(stdscr, line_y: int, inner_x: int, inner_w: int,
     is_active = (ws_idx == state.active_workspace_index)
     prefix = "→ " if focused else ("• " if is_active else "  ")
     name_w = max(12, inner_w // 3)
-    name_text = truncate(ws.name, name_w, "end")
+    name_text = truncate(ws.display_name, name_w, "end")
     n_folders = len(ws.folders)
     meta = (f"{n_folders} folder" if n_folders == 1
             else f"{n_folders} folders")

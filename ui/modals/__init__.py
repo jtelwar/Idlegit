@@ -22,9 +22,16 @@ from .branch_picker import (
 from .clone import (
     draw_clone_modal, handle_clone_modal_key, open_clone_modal,
 )
+from .commit_msg_editor import (
+    draw_commit_msg_editor, handle_commit_msg_editor_key,
+    open_commit_msg_editor,
+)
 from .commit_view import (
     draw_commit_view_modal, handle_commit_view_modal_key,
     open_commit_view_modal,
+)
+from .help import (
+    draw_help_screen, handle_help_screen_key, open_help_screen,
 )
 from .remotes import (
     draw_remotes_modal, handle_remotes_modal_key, open_remotes_modal,
@@ -68,8 +75,11 @@ __all__ = [
     "open_branch_name_prompt",
     "draw_branch_picker", "handle_branch_picker_key", "open_branch_picker",
     "draw_clone_modal", "handle_clone_modal_key", "open_clone_modal",
+    "draw_commit_msg_editor", "handle_commit_msg_editor_key",
+    "open_commit_msg_editor",
     "draw_commit_view_modal", "handle_commit_view_modal_key",
     "open_commit_view_modal",
+    "draw_help_screen", "handle_help_screen_key", "open_help_screen",
     "draw_remotes_modal", "handle_remotes_modal_key", "open_remotes_modal",
     "draw_detached_recovery_prompt", "handle_detached_recovery_prompt_key",
     "open_detached_recovery_prompt",

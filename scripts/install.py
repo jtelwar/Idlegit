@@ -267,13 +267,20 @@ def install_files(home: Path, summary: list) -> None:
         os.chmod(dst, mode)
     # Replace the core/ and ui/ trees wholesale so renames / removals
     # propagate. core/ is the domain layer (config + models + git_ops
-    # + workers); ui/ is the curses surface.
-    for pkg in ("core", "ui"):
+    # + workers); ui/ is the curses surface; help/ is the bundled
+    # markdown pages the in-app help browser reads from. Missing
+    # `help/` in the source tree is non-fatal — the help screen falls
+    # back to a "no help available" placeholder, but every release
+    # should ship it.
+    for pkg in ("core", "ui", "help"):
+        src = PROJECT_ROOT / pkg
+        if not src.exists():
+            continue
         dst = home / pkg
         if dst.exists():
             shutil.rmtree(dst)
-        shutil.copytree(PROJECT_ROOT / pkg, dst)
-    ok("copied launcher + Python modules + ui/")
+        shutil.copytree(src, dst)
+    ok("copied launcher + Python modules + ui/ + help/")
     summary.append(f"Installed / refreshed app files in {home}")
 
     # Strip any __pycache__ left over from prior runs in the source
@@ -340,6 +347,39 @@ def merge_config(summary: list) -> None:
     summary.append(line)
 
 
+def ensure_task_log(summary: list) -> None:
+    """Create an empty `tasks.log` at the user's configured task-log
+    path so the app menu's `Open log file` button has something to
+    open immediately — without this, the file is only created lazily
+    on the first terminal task transition (and never at all when
+    logging is disabled), which surfaces in the UI as a confusing
+    "log file does not exist yet" warning after a fresh install.
+
+    Reads the resolved path off the loaded config so a custom
+    `task_log_path` is honoured. Idempotent: an existing file is
+    left untouched (we never want the installer to clobber log
+    contents). Failures are warnings, not blockers — the log can
+    still be created at runtime."""
+    section("Task log")
+    from core.config import load_config
+    from core.task_log import resolve_task_log_path
+
+    try:
+        cfg = load_config()
+        path = resolve_task_log_path(cfg.task_log_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            ok(f"task log already present at {path}")
+            summary.append(f"Task log already at {path}")
+            return
+        path.touch()
+        ok(f"created empty task log at {path}")
+        summary.append(f"Created empty task log at {path}")
+    except OSError as e:
+        warn("could not create task log", str(e))
+        summary.append(f"Task log not created: {e}")
+
+
 def update_path(bindir: Path, assume_yes: bool, summary: list) -> None:
     section("PATH check")
     path_dirs = (os.environ.get("PATH") or "").split(os.pathsep)
@@ -382,11 +422,23 @@ def print_summary(summary: list, home: Path, link: Path) -> None:
     rerun = f"{sys.executable} {home / 'merge_config.py'}"
     print(f"  {_bold('Re-merge:')}     {_dim(rerun)}")
     print()
+    print(_green(_bold(f"Installed {APP_DISPLAY_NAME} v{VERSION}")))
 
 
 def main(argv: "list[str] | None" = None) -> int:
     argv = list(argv if argv is not None else sys.argv)
     assume_yes = parse_args(argv)
+    # Hard-bail on Windows. The installer pipeline relies on POSIX-only
+    # primitives — `os.symlink` (requires elevation on Windows), executable
+    # mode bits via `chmod 0o755` (no-op on NTFS), and the bash launchers
+    # (`idlegit`, `idlegit-update`) which don't run from a Windows shell.
+    # Windows users have a clean pipx path documented in README; fail
+    # fast and point them at it rather than producing a half-installed
+    # tree that "works" until they try to launch.
+    if sys.platform == "win32":
+        die("install.py is macOS/Linux only — on Windows, install with "
+            "`pipx install \".[windows]\"` from a clone of the repo "
+            "(see README for details)")
     home = Path(os.environ.get("IDLEGIT_HOME") or _default_home())
     bindir = Path(os.environ.get("IDLEGIT_BINDIR") or _default_bindir())
 
@@ -422,6 +474,8 @@ def main(argv: "list[str] | None" = None) -> int:
     link = link_launcher(home, bindir, summary)
     print()
     merge_config(summary)
+    print()
+    ensure_task_log(summary)
     print()
     update_path(bindir, assume_yes, summary)
     print_summary(summary, home, link)

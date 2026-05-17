@@ -5,9 +5,12 @@ name: release
 # the API), which is what `update.py` downloads when it sees a
 # newer tag than the installed VERSION.
 #
-# Pre-flight check: refuses to publish unless `config.VERSION`
-# matches the tag being pushed, so a misnamed tag fails fast
-# instead of producing a release the updater can't reconcile.
+# Pre-flight checks:
+#   1. The full test suite + lint must pass (via the reusable
+#      tests.yml workflow). This blocks releases from a failing tree.
+#   2. `config.VERSION` must match the tag being pushed, so a
+#      misnamed tag fails fast instead of producing a release the
+#      updater can't reconcile.
 
 on:
   push:
@@ -18,7 +21,11 @@ permissions:
   contents: write
 
 jobs:
+  tests:
+    uses: ./.github/workflows/tests.yml
+
   release:
+    needs: tests
     runs-on: ubuntu-latest
     steps:
       - name: Checkout tagged commit

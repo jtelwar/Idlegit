@@ -385,7 +385,10 @@ def handle_task_action_menu_key(state: State, key: int) -> None:
         _handle_sub_picker_key(state, key)
         return
 
-    if key == 27:
+    # Tab mirrors Esc — both close. The task row that opened this
+    # menu was reached via Tab on the task panel, so closing via Tab
+    # is the symmetric muscle memory.
+    if key in (27, 9):
         state.task_action_menu = None
         return
     if key == curses.KEY_UP and menu.items:

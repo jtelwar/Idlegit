@@ -1454,7 +1454,7 @@ class TestStashPopConflictNoHardReset(_TempWorkspace):
 
         # Stash must be preserved.
         stash_out = _run(repo, "git", "stash", "list").stdout
-        self.assertIn("align detached winner", stash_out)
+        self.assertIn("align detached HEAD", stash_out)
 
 
 class TestCommitWorkerDetachedGuard(_TempWorkspace):
@@ -1753,6 +1753,199 @@ class TestPromptHardening(unittest.TestCase):
 
         refresh.assert_called_once_with(state, repo, None)
         self.assertFalse(repo.refreshing)
+
+
+class TestHasOnlySubmodulePointerChanges(_TempWorkspace):
+    """The precondition smart-sync's auto-push-parent step rides on.
+    Anything dirty besides registered-submodule pointer modifications
+    must shut propagation down — otherwise we'd sweep an unrelated
+    in-progress edit into the auto-bump commit."""
+
+    def _bare_remote(self, name: str, branch: str = "master") -> Path:
+        bare = self.tmp / name
+        bare.mkdir()
+        _run(bare, "git", "init", "--bare", "-q", "-b", branch)
+        return bare
+
+    def _parent_with_submodule(self) -> Path:
+        """Build `parent` with `vendor/sub` registered as a submodule
+        pointing at a bare remote. Returns the parent path; the
+        submodule's working dir is clean and at the bare remote's HEAD."""
+        sub_remote = self._bare_remote("sub.git")
+        seed = self.tmp / "seed"
+        _run(self.tmp, "git", "clone", "-q", str(sub_remote), "seed")
+        write_file(seed, "lib.txt", "v1\n")
+        stage_and_commit(seed, "v1")
+        _run(seed, "git", "push", "-q", "-u", "origin", "master")
+
+        parent = make_repo(self.tmp, "parent", branch="master")
+        _run(parent, "git", "-c", "protocol.file.allow=always",
+             "submodule", "add", str(sub_remote), "vendor/sub")
+        stage_and_commit(parent, "register submodule")
+        return parent
+
+    def _bump_submodule_head(self, parent: Path) -> None:
+        """Add a new commit inside the submodule checkout so the parent
+        sees a stale gitlink (this is the post-smart-sync state the
+        helper has to recognise)."""
+        sub = parent / "vendor" / "sub"
+        write_file(sub, "lib.txt", "v2\n")
+        _run(sub, "git", "add", "lib.txt")
+        _run(sub, "git",
+             "-c", "user.email=t@x", "-c", "user.name=t",
+             "commit", "-q", "-m", "v2")
+
+    def test_clean_repo_is_false(self) -> None:
+        from core.git_ops import has_only_submodule_pointer_changes
+        parent = self._parent_with_submodule()
+        self.assertFalse(has_only_submodule_pointer_changes(parent))
+
+    def test_no_gitmodules_is_false(self) -> None:
+        from core.git_ops import has_only_submodule_pointer_changes
+        repo = make_repo(self.tmp, "r")
+        write_file(repo, "edit.txt", "x\n")
+        self.assertFalse(has_only_submodule_pointer_changes(repo))
+
+    def test_submodule_pointer_bump_is_true(self) -> None:
+        from core.git_ops import has_only_submodule_pointer_changes
+        parent = self._parent_with_submodule()
+        self._bump_submodule_head(parent)
+        self.assertTrue(has_only_submodule_pointer_changes(parent))
+
+    def test_submodule_plus_unrelated_edit_is_false(self) -> None:
+        from core.git_ops import has_only_submodule_pointer_changes
+        parent = self._parent_with_submodule()
+        self._bump_submodule_head(parent)
+        # Unrelated tracked file gets a modification.
+        write_file(parent, "README.md", "# parent\nedit\n")
+        self.assertFalse(has_only_submodule_pointer_changes(parent))
+
+    def test_submodule_plus_untracked_is_false(self) -> None:
+        from core.git_ops import has_only_submodule_pointer_changes
+        parent = self._parent_with_submodule()
+        self._bump_submodule_head(parent)
+        write_file(parent, "scratch.txt", "wip\n")
+        self.assertFalse(has_only_submodule_pointer_changes(parent))
+
+    def test_submodule_deletion_is_false(self) -> None:
+        """Deinit-style empty submodule dir surfaces as `D` on the
+        registered path — must NOT count as a propagation candidate
+        (would record a gitlink removal in the parent)."""
+        from core.git_ops import has_only_submodule_pointer_changes
+        parent = self._parent_with_submodule()
+        shutil.rmtree(parent / "vendor" / "sub")
+        self.assertFalse(has_only_submodule_pointer_changes(parent))
+
+
+class TestAutoPushSubmoduleParentPropagation(_TempWorkspace):
+    """End-to-end: after smart-sync of a submodule canonical, the parent
+    repo has a single dirty entry (the now-stale gitlink). With
+    `auto_push_submodule_parent=True`, `_propagate_submodule_bump`
+    commits and pushes the parent. With it False, the parent stays
+    dirty so the user can resolve manually."""
+
+    def _bare_remote(self, name: str, branch: str = "master") -> Path:
+        bare = self.tmp / name
+        bare.mkdir()
+        _run(bare, "git", "init", "--bare", "-q", "-b", branch)
+        return bare
+
+    def _seed_parent_with_submodule(self) -> tuple:
+        """Build a bare parent remote + bare submodule remote, clone the
+        parent locally with the submodule registered, and return
+        (parent_path, parent_remote_path, sub_remote_path)."""
+        parent_remote = self._bare_remote("parent.git")
+        sub_remote = self._bare_remote("sub.git")
+
+        # Seed the sub remote.
+        sub_seed = self.tmp / "sub_seed"
+        _run(self.tmp, "git", "clone", "-q", str(sub_remote), "sub_seed")
+        write_file(sub_seed, "lib.txt", "v1\n")
+        stage_and_commit(sub_seed, "v1")
+        _run(sub_seed, "git", "push", "-q", "-u", "origin", "master")
+
+        # Seed the parent remote with the submodule registered.
+        parent_seed = self.tmp / "parent_seed"
+        _run(self.tmp, "git", "clone", "-q", str(parent_remote), "parent_seed")
+        write_file(parent_seed, "README.md", "# parent\n")
+        stage_and_commit(parent_seed, "init")
+        _run(parent_seed, "git",
+             "-c", "protocol.file.allow=always",
+             "submodule", "add", str(sub_remote), "vendor/sub")
+        stage_and_commit(parent_seed, "register submodule")
+        _run(parent_seed, "git", "push", "-q", "-u", "origin", "master")
+
+        # Fresh clone (the one the test operates on).
+        parent = self.tmp / "parent"
+        _run(self.tmp, "git",
+             "-c", "protocol.file.allow=always",
+             "clone", "-q", "--recurse-submodules",
+             str(parent_remote), "parent")
+        return parent, parent_remote, sub_remote
+
+    def _bump_submodule_head(self, parent: Path) -> str:
+        """Advance the submodule checkout inside `parent` by one commit
+        and return the new HEAD sha. Mirrors the post-smart-sync state."""
+        sub = parent / "vendor" / "sub"
+        write_file(sub, "lib.txt", "v2\n")
+        _run(sub, "git", "add", "lib.txt")
+        _run(sub, "git",
+             "-c", "user.email=t@x", "-c", "user.name=t",
+             "commit", "-q", "-m", "v2")
+        return _run(sub, "git", "rev-parse", "HEAD").stdout.strip()
+
+    def test_propagate_commits_and_pushes_parent(self) -> None:
+        from core.models import Repo, State
+        from core.workers import _propagate_submodule_bump
+
+        parent_path, parent_remote, _ = self._seed_parent_with_submodule()
+        self._bump_submodule_head(parent_path)
+
+        parent_repo = Repo(rel="parent", path=parent_path)
+        state = State(repos=[parent_repo], workspace_name="ws")
+        new_head = _propagate_submodule_bump(state, parent_repo, "parent")
+        self.assertTrue(new_head, "expected non-empty new HEAD on success")
+
+        # Parent's working tree is clean (the bump landed as a commit).
+        status = _run(parent_path, "git", "status", "--porcelain=v1").stdout
+        self.assertEqual(status.strip(), "")
+        # And the remote received the commit (so a fresh clone would see it).
+        rc = _run(parent_remote, "git", "log", "-1", "--format=%H", check=False)
+        self.assertEqual(rc.returncode, 0)
+        self.assertEqual(rc.stdout.strip(), new_head)
+
+    def test_propagate_refuses_when_unrelated_dirt_present(self) -> None:
+        from core.models import Repo, State
+        from core.workers import _propagate_submodule_bump
+
+        parent_path, _, _ = self._seed_parent_with_submodule()
+        self._bump_submodule_head(parent_path)
+        # Unrelated edit must block propagation.
+        write_file(parent_path, "README.md", "# parent\nlocal edit\n")
+
+        parent_repo = Repo(rel="parent", path=parent_path)
+        state = State(repos=[parent_repo], workspace_name="ws")
+        new_head = _propagate_submodule_bump(state, parent_repo, "parent")
+        self.assertEqual(new_head, "")
+        # Parent still dirty in BOTH places — nothing was staged.
+        status = _run(parent_path, "git", "status", "--porcelain=v1").stdout
+        self.assertIn("README.md", status)
+        self.assertIn("vendor/sub", status)
+
+    def test_propagate_refuses_on_detached_head(self) -> None:
+        from core.models import Repo, State
+        from core.workers import _propagate_submodule_bump
+
+        parent_path, _, _ = self._seed_parent_with_submodule()
+        self._bump_submodule_head(parent_path)
+        # Detach so there's no branch to commit on.
+        head = _run(parent_path, "git", "rev-parse", "HEAD").stdout.strip()
+        _run(parent_path, "git", "checkout", "-q", head)
+
+        parent_repo = Repo(rel="parent", path=parent_path)
+        state = State(repos=[parent_repo], workspace_name="ws")
+        new_head = _propagate_submodule_bump(state, parent_repo, "parent")
+        self.assertEqual(new_head, "")
 
 
 if __name__ == "__main__":

@@ -8,7 +8,7 @@ import time
 import weakref
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 
 def _monotonic() -> float:
@@ -90,6 +90,15 @@ class Repo:
     conflict_paths: List[str] = field(default_factory=list)
     suggesting: bool = False  # background suggest in flight for this row
     refreshing: bool = False  # inline refresh in flight for this row
+    # Per-repo refresh mutex. Held while any refresh source (fs_watcher,
+    # Ctrl+R, action menu, commit pipeline) is mid-flight on this Repo,
+    # so concurrent refreshes can't interleave their writes to
+    # `staged` / `unstaged` / `branch` / etc. Acquire non-blocking via
+    # `try_acquire_refresh()`; release via `release_refresh()`. Excluded
+    # from `compare=` and `repr=` so two Repos with the same data fields
+    # but different lock instances still compare equal.
+    refresh_lock: threading.Lock = field(
+        default_factory=threading.Lock, compare=False, repr=False)
     # True for the synthetic canonical Repo we mint when a submodule URL
     # has no matching top-level repo in the workspace. The synthetic
     # Repo only lives as ChildRef.repo for nested rows — it isn't in
@@ -137,6 +146,46 @@ class Repo:
     def is_dirty(self) -> bool:
         return bool(self.staged or self.unstaged or self.untracked)
 
+    def try_acquire_refresh(self) -> bool:
+        """Non-blocking claim on the refresh slot. Returns True if the
+        caller now owns the refresh (must eventually call
+        `release_refresh`); False when another source is already
+        refreshing this repo. Sets `refreshing=True` synchronously on
+        success so the row spinner picks the claim up before the
+        worker thread spawns."""
+        if not self.refresh_lock.acquire(blocking=False):
+            return False
+        self.refreshing = True
+        return True
+
+    def acquire_refresh(self, timeout: float = 5.0) -> bool:
+        """Blocking claim on the refresh slot with a timeout. Used by
+        commit-pipeline paths that MUST get the lock (cascade to
+        parent after a submodule push, etc.) and can't tolerate the
+        silent-skip semantics of `try_acquire_refresh`. The wait is
+        bounded by `timeout` seconds so a stuck contender can't pin
+        the pipeline forever; fs_watcher's typical refresh is ~100ms
+        so 5s is plenty of headroom. Returns True on success, False
+        when the timeout expired."""
+        if not self.refresh_lock.acquire(timeout=timeout):
+            return False
+        self.refreshing = True
+        return True
+
+    def release_refresh(self) -> None:
+        """Release the slot acquired by `try_acquire_refresh` or
+        `acquire_refresh`. The flag only flips back to False when we
+        actually released the lock — a `finally` block on a path that
+        bailed before acquiring leaves `refreshing` alone, so we don't
+        wrongly clear it on the OTHER source that currently holds it.
+        The lock release itself is exception-safe so over-release just
+        becomes a no-op."""
+        try:
+            self.refresh_lock.release()
+        except RuntimeError:
+            return  # we didn't hold it — don't touch the flag
+        self.refreshing = False
+
 
 @dataclass
 class ChildRef:
@@ -161,6 +210,12 @@ class ChildRef:
     # of the dirty/clean/etc. colour, so it's obvious the row's
     # "current" state is in transition. Same role as `Repo.refreshing`.
     refreshing: bool = False
+    # Per-child refresh mutex — same role + semantics as
+    # `Repo.refresh_lock` but scoped to this nested checkout. See the
+    # methods below; the lock is excluded from `compare=` and `repr=`
+    # so child equality still depends only on the data fields.
+    refresh_lock: threading.Lock = field(
+        default_factory=threading.Lock, compare=False, repr=False)
     # Full per-checkout state, populated by link_siblings._populate so
     # the row can be coloured with the same precedence as a top-level
     # Repo (dirty / ahead / behind / diverged / no-upstream / clean /
@@ -171,6 +226,33 @@ class ChildRef:
     behind: int = 0
     merging: bool = False
     error: str = ""
+
+    def try_acquire_refresh(self) -> bool:
+        """Non-blocking claim on this child's refresh slot. Same contract
+        as `Repo.try_acquire_refresh`. Note: this is independent of the
+        canonical `self.repo.refresh_lock` — a refresh on the canonical
+        does NOT block a refresh on the nested child checkout. They're
+        separate working trees with separate git state."""
+        if not self.refresh_lock.acquire(blocking=False):
+            return False
+        self.refreshing = True
+        return True
+
+    def acquire_refresh(self, timeout: float = 5.0) -> bool:
+        """Blocking claim with a timeout — see `Repo.acquire_refresh`."""
+        if not self.refresh_lock.acquire(timeout=timeout):
+            return False
+        self.refreshing = True
+        return True
+
+    def release_refresh(self) -> None:
+        """Release this child's slot. See `Repo.release_refresh` —
+        the flag only flips on actual lock release."""
+        try:
+            self.refresh_lock.release()
+        except RuntimeError:
+            return
+        self.refreshing = False
 
 
 # ---------- Subtree config + workspace state ------------------------------
@@ -208,6 +290,31 @@ class Workspace:
     overrides: dict = field(default_factory=dict)
     subtrees: List[SubtreeSpec] = field(default_factory=list)
     cached_repos: list = field(default_factory=list)
+    # Per-workspace fs-watch ignore list. Lines follow gitignore
+    # syntax (`*`, `**`, leading `/` to anchor, trailing `/` for
+    # directory-only, `!` to negate) and are matched against each
+    # event's path relative to the repo root by `core.fs_watcher`.
+    # Anything that matches gets dropped before the debounce timer
+    # resets, so noisy paths (build outputs, language-server
+    # caches, etc.) stop triggering auto-refresh. Empty list (the
+    # default) keeps the existing behaviour — only `.git/` is
+    # filtered, the rest of the working tree triggers refreshes.
+    fs_watch_ignore: List[str] = field(default_factory=list)
+    # True for workspaces auto-minted at launch from the current
+    # working directory (when cwd is inside a git repo not covered
+    # by any configured workspace). Ephemeral workspaces are NOT
+    # persisted to idlegit.workspaces — `save_workspaces` skips them
+    # — and are rendered with `[name]` brackets in the UI so the
+    # user can tell at a glance they're transient.
+    ephemeral: bool = False
+
+    @property
+    def display_name(self) -> str:
+        """Name as shown in every UI surface (title row, workspace
+        switcher, app menu, loading screen). Ephemeral workspaces
+        get `[name]` square brackets so they read as transient at a
+        glance; persisted workspaces render their bare name."""
+        return f"[{self.name}]" if self.ephemeral else self.name
 
 
 # ---------- Background tasks ----------------------------------------------
@@ -283,6 +390,13 @@ class Tasks:
         self._meta: "weakref.WeakKeyDictionary[Task, TaskMetadata]" = (
             weakref.WeakKeyDictionary())
         self.lock = threading.Lock()
+        # Optional sink fired once per task on its first transition into a
+        # terminal status (ok/fail/warn). Invoked OUTSIDE `self.lock` so a
+        # slow sink (e.g. file write on a network mount) can't stall the
+        # worker threads holding the lock. Wired from idlegit.run() to the
+        # task-log writer when task_log_enabled is on; left None
+        # otherwise so the cost is exactly zero.
+        self.on_finished: Optional[Callable[[Task], None]] = None
 
     def add(self, label: str, parent: Optional[Task] = None) -> Task:
         with self.lock:
@@ -315,6 +429,7 @@ class Tasks:
             return self._meta.get(task)
 
     def update(self, task: Task, status: str, message: str = "") -> None:
+        fire_finished = False
         with self.lock:
             was_terminal = task.status in _TERMINAL_STATUSES
             task.status = status
@@ -324,6 +439,16 @@ class Tasks:
             # auto-remove window starts ticking from the right moment.
             if not was_terminal and status in _TERMINAL_STATUSES:
                 task.finished_at = _monotonic()
+                fire_finished = True
+        # Fire the optional sink outside the lock — a slow callback (file
+        # write on a network mount, say) must NOT block worker threads
+        # waiting on `self.lock`. Wrapped in try/except so a bad sink
+        # never crashes a worker mid-update.
+        if fire_finished and self.on_finished is not None:
+            try:
+                self.on_finished(task)
+            except Exception:  # noqa: BLE001 — logger failures are non-fatal
+                pass
 
     def set_label(self, task: Task, label: str) -> None:
         """Mutate the label in place — used by long-running workers (e.g.
@@ -1244,6 +1369,58 @@ class CommitViewModal:
 
 
 @dataclass
+class CommitMsgEditor:
+    """Multi-line commit-message editor opened with Shift+Right on a
+    dirty repo / submodule row. The textarea binds directly to the
+    holder's `.message` attribute — every keystroke mutates the
+    underlying Repo / ChildRef so the main panel's inline field
+    updates in lockstep. There is no separate buffer / apply step.
+
+    Enter / Esc / Tab all close and return focus to the originating
+    row (the row that was selected when the modal opened). `holder`
+    is either a Repo (top-level row) or a ChildRef (submodule row);
+    `parent` is the containing Repo for submodule holders and None
+    for top-level rows — used by the header to render the same
+    'name [branch]' line the repos panel shows.
+
+    `cursor` indexes into `holder.message` directly (flat index, not
+    row/col — row/col is derived at draw + key-handle time by
+    splitting on `\\n`)."""
+    holder: object  # Repo or ChildRef — both expose `.message`
+    parent: Optional["Repo"]
+    label: str  # display name used in the modal header
+    branch: str  # branch string used in the modal header
+    cursor: int = 0
+    # First visible logical-line index; set by the draw routine when
+    # the cursor moves off the bottom edge of the visible window.
+    scroll: int = 0
+
+
+@dataclass
+class HelpPage:
+    """One bundled help page — title, source filename, raw markdown
+    text. The title is parsed from the first `# ...` heading in the
+    body; if no heading exists, the filename (sans extension, sans
+    leading numeric sort prefix like `01-`) is used as a fallback."""
+    title: str
+    filename: str
+    body: str
+
+
+@dataclass
+class HelpScreen:
+    """In-app help browser, opened from the app menu. Two-pane layout:
+    a list of bundled pages on the left, the selected page's rendered
+    content on the right. Left/Right toggles focus between the two
+    panes; Up/Down navigates within the focused pane (page selection
+    on the left, content scroll on the right). Esc closes."""
+    pages: List[HelpPage]
+    selected_page: int = 0
+    content_scroll: int = 0
+    focused_pane: str = "list"  # "list" or "content"
+
+
+@dataclass
 class State:
     repos: List[Repo]
     workspace_name: str
@@ -1318,6 +1495,49 @@ class State:
     auto_ff: bool = True
     prompt_for_branch: bool = True
     prevent_smart_sync_silent_merge: bool = False
+    # When True, smart-sync follows up its canonical alignment by
+    # committing + pushing each parent whose only dirty change is the
+    # submodule gitlink that just got bumped, cascading upward through
+    # any grandparents that also become only-submodule-dirty.
+    auto_push_submodule_parent: bool = True
+    # Task logging — global (not workspace-scoped). When enabled, every
+    # transition of a task to a terminal status (ok/fail/warn) appends a
+    # line to `task_log_path`. `task_log_max_lines <= 0` disables the
+    # rotation cap; any positive value trims oldest lines first when
+    # exceeded.
+    task_log_enabled: bool = False
+    task_log_path: Path = field(default_factory=lambda: Path("tasks.log"))
+    task_log_max_lines: int = 0
+    # Filesystem-watched auto-refresh. When True, idlegit attaches a
+    # watchdog Observer to each repo's working tree + `.git/` and runs
+    # a lightweight per-repo refresh after `auto_refresh_debounce_ms`
+    # of quiet. False returns to the historical "Ctrl+R only" path.
+    # `in_review` is held True while the confirm sub-loop owns input;
+    # fs-watcher fires that land during this window are queued and
+    # drained on review exit so the review pane never shifts under
+    # the user's cursor mid-decision.
+    auto_refresh_on_fs_change: bool = True
+    auto_refresh_debounce_ms: int = 400
+    # When True, idlegit's pull / fetch / sibling-sync operations
+    # pass `--recurse-submodules=on-demand` so a parent's working
+    # tree advances AND its submodule checkouts get synced to the
+    # new gitlinks in one shot. Workspace-scoped via overrides.
+    auto_recurse_submodules: bool = True
+    # When True, Ctrl+R runs `git fetch --all` per repo BEFORE the
+    # local state re-read, so the displayed ahead/behind reflects
+    # actual upstream rather than the last fetch. Off by default —
+    # Ctrl+R has historically been instant + offline, and turning
+    # this on adds ~200ms/repo against a fast remote (more on a
+    # flaky network). The fetch never modifies working trees.
+    fetch_on_manual_refresh: bool = False
+    # Gitignore-style patterns dropped before the watcher's debounce
+    # timer resets. Mirrored from the active workspace's
+    # `fs_watch_ignore` by `apply_workspace_overrides` so a workspace
+    # switch swaps the list cleanly. Compiled into a `pathspec.PathSpec`
+    # by `core.fs_watcher.RepoWatcher` (cached per repo, recompiled on
+    # change-detection).
+    fs_watch_ignore: List[str] = field(default_factory=list)
+    in_review: bool = False
     tasks: Tasks = field(default_factory=Tasks)
     spinner_frame: int = 0
     field_cursor: int = 0
@@ -1335,6 +1555,11 @@ class State:
     workflow_picker: Optional[WorkflowPicker] = None
     align_heads_prompt: Optional[AlignHeadsPrompt] = None
     detached_recovery_prompt: Optional[DetachedRecoveryPrompt] = None
+    # Opened with Shift+Right on a dirty repo or submodule row.
+    # Large textarea bound directly to the row's `.message`.
+    commit_msg_editor: Optional[CommitMsgEditor] = None
+    # In-app help browser, opened from the app menu.
+    help_screen: Optional[HelpScreen] = None
     # Opened from the review screen's right pane when the user presses
     # Enter on a file row — sub-modal of the review's inner loop, not
     # the main loop, so dispatch happens inside handle_confirm rather

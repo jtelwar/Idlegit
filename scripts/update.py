@@ -362,6 +362,8 @@ def main(argv: "list[str] | None" = None) -> int:
 
     section("Done")
     ok(f"updated to {_bold(latest_tag)}")
+    print()
+    print(_green(_bold(f"Updated to {APP_DISPLAY_NAME} {latest_tag}")))
     return 0
 
 

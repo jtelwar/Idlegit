@@ -95,6 +95,36 @@ class TestEnterReview(unittest.TestCase):
 
 
 @unittest.skipUnless(UI_AVAILABLE, "ui module unavailable")
+class TestPullAllShortcut(unittest.TestCase):
+    """Ctrl+P (key code 16) is the workspace-level "ff-only pull every
+    repo" gesture. Like Ctrl+R / Ctrl+S, it's accepted both from the
+    main panel (focused on a repo row) and from the task panel — the
+    workspace-wide commands shouldn't depend on which side has focus."""
+
+    def test_ctrl_p_on_main_panel_returns_pull_all(self) -> None:
+        s = _state(_make_repo("a"))
+        self.assertEqual(handle_main_key(s, 16), "pull-all")
+
+    def test_ctrl_p_on_task_panel_returns_pull_all(self) -> None:
+        s = _state(_make_repo("a"))
+        s.focused_panel = "tasks"
+        self.assertEqual(handle_task_panel_key(s, 16), "pull-all")
+
+    def test_ctrl_p_on_title_row_returns_pull_all(self) -> None:
+        # `selected = -2` is the title row — Ctrl+P should still
+        # trigger pull-all so the user doesn't have to navigate down
+        # into the body to invoke a workspace-wide command.
+        s = _state(_make_repo("a"))
+        s.selected = -2
+        self.assertEqual(handle_main_key(s, 16), "pull-all")
+
+    def test_ctrl_p_on_workspace_row_returns_pull_all(self) -> None:
+        s = _state(_make_repo("a"))
+        s.selected = -1  # workspace switcher row
+        self.assertEqual(handle_main_key(s, 16), "pull-all")
+
+
+@unittest.skipUnless(UI_AVAILABLE, "ui module unavailable")
 class TestEscBehavior(unittest.TestCase):
     def test_esc_no_messages_returns_quit(self) -> None:
         s = _state(_make_repo("a"))
@@ -561,7 +591,7 @@ class TestBranchNamePromptHandler(unittest.TestCase):
         s = _state(_make_repo("a"))
         s.branch_name_prompt = BranchNamePrompt(
             target_label="repo", target_path=Path("/tmp/repo"),
-            default_name="idlegit/wip")
+            default_name="wip-abc")
 
         handle_branch_name_prompt_key(s, ord("-"))
 

@@ -1,13 +1,115 @@
-0.12.0
+0.22.3
+
+### 0.22.3
+- 2026-05-17: updated hint texts
+
+### 0.22.2
+- 2026-05-17: pull-all (Ctrl+P) now adds a parent "pull all" task with `n pulled / n up-to-date / n no upstream / n locked / n failed` summary so the gesture is visible even when every repo silently no-ops; smart-sync icon-state lag fixed — final refresh + link_siblings now runs BEFORE the `refreshing` flags clear and the header task is marked terminal, so the main loop stays on the 100ms tick during the post-sync refresh instead of dropping to its 1s idle cadence
+
+### 0.22.1
+- 2026-05-17: Shortened some hint texts
+
+### 0.22.0
+- 2026-05-17: Ctrl+P — workspace-level `pull --ff-only` against every repo with an upstream; honours `auto_recurse_submodules`, runs up to MAX_PARALLEL_GIT_JOBS in parallel, surfaces per-repo task rows. No-upstream repos are silently skipped; non-FF pulls fail (use the action menu's Pull for a merge fallback)
+
+### 0.21.2
+- 2026-05-17: fix submodule-parent propagation regression — `_propagate_submodule_bump` now waits up to 5s for the parent's refresh lock instead of silently skipping on contention (fs_watcher could grab the lock in the brief window between push completion and sibling-sync start, leaving the parent's gitlink unbumped)
+
+### 0.21.1
+- 2026-05-17: main-screen "edit msg" (Shift+→) hint now shows whenever the focused row is commit-able, not just when a message has been typed
+
+### 0.21.0
+- 2026-05-17: `auto_recurse_submodules` (default on) makes idlegit's pull/fetch pass `--recurse-submodules=on-demand`; `fetch_on_manual_refresh` (default off) makes Ctrl+R fetch from origin per repo before re-reading state so ahead/behind reflects upstream. Both are workspace-overridable and surface as toggle rows in the workspace settings modal's SMART-SYNC section.
+
+### 0.20.3
+- 2026-05-17: fs-watcher gate-order fix — `on_event` / `_on_timer` now check `tasks.has_running()` before `repo.refreshing` so user edits during a commit pipeline route to the post-task drain queue instead of being dropped; `release_refresh` no longer clears the spinner flag when the underlying lock was already unlocked; `fire_refresh` bails when the watcher was torn down mid-drain
+
+### 0.20.2
+- 2026-05-17: per-repo refresh mutex — every refresh source (fs_watcher, Ctrl+R, action menu, commit pipeline) now claims `Repo.refresh_lock` non-blocking and bails when another source already holds it, eliminating cross-source races on the row's status fields
+
+### 0.20.1
+- 2026-05-17: help page added for auto-refresh (toggle, debounce, per-workspace gitignore-style ignore list); shortcuts + configuration pages cross-link to it
+
+### 0.20.0
+- 2026-05-17: per-workspace `fs_watch_ignore` (gitignore-style patterns) editable in the workspace settings modal; auto-refresh now uses a single persistent debounce thread per repo (was spawning a thread per event under bursts — could exhaust per-process thread limits) and suspends entirely while any action/task is running, draining one refresh per affected repo on the has-running → idle transition
+
+### 0.19.2
+- 2026-05-17: Esc on the startup loading screen now cancels the parallel refresh and exits cleanly instead of queuing behind the in-flight git calls
+
+### 0.19.1
+- 2026-05-16: fs-watch filter now ignores all `.git/` writes so `git status`'s stat-cache refresh of `.git/index` no longer loops the auto-refresh into a flicker
+
+### 0.19.0
+- 2026-05-16: filesystem-watched auto-refresh — repo rows update on external edits without Ctrl+R; toggle + debounce cycle live under the app menu's AUTO REFRESH section
+
+### 0.18.3
+- 2026-05-16: refresh spinners cover every post-push action and propagation step
+
+### 0.18.2
+- 2026-05-16: auto-push-submodule-parent now fires from the regular push pipeline too
+
+### 0.18.1
+- 2026-05-16: task panel bg consistent across terminals; "idlegit"/"smart-sync" stripped from commit/stash/branch artifacts
+
+### 0.18.0
+- 2026-05-15: ephemeral workspaces — launching from a git repo auto-creates a `[bracketed]` workspace; "Save as workspace…" promotes it
+
+### 0.17.3
+- 2026-05-15: README trimmed
+
+### 0.17.2
+- 2026-05-15: dropped F5 refresh binding; help modal header polish
+
+### 0.17.1
+- 2026-05-15: help modal body height derived from actual modal height (no more overflow on short terminals)
+
+### 0.17.0
+- 2026-05-15: in-app help browser — new "Help" entry in the app menu with bundled markdown pages
+
+### 0.16.1
+- 2026-05-15: commit-message editor polish — caret visible, textarea bg darkened, header repainted on modal bg
+
+### 0.16.0
+- 2026-05-15: new commit-message editor modal — Shift+Right on a dirty repo opens a multi-line textarea bound directly to the row's `.message`; Enter/Esc close
+
+### 0.15.1
+- 2026-05-15: Tab closes any modal that was opened by Tab — fixes `task_action_menu`; other Esc-cancel prompts stay Esc-only
+
+### 0.15.0
+- 2026-05-15: in-app task-logging on/off toggle in the app menu, persisted to `idlegit.conf` via new `set_conf_value` line-based writer; installer pre-creates an empty `tasks.log`
+
+### 0.14.4
+- 2026-05-15: pyproject metadata fleshed out (URLs, keywords, classifiers, `[tool.ruff]`); install.py bails on Windows; git_ops helpers gain docstrings
+
+### 0.14.3
+- 2026-05-15: LICENSE switched to MIT; added CONTRIBUTING.md, SECURITY.md, CODE_OF_CONDUCT.md; README gains CI / license / Python badges
+
+### 0.14.2
+- 2026-05-15: updater prints a final `Updated to Idlegit vX.Y.Z` line
+
+### 0.14.1
+- 2026-05-15: installer prints a final `Installed Idlegit vX.Y.Z` line
+
+### 0.14.0
+- 2026-05-15: optional task logging — terminal task transitions append to `tasks.log`; TASK LOGGING section in app menu (status / path / size / Open / Clear); line-count cap with oldest-first rotation
+
+### 0.13.1
+- 2026-05-15: added `tests.yml` GitHub Action; `release.yml` now `needs: tests` so a failing tree can't cut a release
+
+### 0.13.0
+- 2026-05-15: smart-sync auto-pushes parent repos whose only dirt is the bumped submodule gitlink (new `default_auto_push_submodule_parent` toggle, cascades through grandparents)
+
+### 0.12.1
+- 2026-05-14: Enter on the Idlegit title row now opens the app menu (Tab still works) to match the row's underline affordance; hint relabelled Tab → Enter
 
 ### 0.12.0
-- 2026-05-14: cross-platform phase 3 — wcwidth-aware `_display_width`/`_slice_to_width` helpers in `ui/geometry.py` so `truncate`/`end_truncate`/`safe_addstr`/`wrap_label_value` measure CJK + wide chars in display cells (fallback to `len()` if wcwidth unavailable); new `ui/glyphs.py` centralises spinner with locale-aware ASCII fallback (`IDLEGIT_ASCII_GLYPHS=1` env override); added `pyproject.toml` for `pipx install ".[windows]"` install path; README gains Windows install section
+- 2026-05-14: wcwidth-aware `_display_width`/`_slice_to_width` helpers in `ui/geometry.py` so `truncate`/`end_truncate`/`safe_addstr`/`wrap_label_value` measure CJK + wide chars in display cells (fallback to `len()` if wcwidth unavailable); new `ui/glyphs.py` centralises spinner with locale-aware ASCII fallback (`IDLEGIT_ASCII_GLYPHS=1` env override); added `pyproject.toml` for `pipx install ".[windows]"` install path; README gains Windows install section
 
 ### 0.11.4
-- 2026-05-14: cross-platform phase 2 — `_open_in_browser` routes via stdlib `webbrowser` (adds Windows support, drops subprocess shell-out); tests use `os.devnull` not `/dev/null` literal; `scripts/install.py` splits PATH on `os.pathsep` and gates Homebrew bindir hints + shell-rc edits behind non-win32
+- 2026-05-14: `_open_in_browser` routes via stdlib `webbrowser` (adds Windows support, drops subprocess shell-out); tests use `os.devnull` not `/dev/null` literal; `scripts/install.py` splits PATH on `os.pathsep` and gates Homebrew bindir hints + shell-rc edits behind non-win32
 
 ### 0.11.3
-- 2026-05-14: cross-platform phase 1 — move `import termios` inline behind `sys.platform != "win32"` guard so idlegit.py is importable on Windows
+- 2026-05-14: move `import termios` inline behind `sys.platform != "win32"` guard so idlegit.py is importable on Windows
 
 ### 0.11.2
 - 2026-05-14: workers refactor, expanded git integration tests, main_screen polish
@@ -49,7 +151,7 @@
 - 2026-04-30: core scaffolding — workers.py, git_ops.py, models.py introduced
 
 ### 0.2.0
-- 2026-04-28: major idlegit.py expansion (~1100 lines); README and conf updates
+- 2026-04-28: idlegit.py mvp (~1100 lines); README and conf updates
 
 ### 0.1.0
 - 2026-04-28: initial commit

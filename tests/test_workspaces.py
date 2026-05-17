@@ -21,7 +21,8 @@ from _helpers import (  # noqa: E402
 from core.config import (  # noqa: E402
     Config, apply_workspace_overrides, base_value_for_override,
     coerce_override_value, get_load_warnings, load_config,
-    load_workspaces, save_workspaces, state_attr_value_from_override,
+    load_workspaces, save_workspaces, set_conf_value,
+    state_attr_value_from_override,
 )
 from core.models import (  # noqa: E402
     State, Workspace, WorkspaceCreator, WorkspaceDraft,
@@ -155,6 +156,101 @@ class TestApplyWorkspaceOverrides(unittest.TestCase):
         s = _state(_make_repo("a"))
         apply_workspace_overrides(s, cfg, ws)
         self.assertTrue(s.prevent_smart_sync_silent_merge)
+
+
+class TestSetConfValue(unittest.TestCase):
+    """`set_conf_value` is the writer behind app-menu toggles (today:
+    task logging on/off). Comments + ordering MUST round-trip — the
+    bundled `idlegit.default.conf` ships an inline-comment-per-key hint,
+    and losing those on every UI toggle would shred the docs the user
+    relies on. These tests pin down the preservation contract."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp_path = Path(self._tmp.name) / "idlegit.conf"
+        self._patch = mock.patch.object(config, "CONFIG_FILE", self.tmp_path)
+        self._patch.start()
+        self.addCleanup(self._patch.stop)
+        # `_ensure_config_ready` seeds CONFIG_FILE from the bundled
+        # template; the patched path is empty so it triggers the seed
+        # on first call. Patch `_ensure_config_ready` to a no-op
+        # instead so the tests run hermetically without depending on
+        # the template's exact contents — we write the seed we want.
+        self._ensure_patch = mock.patch.object(
+            config, "_ensure_config_ready", lambda: None)
+        self._ensure_patch.start()
+        self.addCleanup(self._ensure_patch.stop)
+
+    def _seed(self, text: str) -> None:
+        self.tmp_path.parent.mkdir(parents=True, exist_ok=True)
+        self.tmp_path.write_text(text, encoding="utf-8")
+
+    def test_updates_existing_key_in_place(self) -> None:
+        self._seed("[idlegit]\ntask_log_enabled = false\n")
+        self.assertTrue(set_conf_value("task_log_enabled", "true"))
+        text = self.tmp_path.read_text(encoding="utf-8")
+        self.assertIn("task_log_enabled = true", text)
+        self.assertNotIn("task_log_enabled = false", text)
+
+    def test_preserves_inline_comment(self) -> None:
+        # The default template ships every key with a `; explanation`
+        # comment. The writer must keep that comment intact so the
+        # docs survive each UI toggle.
+        self._seed(
+            "[idlegit]\n"
+            "task_log_enabled = false   ; off by default\n")
+        self.assertTrue(set_conf_value("task_log_enabled", "true"))
+        text = self.tmp_path.read_text(encoding="utf-8")
+        self.assertIn("task_log_enabled = true", text)
+        self.assertIn("; off by default", text)
+
+    def test_preserves_unrelated_keys_and_comments(self) -> None:
+        self._seed(
+            "; top-of-file note\n"
+            "[idlegit]\n"
+            "suggest_added = 5   ; keep me\n"
+            "task_log_enabled = false\n"
+            "name_truncation = middle\n")
+        self.assertTrue(set_conf_value("task_log_enabled", "true"))
+        text = self.tmp_path.read_text(encoding="utf-8")
+        self.assertIn("; top-of-file note", text)
+        self.assertIn("suggest_added = 5", text)
+        self.assertIn("; keep me", text)
+        self.assertIn("name_truncation = middle", text)
+        self.assertIn("task_log_enabled = true", text)
+
+    def test_appends_missing_key_under_idlegit_section(self) -> None:
+        self._seed("[idlegit]\nsuggest_added = 5\n")
+        self.assertTrue(set_conf_value("task_log_enabled", "true"))
+        text = self.tmp_path.read_text(encoding="utf-8")
+        self.assertIn("task_log_enabled = true", text)
+        # The new key sits inside the [idlegit] section (no other
+        # sections exist yet, so it lands at the end of the file).
+        self.assertIn("[idlegit]", text)
+
+    def test_round_trip_via_load_config(self) -> None:
+        # The whole point of the writer: a toggle persists across a
+        # reload. Write `task_log_enabled = true`, reload the Config,
+        # and verify the live value reflects the change.
+        self._seed("[idlegit]\ntask_log_enabled = false\n")
+        self.assertTrue(set_conf_value("task_log_enabled", "true"))
+        cfg = load_config()
+        self.assertTrue(cfg.task_log_enabled)
+
+    def test_handles_missing_file_by_seeding(self) -> None:
+        # No prior conf exists — writer must create one with the new
+        # key under [idlegit] rather than failing.
+        self.assertFalse(self.tmp_path.exists())
+        # `_ensure_config_ready` is patched to no-op in setUp, so the
+        # writer's own missing-file path is what's being exercised.
+        # That path expects the file to exist (read_text fails OSError),
+        # so simulate the post-`_ensure_config_ready` state with an
+        # empty section header.
+        self._seed("[idlegit]\n")
+        self.assertTrue(set_conf_value("task_log_enabled", "true"))
+        text = self.tmp_path.read_text(encoding="utf-8")
+        self.assertIn("task_log_enabled = true", text)
 
 
 class TestBaseValueLookup(unittest.TestCase):
@@ -651,6 +747,21 @@ class TestTitleRowTab(unittest.TestCase):
         handle_main_key(s, 9)  # Tab
         self.assertIsNotNone(s.app_menu)
 
+    def test_enter_on_title_row_opens_picker(self) -> None:
+        # Enter matches the title row's underline affordance — same
+        # action as Tab, kept in parity so muscle memory works either
+        # way. Verified for all three Enter codepoints the rest of the
+        # app recognises (10, 13, curses.KEY_ENTER).
+        ws_a = Workspace(name="A", folders=[Path("/a")])
+        ws_b = Workspace(name="B", folders=[Path("/b")])
+        for key in (10, 13, curses.KEY_ENTER):
+            with self.subTest(key=key):
+                s = _state(_make_repo("r"), workspaces=[ws_a, ws_b])
+                s.selected = -2
+                self.assertIsNone(s.app_menu)
+                handle_main_key(s, key)
+                self.assertIsNotNone(s.app_menu)
+
 
 # ---------- Workspaces picker --------------------------------------------
 
@@ -691,10 +802,18 @@ class TestAppMenu(unittest.TestCase):
         handle_app_menu_key(s, curses.KEY_DOWN)  # ws 2 → Create
         row = self._focused(s)
         self.assertEqual(row.kind, "create_workspace")
-        # Down at the bottom doesn't overshoot.
-        handle_app_menu_key(s, curses.KEY_DOWN)
+
+    def test_down_past_workspaces_descends_into_task_logging(self) -> None:
+        # Below the WORKSPACES section sits the TASK LOGGING section
+        # (toggle / open / clear actions); walking all the way Down
+        # lands on the final clear_task_log action and stops there.
+        s = self._state()
+        open_app_menu(s)
+        for _ in range(50):
+            handle_app_menu_key(s, curses.KEY_DOWN)
         row = self._focused(s)
-        self.assertEqual(row.kind, "create_workspace")
+        self.assertEqual(row.kind, "app_action")
+        self.assertEqual(row.attr_name, "clear_task_log")
 
     def test_enter_on_workspace_calls_switch(self) -> None:
         s = self._state()
@@ -859,6 +978,121 @@ class TestWorkspaceMenuFolders(unittest.TestCase):
             handle_workspace_menu_key(s, 10)  # commit
         self.assertEqual(len(s.active_workspace.folders), 2)
         self.assertEqual(str(s.active_workspace.folders[1]), "/var")
+
+
+@unittest.skipUnless(UI_AVAILABLE, "ui imports unavailable")
+class TestWorkspaceMenuIgnorePatterns(unittest.TestCase):
+    """FILE WATCH IGNORE section of the workspace settings modal.
+    The flow mirrors the folder rows pattern (`ignore_pattern` rows
+    + an `add_ignore_pattern` sentinel sharing the same `editing` /
+    `edit_buffer` primitive), but with no live discover_repos
+    validation and no "can't remove the last one" guard — the empty
+    list is the default and reverts the watcher to its un-filtered
+    behaviour."""
+
+    def _state(self, patterns) -> State:
+        cfg = Config()
+        ws = Workspace(name="W", folders=[Path("/tmp")],
+                       fs_watch_ignore=list(patterns))
+        s = _state(_make_repo("r"), workspaces=[ws],
+                   active_workspace_index=0, base_config=cfg)
+        # Mirror what apply_workspace_overrides would do at startup —
+        # the modal trusts state.fs_watch_ignore is in sync with the
+        # active workspace's patterns.
+        s.fs_watch_ignore = list(patterns)
+        return s
+
+    def _focus_row_by_kind(self, s: State, kind: str,
+                           index: int = 0) -> None:
+        menu = s.workspace_menu
+        seen = 0
+        for i, row in enumerate(menu.rows):
+            if row.kind == kind:
+                if seen == index:
+                    menu.selected = i
+                    return
+                seen += 1
+        raise AssertionError(f"row of kind={kind!r} idx={index} not found")
+
+    def test_open_includes_ignore_rows_and_add_sentinel(self) -> None:
+        s = self._state(["*.log", "build/**"])
+        open_workspace_menu(s)
+        kinds = [r.kind for r in s.workspace_menu.rows]
+        self.assertEqual(kinds.count("ignore_pattern"), 2)
+        self.assertEqual(kinds.count("add_ignore_pattern"), 1)
+
+    def test_add_sentinel_commits_new_pattern(self) -> None:
+        s = self._state([])
+        open_workspace_menu(s)
+        self._focus_row_by_kind(s, "add_ignore_pattern", 0)
+        handle_workspace_menu_key(s, 10)  # Enter to start edit
+        self.assertTrue(s.workspace_menu.editing)
+        self.assertEqual(s.workspace_menu.edit_buffer, "")
+        for ch in "*.log":
+            handle_workspace_menu_key(s, ord(ch))
+        with mock.patch("ui.modals.workspace_menu.save_workspaces"):
+            handle_workspace_menu_key(s, 10)  # Enter to commit
+        self.assertFalse(s.workspace_menu.editing)
+        self.assertEqual(s.active_workspace.fs_watch_ignore, ["*.log"])
+        # State mirror is also updated so the next fs event recompiles
+        # against the new list.
+        self.assertEqual(s.fs_watch_ignore, ["*.log"])
+
+    def test_enter_on_pattern_loads_buffer_for_edit(self) -> None:
+        s = self._state(["*.log"])
+        open_workspace_menu(s)
+        self._focus_row_by_kind(s, "ignore_pattern", 0)
+        handle_workspace_menu_key(s, 10)
+        self.assertTrue(s.workspace_menu.editing)
+        self.assertEqual(s.workspace_menu.edit_buffer, "*.log")
+
+    def test_edit_commits_replacement(self) -> None:
+        s = self._state(["*.log"])
+        open_workspace_menu(s)
+        self._focus_row_by_kind(s, "ignore_pattern", 0)
+        handle_workspace_menu_key(s, 10)  # enter edit
+        s.workspace_menu.edit_buffer = "build/**"
+        s.workspace_menu.edit_cursor = len("build/**")
+        with mock.patch("ui.modals.workspace_menu.save_workspaces"):
+            handle_workspace_menu_key(s, 10)  # commit
+        self.assertEqual(
+            s.active_workspace.fs_watch_ignore, ["build/**"])
+        self.assertEqual(s.fs_watch_ignore, ["build/**"])
+
+    def test_esc_in_edit_mode_cancels_without_persisting(self) -> None:
+        s = self._state(["*.log"])
+        open_workspace_menu(s)
+        self._focus_row_by_kind(s, "ignore_pattern", 0)
+        handle_workspace_menu_key(s, 10)
+        s.workspace_menu.edit_buffer = "newpattern"
+        handle_workspace_menu_key(s, 27)  # Esc
+        self.assertFalse(s.workspace_menu.editing)
+        self.assertEqual(s.active_workspace.fs_watch_ignore, ["*.log"])
+        # Modal itself stays open — Esc only exits the inner edit.
+        self.assertIsNotNone(s.workspace_menu)
+
+    def test_backspace_removes_pattern_including_when_last(self) -> None:
+        # Unlike folders, removing the last ignore pattern is fine —
+        # an empty list means "watch everything", which is the
+        # default behaviour anyway.
+        s = self._state(["*.log"])
+        open_workspace_menu(s)
+        self._focus_row_by_kind(s, "ignore_pattern", 0)
+        with mock.patch("ui.modals.workspace_menu.save_workspaces"):
+            handle_workspace_menu_key(s, curses.KEY_BACKSPACE)
+        self.assertEqual(s.active_workspace.fs_watch_ignore, [])
+        self.assertEqual(s.fs_watch_ignore, [])
+
+    def test_backspace_at_middle_index_renumbers_remaining(self) -> None:
+        s = self._state(["*.log", "build/**", "dist/**"])
+        open_workspace_menu(s)
+        # Focus the middle pattern row.
+        self._focus_row_by_kind(s, "ignore_pattern", 1)
+        with mock.patch("ui.modals.workspace_menu.save_workspaces"):
+            handle_workspace_menu_key(s, curses.KEY_BACKSPACE)
+        # Remaining list keeps order, "build/**" is gone.
+        self.assertEqual(
+            s.active_workspace.fs_watch_ignore, ["*.log", "dist/**"])
 
 
 # ---------- Sanity: WorkspaceCreator dataclass init -----------------------

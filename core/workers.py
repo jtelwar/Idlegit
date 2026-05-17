@@ -15,7 +15,9 @@ from .models import (
 )
 from .git_ops import (
     apply_lfs_tracking, discover_repos, dispatch_workflow, first_line,
-    get_run_view, gh_available, git, link_siblings, list_branches,
+    get_run_view, gh_available, git,
+    has_only_submodule_pointer_changes,
+    link_siblings, list_branches,
     list_recent_runs, merge_remote_workflow_states, parse_github_slug,
     refresh_repo, safe_stage_all, signature_mtime, suggest_commit_message,
     suggest_commit_message_at, suggest_commit_message_for_paths,
@@ -32,33 +34,57 @@ _align_heads_prompt_lock = threading.Lock()
 
 def _pull_prefer_ff_then_merge(
         path: Path, tasks: Tasks, name: str, *,
-        allow_merge_fallback: bool) -> bool:
+        allow_merge_fallback: bool,
+        recurse_submodules: bool = False,
+        parent_task: "Optional[Task]" = None) -> bool:
     """`git pull --ff-only`, then optionally `git pull --no-rebase --no-edit`
     when the caller allows merge commits. No rebase / no force. Returns
     False on failure (a task row records the error). On success: when HEAD
     moved, adds an ok task; when already up to date, no task (matches the
-    commit pipeline's historical no-noise behaviour)."""
+    commit pipeline's historical no-noise behaviour).
+
+    `recurse_submodules` (default False for compatibility) maps to
+    `--recurse-submodules=on-demand`: git updates each submodule's
+    working tree only when the parent's gitlink moved to a commit the
+    submodule hasn't seen, matching what the user expects from "pull
+    the parent and have submodule code on disk match." Callers pass
+    `state.auto_recurse_submodules` so the workspace setting drives
+    every pull through this helper.
+
+    `parent_task` (default None) — when supplied, every child task row
+    added by this call gets parented under it via `tasks.add(..., parent=...)`.
+    Used by `kick_off_pull_all` to nest per-repo task rows beneath a
+    single workspace-wide "pull all" parent so the user can see at a
+    glance which gesture they're looking at — without changing the
+    no-noise behaviour for "already up to date" repos (those still
+    add no task at all)."""
     _, head_before, _ = git(path, ["rev-parse", "HEAD"])
-    rc, _, err = git(path, ["pull", "--ff-only"])
+    pull_args = ["pull", "--ff-only"]
+    if recurse_submodules:
+        pull_args.append("--recurse-submodules=on-demand")
+    rc, _, err = git(path, pull_args)
     _, head_after, _ = git(path, ["rev-parse", "HEAD"])
     if rc == 0:
         if head_before.strip() != head_after.strip():
-            t = tasks.add(f"{name}: pull")
+            t = tasks.add(f"{name}: pull", parent=parent_task)
             tasks.update(t, "ok")
         return True
     if not allow_merge_fallback:
-        t = tasks.add(f"{name}: pull --ff-only")
+        t = tasks.add(f"{name}: pull --ff-only", parent=parent_task)
         tasks.update(t, "fail",
                      first_line(err) or "cannot fast-forward")
         return False
-    rc2, _, err2 = git(path, ["pull", "--no-rebase", "--no-edit"])
+    merge_args = ["pull", "--no-rebase", "--no-edit"]
+    if recurse_submodules:
+        merge_args.append("--recurse-submodules=on-demand")
+    rc2, _, err2 = git(path, merge_args)
     _, head_after2, _ = git(path, ["rev-parse", "HEAD"])
     if rc2 != 0:
-        t = tasks.add(f"{name}: pull")
+        t = tasks.add(f"{name}: pull", parent=parent_task)
         tasks.update(t, "fail",
                      first_line(err2) or first_line(err) or "pull failed")
         return False
-    t = tasks.add(f"{name}: pull")
+    t = tasks.add(f"{name}: pull", parent=parent_task)
     detail = ""
     if head_before.strip() != head_after2.strip():
         detail = "merged upstream"
@@ -581,27 +607,54 @@ def kick_off_action(state: State, action_id: str, *,
     }
     should_refresh = action_id in known_actions
     target_child = _find_child_at(target_parent, target_path)
-    # Flip refreshing SYNCHRONOUSLY before returning so the very next
-    # redraw shows the spinner — the daemon worker may not run for a
-    # tick, and even a 100ms gap reads as "did anything happen?".
+    # Claim the refresh slot SYNCHRONOUSLY before returning so the
+    # very next redraw shows the spinner — the daemon worker may not
+    # run for a tick, and even a 100ms gap reads as "did anything
+    # happen?". `try_acquire_refresh` doubles as a mutex against any
+    # other refresh source (fs_watcher's debounce timer, a concurrent
+    # Ctrl+R) starting on the same target. The UI gate in main_loop
+    # already prevents opening the action menu over a refreshing row,
+    # but there's a tiny window where an fs event could win the race
+    # between menu-open and action-dispatch — we surface a warn task
+    # rather than silently racing the existing refresh.
+    repo_acquired = False
+    child_acquired = False
     if target_repo is not None:
-        target_repo.refreshing = True
+        repo_acquired = target_repo.try_acquire_refresh()
+        if not repo_acquired:
+            t = state.tasks.add(f"{target_label}: skipped")
+            state.tasks.update(
+                t, "warn", "refresh in progress — try again")
+            return
     if target_child is not None:
-        target_child.refreshing = True
+        child_acquired = target_child.try_acquire_refresh()
+        if not child_acquired:
+            # Release the parent's claim before bailing so we don't
+            # strand its lock.
+            if repo_acquired and target_repo is not None:
+                target_repo.release_refresh()
+            t = state.tasks.add(f"{target_label}: skipped")
+            state.tasks.update(
+                t, "warn", "refresh in progress — try again")
+            return
 
     def worker() -> None:
       started_at = time.monotonic()
       try:
         if action_id == "fetch":
             t = state.tasks.add(f"{target_label}: fetch")
-            rc, _, err = git(target_path, ["fetch", "--all"])
+            fetch_args = ["fetch", "--all"]
+            if state.auto_recurse_submodules:
+                fetch_args.append("--recurse-submodules=on-demand")
+            rc, _, err = git(target_path, fetch_args)
             state.tasks.update(
                 t, "ok" if rc == 0 else "fail",
                 "" if rc == 0 else first_line(err))
         elif action_id == "pull":
             ok = _pull_prefer_ff_then_merge(
                 target_path, state.tasks, target_label,
-                allow_merge_fallback=True)
+                allow_merge_fallback=True,
+                recurse_submodules=state.auto_recurse_submodules)
             if not ok:
                 return
         elif action_id == "push":
@@ -617,7 +670,8 @@ def kick_off_action(state: State, action_id: str, *,
             if has_upstream:
                 ok_pull = _pull_prefer_ff_then_merge(
                     target_path, state.tasks, target_label,
-                    allow_merge_fallback=True)
+                    allow_merge_fallback=True,
+                    recurse_submodules=state.auto_recurse_submodules)
                 if not ok_pull:
                     state.tasks.update(t, "fail", "skipped: cannot pull")
                     return
@@ -785,12 +839,16 @@ def kick_off_action(state: State, action_id: str, *,
                 time.monotonic() - started_at)
             if remaining > 0:
                 time.sleep(remaining)
-        # Always release the refreshing flags — even on early-return
-        # / exception paths — so a row never gets stuck spinning.
-        if target_repo is not None:
-            target_repo.refreshing = False
-        if target_child is not None:
-            target_child.refreshing = False
+        # Always release the refresh slot — even on early-return /
+        # exception paths — so a row never gets stuck spinning AND
+        # so the underlying lock is freed for fs_watcher / Ctrl+R to
+        # acquire next. `release_refresh` is idempotent on the lock
+        # (swallows RuntimeError if not held), so the guard against
+        # double-release is built in.
+        if repo_acquired and target_repo is not None:
+            target_repo.release_refresh()
+        if child_acquired and target_child is not None:
+            target_child.release_refresh()
 
     threading.Thread(target=worker, daemon=True).start()
 
@@ -968,10 +1026,27 @@ def kick_off_add_tag(state: State, target_label: str,
     safe: it only writes a new ref. Pushing the tag is a separate
     operation we don't run automatically."""
     target_child = _find_child_at(target_parent, target_path)
+    # Same try_acquire / warn-and-bail pattern as kick_off_action — a
+    # tag write is a fast ref-only op, but it still mutates `.git/`
+    # and would race a concurrent refresh on the row's flags.
+    repo_acquired = False
+    child_acquired = False
     if target_repo is not None:
-        target_repo.refreshing = True
+        repo_acquired = target_repo.try_acquire_refresh()
+        if not repo_acquired:
+            t = state.tasks.add(f"{target_label}: skipped")
+            state.tasks.update(
+                t, "warn", "refresh in progress — try again")
+            return
     if target_child is not None:
-        target_child.refreshing = True
+        child_acquired = target_child.try_acquire_refresh()
+        if not child_acquired:
+            if repo_acquired and target_repo is not None:
+                target_repo.release_refresh()
+            t = state.tasks.add(f"{target_label}: skipped")
+            state.tasks.update(
+                t, "warn", "refresh in progress — try again")
+            return
 
     def worker() -> None:
         try:
@@ -987,10 +1062,10 @@ def kick_off_add_tag(state: State, target_label: str,
                 t, "ok" if rc == 0 else "fail",
                 "" if rc == 0 else first_line(err))
         finally:
-            if target_repo is not None:
-                target_repo.refreshing = False
-            if target_child is not None:
-                target_child.refreshing = False
+            if repo_acquired and target_repo is not None:
+                target_repo.release_refresh()
+            if child_acquired and target_child is not None:
+                target_child.release_refresh()
 
     threading.Thread(target=worker, daemon=True).start()
 
@@ -1013,7 +1088,12 @@ def kick_off_clone(state: State, url: str, dest: Path, branch: str,
         if on_done is not None:
             try:
                 on_done(ok, msg)
-            except Exception:
+            except Exception:  # noqa: BLE001
+                # Caller-supplied callback is best-effort; never let a
+                # bad sink (e.g. a UI hook that races a teardown) crash
+                # the daemon thread. Failure here is invisible to the
+                # main loop, but the task row already records the real
+                # ok/fail outcome a few lines above.
                 pass
 
     threading.Thread(target=worker, daemon=True).start()
@@ -1254,7 +1334,8 @@ def _commit_worker_inner(state: State, repo: Repo, msg: str,
     # fails.
     if repo.upstream:
         ok_pull = _pull_prefer_ff_then_merge(
-            repo.path, tasks, name, allow_merge_fallback=True)
+            repo.path, tasks, name, allow_merge_fallback=True,
+            recurse_submodules=state.auto_recurse_submodules)
         if not ok_pull:
             return
 
@@ -1363,8 +1444,34 @@ def _commit_worker_inner(state: State, repo: Repo, msg: str,
     for sib_repo, sib_path in repo.siblings:
         t = tasks.add(
             f"  ↳ sync {state.task_repo_label(sib_repo)}", parent=push_task)
-        ok, sync_msg = sync_sibling(sib_path, repo.branch)
+        # Flip the matching ChildRef's `refreshing` flag for the
+        # duration of the sync so the submodule row inside `sib_repo`
+        # animates while its on-disk checkout is being advanced. The
+        # try/finally guarantees the flag is cleared even on a
+        # mid-sync exception, otherwise the row would spin forever.
+        _set_child_ref_refreshing(sib_repo, sib_path, True)
+        try:
+            ok, sync_msg = sync_sibling(sib_path, repo.branch)
+        finally:
+            _set_child_ref_refreshing(sib_repo, sib_path, False)
         tasks.update(t, "ok" if ok else "fail", sync_msg)
+
+    # Same parent-propagation as the canonical-sync path: once the
+    # sibling submodule checkouts inside each parent advance to the
+    # new HEAD, the parent's gitlink to this repo is stale. If the
+    # only dirty change on the parent is that gitlink, auto-stage +
+    # commit + push (cascading upward through any grandparents that
+    # also gain only-submodule dirt). Gated on the same toggle the
+    # canonical-sync path uses.
+    if state.auto_push_submodule_parent and repo.siblings:
+        try:
+            _cascade_propagate_to_parents(state, [repo])
+        except Exception as e:  # noqa: BLE001
+            # Propagation failures shouldn't poison the push pipeline
+            # — the push itself already landed. Surface as a warn
+            # task and move on.
+            t = tasks.add("  ↳ propagate to parents", parent=push_task)
+            tasks.update(t, "fail", first_line(str(e)))
 
 
 def commit_worker_for_child(state: State, parent: Repo, ref: ChildRef,
@@ -1524,21 +1631,57 @@ def _commit_worker_for_child_inner(state: State, parent: Repo,
     # Build the post-push sync targets. For tracked canonicals we sync
     # the top-level checkout first; for synthetic canonicals there's no
     # workspace top-level, so we only fan out to the sibling parents.
-    targets: List[Tuple[str, Path]] = []
+    # Each target also carries an optional `(parent, sub_path)` pair
+    # so the per-row spinner toggle has something to flag — the
+    # top-level canonical's spinner lives on `ref.repo.refreshing`
+    # itself; the in-parent submodule rows live on a ChildRef.
+    targets: List[Tuple[str, Path, Optional[Tuple[Repo, Path]]]] = []
     ref_label = state.task_repo_label(ref.repo)
     if not ref.repo.synthetic:
-        targets.append((f"top-level {ref_label}", ref.repo.path))
+        targets.append((f"top-level {ref_label}", ref.repo.path, None))
     for other_parent, other_path in ref.repo.siblings:
         if other_path == ref.nested_path:
             continue
         targets.append(
             (f"{ref_label} in {state.task_repo_label(other_parent)}",
-             other_path))
+             other_path, (other_parent, other_path)))
 
-    for label, target_path in targets:
+    for label, target_path, child_pair in targets:
         t = tasks.add(f"  ↳ sync {label}", parent=push_task)
-        ok, sync_msg = sync_sibling(target_path, nested_branch)
+        # Flip the matching spinner on for the duration of the sync.
+        # For the top-level canonical that's `ref.repo.refreshing`;
+        # for an in-parent nested copy it's the ChildRef on the
+        # other parent. The try/finally guarantees the flag clears
+        # even on a mid-sync exception so the row can't spin forever.
+        if child_pair is None:
+            ref.repo.refreshing = True
+        else:
+            _set_child_ref_refreshing(
+                child_pair[0], child_pair[1], True)
+        try:
+            ok, sync_msg = sync_sibling(target_path, nested_branch)
+        finally:
+            if child_pair is None:
+                ref.repo.refreshing = False
+            else:
+                _set_child_ref_refreshing(
+                    child_pair[0], child_pair[1], False)
         tasks.update(t, "ok" if ok else "fail", sync_msg)
+
+    # Same parent-propagation as the canonical-sync path: each
+    # parent containing this canonical (whether top-level or just
+    # another nested copy) now has a stale gitlink to the new
+    # commit. If the parent's only dirt is that gitlink, auto-bump
+    # + push. `ref.repo.siblings` lists the parents; the propagation
+    # helper skips the parent that owns this nested checkout when
+    # its own gitlink isn't stale yet (it'll have been advanced as
+    # part of the in-place commit above).
+    if state.auto_push_submodule_parent and ref.repo.siblings:
+        try:
+            _cascade_propagate_to_parents(state, [ref.repo])
+        except Exception as e:  # noqa: BLE001
+            t = tasks.add("  ↳ propagate to parents", parent=push_task)
+            tasks.update(t, "fail", first_line(str(e)))
 
 
 def kick_off_workers(state: State, blocks: List[ReviewBlock]) -> None:
@@ -1572,14 +1715,18 @@ def kick_off_workers(state: State, blocks: List[ReviewBlock]) -> None:
         if not msg:
             continue
         repo.message = ""
-        if repo.refreshing:  # another action owns this repo — skip
+        # Claim the refresh slot via the mutex (replaces the previous
+        # `if repo.refreshing: continue` flag check + later `= True`
+        # assignment). `try_acquire_refresh` is atomic: either we own
+        # the slot for the entire commit + post-commit refresh, or
+        # another source already has it and we skip this row.
+        if not repo.try_acquire_refresh():
             continue
         block = repo_blocks.get(id(repo))
         repo_cands = list(block.lfs_candidates) if block else []
         staged = dict(block.staged_paths) if block else {}
         amend = bool(block.amend) if block else False
         repo_plans.append((repo, msg, repo_cands, staged, amend))
-        repo.refreshing = True  # lock synchronously before spawning
 
     child_plans: List[Tuple[Repo, ChildRef, str,
                             "dict[str, bool]", bool]] = []
@@ -1591,13 +1738,12 @@ def kick_off_workers(state: State, blocks: List[ReviewBlock]) -> None:
             if not msg:
                 continue
             ref.message = ""
-            if ref.refreshing:  # another action owns this child — skip
+            if not ref.try_acquire_refresh():
                 continue
             block = child_blocks.get(id(ref))
             staged = dict(block.staged_paths) if block else {}
             amend = bool(block.amend) if block else False
             child_plans.append((parent, ref, msg, staged, amend))
-            ref.refreshing = True  # lock synchronously before spawning
 
     if not repo_plans and not child_plans:
         return
@@ -1630,12 +1776,12 @@ def kick_off_workers(state: State, blocks: List[ReviewBlock]) -> None:
         for r in state.repos:
             refresh_repo(r)
             if id(r) in locked_repos:
-                r.refreshing = False
+                r.release_refresh()
         link_siblings(state.repos, state.subtrees)
         for parent in state.repos:
             for ref in parent.children:
                 if id(ref) in locked_refs:
-                    ref.refreshing = False
+                    ref.release_refresh()
 
     threading.Thread(target=supervisor, daemon=True).start()
 
@@ -2103,7 +2249,7 @@ def _try_ff_through_redundant_dirty(state: State, c: SmartSyncCheckout,
     if matches is not True:
         return matches
 
-    stash_msg = "idlegit smart-sync: redundant dirty changes"
+    stash_msg = "auto: redundant dirty changes"
     rc, _, _ = git(c.path, [
         "stash", "push", "--include-untracked", "-m", stash_msg,
     ])
@@ -2171,7 +2317,7 @@ def _try_detached_checkout_through_redundant_dirty(
         # commits.
         return False
 
-    stash_msg = "idlegit smart-sync: redundant dirty changes"
+    stash_msg = "auto: redundant dirty changes"
     rc, _, _ = git(c.path, [
         "stash", "push", "--include-untracked", "-m", stash_msg,
     ])
@@ -2262,7 +2408,7 @@ def _stash_switch_pop_winner(state: State, winner: SmartSyncCheckout,
     # user never loses their changes.
     rc, _, _ = git(winner.path, [
         "stash", "push", "--include-untracked",
-        "-m", "idlegit smart-sync: align detached winner",
+        "-m", "auto: align detached HEAD",
     ])
     if rc != 0:
         state.tasks.update(t, "fail", initial_err)
@@ -2609,6 +2755,215 @@ def _align_canonical(state: State, canonical: Repo) -> Tuple[int, int]:
     return ok, fail
 
 
+def _propagate_submodule_bump(state: State, parent: Repo,
+                              parent_label: str) -> str:
+    """Stage + commit + push `parent` if its working tree is only dirty
+    because of submodule pointer updates left over by smart-sync. No-op
+    (returns "") when the parent has unrelated dirt, is on a detached
+    HEAD, or any of the three steps fails. Returns the parent's new HEAD
+    sha on success, so the cascade caller can FF parent's own siblings
+    onto it.
+
+    Uses the same Cardinal-Rule-safe primitives as `_commit_dirty_winner`
+    and `_push_winner`: `safe_stage_all` (refuses pointer deletions),
+    plain `git commit -m`, plain `git push` with `--set-upstream` fallback
+    on the first miss. No force-pushes, no rebases, no hard resets.
+
+    Sets `parent.refreshing = True` for the duration so the parent's
+    row reads as "working" on the main screen — its state dot becomes
+    the spinner, its commit field is hidden, and any concurrent action
+    on the row is locked out. Wrapped in try/finally so the flag clears
+    on every exit path (success, no-op, or failure mid-pipeline).
+    """
+    # Acquire the parent's refresh slot with a BLOCKING acquire —
+    # the cascade is a user-initiated commit-pipeline step that
+    # MUST run, so the silent-skip semantics of
+    # `try_acquire_refresh` would manifest as a regression where
+    # "I pushed the canonical but the parent's gitlink never got
+    # bumped". The non-blocking variant raced fs_watcher's post-
+    # task drain (which could fire on the parent in the brief gap
+    # between push completion and the first sibling-sync task) and
+    # silently dropped the propagation. fs_watcher's refresh is
+    # bounded at ~100ms so 5s is generous headroom; on a stuck
+    # contender we still bail rather than block the pipeline
+    # forever.
+    if not parent.acquire_refresh(timeout=5.0):
+        t = state.tasks.add(f"  ↳ propagate {parent_label}")
+        state.tasks.update(
+            t, "warn", "skipped: parent refresh lock held by another op")
+        return ""
+    try:
+        return _propagate_submodule_bump_inner(state, parent, parent_label)
+    finally:
+        parent.release_refresh()
+
+
+def _propagate_submodule_bump_inner(state: State, parent: Repo,
+                                    parent_label: str) -> str:
+    """Inner body of `_propagate_submodule_bump` — extracted so the
+    `parent.refreshing` flag toggle stays a single point of control."""
+    refresh_repo(parent)
+    if parent.error:
+        return ""
+    if not has_only_submodule_pointer_changes(parent.path):
+        return ""
+
+    rc, out, _ = git(parent.path, ["branch", "--show-current"])
+    if rc != 0 or not out.strip():
+        t = state.tasks.add(f"  ↳ propagate {parent_label}")
+        state.tasks.update(
+            t, "warn", "detached HEAD — no branch to commit on")
+        return ""
+    branch = out.strip()
+    if not is_safe_ref_arg(branch):
+        t = state.tasks.add(f"  ↳ propagate {parent_label}")
+        state.tasks.update(t, "fail", "unsafe branch name")
+        return ""
+
+    # Name the submodule paths we're about to bump so the commit
+    # message and the task row are both self-explanatory. Pulled from
+    # the same porcelain that has_only_submodule_pointer_changes
+    # already validated, so there's no need to re-check the codes.
+    rc, status_out, _ = git(parent.path, ["status", "--porcelain=v1"])
+    sub_paths: List[str] = []
+    if rc == 0:
+        for line in status_out.splitlines():
+            if len(line) >= 3:
+                sub_paths.append(line[3:].rstrip("/").strip())
+    if len(sub_paths) == 1:
+        msg = f"bump submodule {sub_paths[0]}"
+    elif sub_paths:
+        joined = ", ".join(sub_paths)
+        msg = f"bump submodules {joined}"
+    else:
+        msg = "bump submodule pointer(s)"
+
+    t = state.tasks.add(f"  ↳ propagate {parent_label}: stage")
+    ok, stage_err = safe_stage_all(parent.path)
+    if not ok:
+        state.tasks.update(t, "fail", stage_err)
+        return ""
+    state.tasks.update(t, "ok")
+
+    t = state.tasks.add(f"  ↳ propagate {parent_label}: commit")
+    rc, _, err = git(parent.path, ["commit", "-m", msg])
+    if rc != 0:
+        state.tasks.update(t, "fail", first_line(err))
+        return ""
+    state.tasks.update(t, "ok", msg)
+
+    t = state.tasks.add(f"  ↳ propagate {parent_label}: push")
+    rc, _, err = git(parent.path, ["push"])
+    if rc != 0:
+        rc, _, err = git(
+            parent.path, ["push", "--set-upstream", "origin", branch])
+    if rc != 0:
+        state.tasks.update(t, "fail", first_line(err))
+        return ""
+    state.tasks.update(t, "ok")
+
+    rc, out, _ = git(parent.path, ["rev-parse", "HEAD"])
+    if rc != 0 or not out.strip():
+        return ""
+    return out.strip()
+
+
+def _ff_submodule_checkout_to(path: Path, branch: str,
+                              target_sha: str) -> bool:
+    """Fetch + `merge --ff-only target_sha` inside a submodule checkout,
+    but only when the checkout is on `branch`, clean, and the FF would
+    not orphan any local commits. Used by the propagation cascade to
+    advance the submodule-checkout of a just-pushed parent up to the
+    parent's new HEAD before checking the grandparent's gitlink. Refuses
+    on dirty / off-branch / divergent state — propagation simply stops
+    that cascade path."""
+    if not is_safe_ref_arg(branch):
+        return False
+    rc, _, _ = git(path, ["fetch", "origin", branch])
+    if rc != 0:
+        return False
+    rc, out, _ = git(path, ["branch", "--show-current"])
+    if rc != 0 or out.strip() != branch:
+        return False
+    rc, out, _ = git(path, ["status", "--porcelain=v1"])
+    if rc != 0 or out.strip():
+        return False
+    # Already at the target — nothing to do.
+    rc, out, _ = git(path, ["rev-parse", "HEAD"])
+    if rc == 0 and out.strip() == target_sha:
+        return True
+    # Strict FF: target_sha must be reachable from HEAD's history (i.e.
+    # HEAD is an ancestor of target_sha). Refuses to orphan local-only
+    # commits the way a hard reset would.
+    rc, _, _ = git(
+        path, ["merge-base", "--is-ancestor", "HEAD", target_sha])
+    if rc != 0:
+        return False
+    rc, _, _ = git(path, ["merge", "--ff-only", target_sha])
+    return rc == 0
+
+
+def _cascade_propagate_to_parents(state: State,
+                                  canonicals_synced: List[Repo]) -> None:
+    """Walk up through every parent that holds a stale submodule gitlink
+    after the canonical sync. For each parent whose only dirt is the
+    submodule pointer(s), commit + push it; then FF the parent's own
+    sibling submodule checkouts onto the new HEAD and recurse into any
+    grandparent that thereby gains only-submodule-pointer dirt.
+
+    Visited-by-id() bookkeeping prevents revisiting the same parent
+    when several synced canonicals share it. Failures on one cascade
+    path (refusal to FF a sibling, dirty parent, etc.) don't poison
+    other branches — they just stop that branch's walk."""
+    visited: "set[int]" = set()
+    pending: List[Repo] = []
+    for canonical in canonicals_synced:
+        for parent, _sub_path in canonical.siblings:
+            if id(parent) not in visited and parent not in pending:
+                pending.append(parent)
+
+    while pending:
+        parent = pending.pop(0)
+        if id(parent) in visited:
+            continue
+        visited.add(id(parent))
+
+        parent_label = state.task_repo_label(parent)
+        new_head = _propagate_submodule_bump(state, parent, parent_label)
+        if not new_head:
+            continue
+
+        # Parent is now ahead of every other on-disk checkout of itself
+        # (the submodule-checkouts that live inside grandparents). FF
+        # those checkouts so each grandparent's gitlink check sees only
+        # submodule-pointer dirt.
+        rc, branch_out, _ = git(parent.path, ["branch", "--show-current"])
+        if rc != 0 or not branch_out.strip():
+            continue
+        branch = branch_out.strip()
+        for grandparent, sub_path in parent.siblings:
+            grandparent_label = state.task_repo_label(grandparent)
+            t = state.tasks.add(
+                f"  ↳ propagate {parent_label}: align in "
+                f"{grandparent_label}")
+            # Flag the matching ChildRef on the grandparent for the
+            # duration of the FF so its row animates while the
+            # underlying checkout moves forward. try/finally ensures
+            # the flag clears even if the FF helper raises.
+            _set_child_ref_refreshing(grandparent, sub_path, True)
+            try:
+                ff_ok = _ff_submodule_checkout_to(sub_path, branch, new_head)
+            finally:
+                _set_child_ref_refreshing(grandparent, sub_path, False)
+            if ff_ok:
+                state.tasks.update(t, "ok")
+                if id(grandparent) not in visited:
+                    pending.append(grandparent)
+            else:
+                state.tasks.update(
+                    t, "warn", "skipped — non-FF or dirty checkout")
+
+
 def _smart_sync_set_canonical_tree_refreshing(canonical: Repo, value: bool
                                              ) -> None:
     """Mark a canonical repo and every nested submodule ChildRef that
@@ -2620,6 +2975,20 @@ def _smart_sync_set_canonical_tree_refreshing(canonical: Repo, value: bool
         for ref in parent.children:
             if ref.kind == "submodule" and ref.repo is canonical:
                 ref.refreshing = value
+
+
+def _set_child_ref_refreshing(parent: Repo, sub_path: Path,
+                              value: bool) -> None:
+    """Toggle the `refreshing` flag on the ChildRef of `parent` whose
+    nested-path matches `sub_path`. No-op when the ref isn't found —
+    handles a stale `link_siblings` snapshot gracefully. Used by the
+    commit pipeline's post-push fan-out and the parent-propagation
+    cascade so the per-submodule row animates while its underlying
+    checkout is being advanced."""
+    for ref in parent.children:
+        if ref.kind == "submodule" and ref.nested_path == sub_path:
+            ref.refreshing = value
+            return
 
 
 def kick_off_sync_siblings(state: State) -> None:
@@ -2670,6 +3039,21 @@ def kick_off_sync_siblings(state: State) -> None:
                 ok_total += ok
                 fail_total += fail
 
+            # Auto-push each parent whose only dirt is the now-stale
+            # submodule gitlink (cascading up through grandparents that
+            # also become only-submodule-dirty). Off → leaves the parent
+            # commit as a manual decision, which is what existing setups
+            # got before this knob existed.
+            if (state.auto_push_submodule_parent
+                    and canonicals_with_siblings):
+                try:
+                    _cascade_propagate_to_parents(
+                        state, canonicals_with_siblings)
+                except Exception as e:
+                    t = state.tasks.add("  ↳ propagate to parents")
+                    state.tasks.update(t, "fail", first_line(str(e)))
+                    fail_total += 1
+
             for parent, ref in subtree_items:
                 t = state.tasks.add(
                     f"  ⊕ {state.task_repo_label(ref.repo)} "
@@ -2690,6 +3074,32 @@ def kick_off_sync_siblings(state: State) -> None:
                 finally:
                     refresh_repo(parent)
         finally:
+            # Final full refresh + sibling-link rebuild BEFORE we
+            # clear `refreshing` flags or mark the header task
+            # terminal. Order matters: clearing flags AND marking the
+            # header terminal both drop `anim_running` in the main
+            # loop, which then switches its getch timeout from 100ms
+            # to 1s — and the per-repo `refresh_repo` calls below run
+            # serially on this thread, so with N repos the loop spends
+            # ~N×100ms (or longer) on the 1s tick before redrawing
+            # the post-sync state. The user perceives this as the row
+            # icons staying stale for "a couple of seconds" after the
+            # sync tasks complete. Running the refresh while the
+            # spinner state is still live keeps the loop on the 100ms
+            # tick so the next redraw after release-flags lands within
+            # a frame.
+            #
+            # Parallelised across MAX_PARALLEL_GIT_JOBS (matches
+            # `kick_off_inline_refresh`) — each `refresh_repo` is a
+            # handful of independent git subprocesses, network-free,
+            # so contention is just the subprocess fork cost.
+            if state.repos:
+                max_workers = min(
+                    len(state.repos), MAX_PARALLEL_GIT_JOBS)
+                with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                    list(ex.map(refresh_repo, state.repos))
+            link_siblings(state.repos, state.subtrees)
+
             for canonical in canonicals_with_siblings:
                 _smart_sync_set_canonical_tree_refreshing(canonical, False)
             for _parent, ref in subtree_items:
@@ -2705,12 +3115,6 @@ def kick_off_sync_siblings(state: State) -> None:
             else:
                 state.tasks.update(
                     header, "warn", f"{ok_total} ok / {fail_total} failed")
-
-            # Final full refresh + sibling-link rebuild to catch any repos
-            # not covered by the per-item refreshes above.
-            for r in state.repos:
-                refresh_repo(r)
-            link_siblings(state.repos, state.subtrees)
 
     threading.Thread(target=worker, daemon=True).start()
 
@@ -2754,17 +3158,21 @@ def kick_off_inline_refresh(state: State) -> None:
                 _inline_refresh_in_flight = False
             return
 
-    # Flip every row's refreshing flag SYNCHRONOUSLY before we spawn the
-    # worker. The main loop's `anim_running` check fires as soon as any
-    # repo has `refreshing=True`; flipping it now means the very next
-    # loop iteration drops the getch timeout from 1s back to 100ms, so
-    # the row spinners light up immediately and the user gets visible
-    # feedback that their Ctrl+R registered. Without this, the loop
-    # may block for up to a second on its idle-timeout getch before
-    # noticing activity, which feels like a missed keystroke and tempts
-    # a second press (which is what triggered the duplication race).
+    # Claim the per-repo refresh slot SYNCHRONOUSLY before we spawn the
+    # worker. `try_acquire_refresh` flips `refreshing=True` so the main
+    # loop's `anim_running` check fires immediately (the next iteration
+    # drops the getch timeout from 1s to 100ms and row spinners light
+    # up), AND it acquires `repo.refresh_lock` so no other source can
+    # start a concurrent refresh on the same repo. Repos already locked
+    # by another source (fs_watcher, action menu) are skipped — the
+    # current owner will finish refreshing them. Without this gate, a
+    # Ctrl+R during an in-flight auto-refresh would race the auto-
+    # refresh on the same Repo's `staged`/`unstaged`/etc. lists and
+    # leave the row briefly flickering between half-populated states.
+    acquired: List[Repo] = []
     for r in state.repos:
-        r.refreshing = True
+        if r.try_acquire_refresh():
+            acquired.append(r)
 
     def worker() -> None:
         global _inline_refresh_in_flight
@@ -2792,19 +3200,55 @@ def kick_off_inline_refresh(state: State) -> None:
             next_repos.sort(
                 key=lambda r: (r.rel != ".", r.rel.lower() if r.rel != "." else ""))
 
+            # Newly-discovered repos that weren't in `state.repos` at
+            # sync-acquire time need their own claim. Membership check
+            # uses `path` identity rather than `r in acquired` so we
+            # don't depend on Repo equality (the dataclass `__eq__`
+            # compares many fields and could surprise us).
+            acquired_paths = {a.path for a in acquired}
             for r in next_repos:
-                r.refreshing = True
+                if r.path in acquired_paths:
+                    continue
+                if r.try_acquire_refresh():
+                    acquired.append(r)
+                    acquired_paths.add(r.path)
+
+            # Refresh only repos we own. Vanished repos (acquired but
+            # not in next_repos) are released in the `finally` below
+            # without a refresh — they're about to fall off the list
+            # anyway. Locked repos (in next_repos but not acquired)
+            # are skipped — their current owner is mid-refresh and
+            # will leave them in a consistent state.
+            repos_to_refresh = [r for r in next_repos
+                                if r.path in acquired_paths]
+
+            # `fetch_on_manual_refresh` (default off) makes Ctrl+R do
+            # a `git fetch --all` per repo BEFORE the local state
+            # re-read so the displayed ahead/behind reflects actual
+            # upstream rather than the last fetch. Fetch failures are
+            # silently swallowed — they don't fail the refresh; the
+            # local state re-read still runs and the ahead/behind
+            # numbers just stay stale. Recursing submodules in this
+            # fetch piggybacks on the same workspace flag so the
+            # behaviour matches the action menu's Fetch.
+            do_fetch = state.fetch_on_manual_refresh
+            fetch_args = ["fetch", "--all"]
+            if do_fetch and state.auto_recurse_submodules:
+                fetch_args.append("--recurse-submodules=on-demand")
 
             def refresh_one(r: Repo) -> None:
-                try:
-                    refresh_repo_with_remote_state(r)
-                finally:
-                    r.refreshing = False
+                if do_fetch:
+                    try:
+                        git(r.path, fetch_args)
+                    except Exception:  # noqa: BLE001
+                        pass
+                refresh_repo_with_remote_state(r)
 
-            if next_repos:
-                max_workers = min(len(next_repos), MAX_PARALLEL_GIT_JOBS)
+            if repos_to_refresh:
+                max_workers = min(
+                    len(repos_to_refresh), MAX_PARALLEL_GIT_JOBS)
                 with ThreadPoolExecutor(max_workers=max_workers) as ex:
-                    list(ex.map(refresh_one, next_repos))
+                    list(ex.map(refresh_one, repos_to_refresh))
             link_siblings(next_repos, state.subtrees)
 
             state.repos = next_repos
@@ -2821,9 +3265,144 @@ def kick_off_inline_refresh(state: State) -> None:
                     0, min(state.selected, max(0, state.total_rows - 1)))
             state.body_scroll = max(
                 0, min(state.body_scroll, max(0, state.total_rows - 1)))
+
+            # Reconcile fs-watchers against the new repo set: attach for
+            # newly-appeared repos, drop watchers for repos that vanished.
+            # Idempotent + safe to call even when the feature flag is off
+            # (it stops any existing watchers). Lazy import keeps watchdog
+            # off the workers module's import path for tests that stub
+            # workers without touching the watcher manager.
+            from .fs_watcher import reconcile_repo_watchers
+            reconcile_repo_watchers(state)
         finally:
+            # Always release every claim, including for repos that
+            # vanished (not in next_repos) or that we skipped because
+            # another source held the lock — release on the latter is
+            # a no-op since we never acquired. Done inside the
+            # try/finally so a discover-time exception can't leave a
+            # repo permanently locked.
+            for r in acquired:
+                r.release_refresh()
             with _inline_refresh_lock:
                 _inline_refresh_in_flight = False
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def kick_off_pull_all(state: State) -> None:
+    """Ctrl+P entry point — run `git pull --ff-only` against every
+    repo in the active workspace that has an upstream. Repos without
+    an upstream are silently skipped (no noise for local-only repos).
+    Per-repo task rows surface the outcome; after every pull lands,
+    state is re-read so the displayed ahead/behind reflects the new
+    HEAD.
+
+    Refusing on non-FF is deliberate (matches the user's mental model
+    of "pull all" as a no-merge-commit-here gesture) — divergent
+    branches surface a fail task and the user can either resolve them
+    individually via the action menu's Pull (which DOES allow a merge
+    fallback) or via shell.
+
+    Per-repo refresh slots are claimed non-blocking — a repo whose
+    lock is held by another source (commit pipeline, fs_watcher,
+    action menu) is skipped. The pull runs in parallel up to
+    MAX_PARALLEL_GIT_JOBS, mirroring the inline-refresh pool."""
+    if not state.repos:
+        return
+
+    # Parent task surfaces the gesture itself so the user sees that
+    # Ctrl+P registered even on a workspace where every repo is
+    # already up to date (in which case the per-repo helpers add no
+    # task rows by design — see `_pull_prefer_ff_then_merge`). The
+    # parent gets a summary `n/total` count on completion so a quick
+    # glance tells the user what landed.
+    parent_task = state.tasks.add("pull all")
+
+    acquired: List[Repo] = []
+    for r in state.repos:
+        if r.try_acquire_refresh():
+            acquired.append(r)
+
+    n_total = len(state.repos)
+    n_skipped_locked = n_total - len(acquired)
+    # Track outcomes from worker threads — use a lock since
+    # ThreadPoolExecutor runs `pull_one` concurrently. ints, but
+    # we wrap reads/writes in a tiny critical section so the final
+    # summary count is stable.
+    counters_lock = threading.Lock()
+    n_pulled = [0]
+    n_skipped_no_upstream = [0]
+    n_failed = [0]
+
+    def worker() -> None:
+        try:
+            def pull_one(r: Repo) -> None:
+                name = state.task_repo_label(r)
+                # Skip silently when there's no upstream — pulling
+                # against nothing isn't a meaningful op and the
+                # task row would just be noise on a workspace with
+                # any local-only repos. Still tracked in the
+                # summary so the user sees "5 had no upstream".
+                rc, out, _ = git(r.path, [
+                    "rev-parse", "--abbrev-ref",
+                    "--symbolic-full-name", "@{u}"])
+                if rc != 0 or not out.strip():
+                    with counters_lock:
+                        n_skipped_no_upstream[0] += 1
+                    return
+                ok = _pull_prefer_ff_then_merge(
+                    r.path, state.tasks, name,
+                    allow_merge_fallback=False,
+                    recurse_submodules=state.auto_recurse_submodules,
+                    parent_task=parent_task)
+                with counters_lock:
+                    if ok:
+                        n_pulled[0] += 1
+                    else:
+                        n_failed[0] += 1
+
+            if acquired:
+                max_workers = min(len(acquired), MAX_PARALLEL_GIT_JOBS)
+                with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                    list(ex.map(pull_one, acquired))
+
+            # Re-read state for every repo we touched so ahead/behind,
+            # HEAD sha, and dirty flags reflect the post-pull world.
+            # Skip the gh workflow query — pull doesn't change which
+            # workflows exist, and the inline-refresh path will pick
+            # any drift up on the next Ctrl+R.
+            for r in acquired:
+                refresh_repo(r)
+            link_siblings(state.repos, state.subtrees)
+        finally:
+            for r in acquired:
+                r.release_refresh()
+            # Summarise + close the parent task. Status reflects the
+            # worst outcome: fail if anything failed, warn if some
+            # repos were locked or had no upstream, ok if everything
+            # cleanly pulled or no-op'd.
+            parts: List[str] = []
+            if n_pulled[0]:
+                parts.append(f"{n_pulled[0]} pulled")
+            ok_count = (len(acquired) - n_pulled[0] - n_failed[0]
+                        - n_skipped_no_upstream[0])
+            if ok_count > 0:
+                parts.append(f"{ok_count} up-to-date")
+            if n_skipped_no_upstream[0]:
+                parts.append(
+                    f"{n_skipped_no_upstream[0]} no upstream")
+            if n_skipped_locked:
+                parts.append(f"{n_skipped_locked} locked")
+            if n_failed[0]:
+                parts.append(f"{n_failed[0]} failed")
+            summary = ", ".join(parts) if parts else "no repos"
+            if n_failed[0]:
+                status = "fail"
+            elif n_skipped_locked or n_skipped_no_upstream[0]:
+                status = "warn"
+            else:
+                status = "ok"
+            state.tasks.update(parent_task, status, summary)
 
     threading.Thread(target=worker, daemon=True).start()
 
@@ -2929,6 +3508,14 @@ def switch_workspace(state: State, new_index: int) -> None:
         save_workspaces(state.workspaces, state.active_workspace_index)
     except OSError:
         pass
+
+    # Reconcile fs-watchers for the new repo set. When kick_refresh is
+    # True the subsequent kick_off_inline_refresh will reconcile again
+    # at its tail (and pick up any repos that got refreshed in-place);
+    # we still reconcile here so the cache-hit path attaches watchers
+    # immediately rather than waiting for the next Ctrl+R.
+    from .fs_watcher import reconcile_repo_watchers
+    reconcile_repo_watchers(state)
 
     if kick_refresh:
         kick_off_inline_refresh(state)

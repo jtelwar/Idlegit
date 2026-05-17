@@ -254,13 +254,13 @@ class TestMainHintsGlobal(unittest.TestCase):
     def test_repos_focus_advertises_tasks_panel(self) -> None:
         s = _state(_make_repo("r"))
         actions = [h.action for h in _main_hints_global(s)]
-        self.assertIn("tasks panel", actions)
+        self.assertIn("-> tasks", actions)
 
     def test_tasks_focus_advertises_back_to_repos(self) -> None:
         s = _state(_make_repo("r"))
         s.focused_panel = "tasks"
         actions = [h.action for h in _main_hints_global(s)]
-        self.assertIn("back to repos", actions)
+        self.assertIn("<- repos", actions)
 
 
 # ---------- Confirm-screen hints -----------------------------------------

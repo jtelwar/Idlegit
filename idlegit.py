@@ -42,9 +42,11 @@ from ui import (
     handle_branch_name_prompt_key,
     handle_branch_picker_key,
     handle_clone_modal_key,
+    handle_commit_msg_editor_key,
     handle_commit_view_modal_key,
     handle_confirm,
     handle_detached_recovery_prompt_key,
+    handle_help_screen_key,
     handle_remotes_modal_key,
     handle_main_key,
     handle_reset_prompt_key,
@@ -62,6 +64,7 @@ from ui import (
 )
 from core.workers import (
     kick_off_inline_refresh,
+    kick_off_pull_all,
     kick_off_sync_siblings,
     switch_workspace,
 )
@@ -257,25 +260,40 @@ def run(stdscr, cfg, workspaces, initial_active_idx: int = 0,
         # discovery, no async refresh race when the user rapid-fires
         # ←/→ between workspaces.
         ws.cached_repos = ws_repos
-        workspace_repos.append((ws.name, ws_repos, ws.subtrees))
+        workspace_repos.append((ws.display_name, ws_repos, ws.subtrees))
     repos = workspace_repos[active_idx][1]
-    refresh_all_workspaces(stdscr, workspace_repos, cfg.name_display_max,
-                           cfg.name_truncation, active_index=active_idx)
+    # Esc during the initial parallel-refresh aborts the load and
+    # quits — the only "quit" gesture available before the main loop
+    # gets to dispatch keys. Background refresh threads are daemons
+    # and die with the process.
+    if not refresh_all_workspaces(
+            stdscr, workspace_repos, cfg.name_display_max,
+            cfg.name_truncation, active_index=active_idx):
+        return
 
-    title = f"Idlegit · {active_ws.name}" if active_ws.name else "Idlegit"
+    title = (f"Idlegit · {active_ws.display_name}"
+             if active_ws.display_name else "Idlegit")
     # Re-emit immediately after curses owns the terminal: VS Code's
     # integrated terminal (and a few others) overwrite the title with
     # the running-process name once the alt-screen comes up.
     _set_terminal_title(title)
-    last_title_emitted = title
-    last_title_at = time.monotonic()
     state = State(
         repos=repos,
-        workspace_name=active_ws.name,
+        workspace_name=active_ws.display_name,
         workspaces=workspaces,
         active_workspace_index=active_idx,
         base_config=cfg,
     )
+    # Task logging is global (not workspace-scoped) so it's wired from
+    # the loaded Config directly, not from apply_workspace_overrides.
+    # When enabled, every terminal task transition appends a line to
+    # `task_log_path`; the cap rotates oldest-first when exceeded.
+    from core.task_log import resolve_task_log_path, wire_task_log
+    state.task_log_enabled = cfg.task_log_enabled
+    state.task_log_path = resolve_task_log_path(cfg.task_log_path)
+    state.task_log_max_lines = cfg.task_log_max_lines
+    if state.task_log_enabled:
+        wire_task_log(state)
     for warning in startup_warnings or []:
         t = state.tasks.add("startup warning")
         state.tasks.update(t, "warn", warning)
@@ -284,6 +302,35 @@ def run(stdscr, cfg, workspaces, initial_active_idx: int = 0,
     # later workspace switches.
     apply_workspace_overrides(state, cfg, active_ws)
 
+    # Stand up filesystem watchers for the active workspace's repos so
+    # external edits propagate without a Ctrl+R. The reconcile is a
+    # no-op (and tears down any leftover observer) when the config flag
+    # is off; the manager handles per-repo schedule + debounce.
+    from core.fs_watcher import (
+        reconcile_repo_watchers, stop_repo_watchers,
+    )
+    reconcile_repo_watchers(state)
+
+    try:
+        _run_main_loop(stdscr, state, title)
+    finally:
+        # Polite teardown — daemon Observer thread would exit with the
+        # process anyway, but stopping it here lets the platform release
+        # its inotify/FSEvents handles immediately.
+        stop_repo_watchers()
+
+
+def _run_main_loop(stdscr, state, title):
+    from core.fs_watcher import drain_pending_refreshes
+    last_title_emitted = title
+    last_title_at = time.monotonic()
+    # Track tasks.has_running() across iterations so we can detect the
+    # transition from "actions in flight" → "idle" and drain queued
+    # fs-watch events at that boundary. Without this, a sync (which
+    # writes to multiple working trees as it goes) would queue events
+    # in `_pending` but never fire — the user would see the action
+    # complete but the repo rows stay stale until they hit Ctrl+R.
+    prev_tasks_running = False
     while True:
         now = time.monotonic()
         # Prune any completed tasks that have aged past the auto-remove
@@ -381,6 +428,18 @@ def run(stdscr, cfg, workspaces, initial_active_idx: int = 0,
         if anim_running:
             state.spinner_frame = (state.spinner_frame + 1) % len(SPINNER_FRAMES)
 
+        # Tasks-drained transition: when the last running task finishes
+        # we fire one auto-refresh per repo that had a suppressed fs
+        # event during the action. This is what gives the user the
+        # post-sync / post-commit "everything's now up to date"
+        # snapshot without thrashing the spinner during the action
+        # itself. `drain_pending_refreshes` is a no-op when nothing
+        # was queued.
+        cur_tasks_running = state.tasks.has_running()
+        if prev_tasks_running and not cur_tasks_running:
+            drain_pending_refreshes()
+        prev_tasks_running = cur_tasks_running
+
         # Dynamic getch timeout: snappy 100ms while anything is animating
         # so the spinner / fade-outs run smoothly, lazy 1s when truly
         # idle. The loop still wakes once a second to refresh relative
@@ -401,7 +460,7 @@ def run(stdscr, cfg, workspaces, initial_active_idx: int = 0,
             # this, cells from the old layout (most visibly: black bars
             # in the task panel) survive into the new draw because curses
             # only writes cells it thinks have changed.
-            try:
+            try: 
                 curses.update_lines_cols()
             except (AttributeError, curses.error):
                 pass
@@ -413,6 +472,23 @@ def run(stdscr, cfg, workspaces, initial_active_idx: int = 0,
 
         # Modal dispatch (deepest first). Each modal owns its key handling
         # and may close itself by clearing its slot on state.
+        # Commit-msg editor goes first — it's the only modal that owns
+        # the hardware cursor while open, so any other modal stacked
+        # on top would still want this one to swallow its own keys.
+        if state.commit_msg_editor is not None:
+            handle_commit_msg_editor_key(state, key)
+            # When it closes, restore the hidden-cursor default the
+            # main screen relies on (the modal turned it back on to
+            # show the caret over the textarea).
+            if state.commit_msg_editor is None:
+                try:
+                    curses.curs_set(0)
+                except curses.error:
+                    pass
+            continue
+        if state.help_screen is not None:
+            handle_help_screen_key(state, key)
+            continue
         if state.reset_prompt is not None:
             handle_reset_prompt_key(state, key)
             continue
@@ -479,6 +555,9 @@ def run(stdscr, cfg, workspaces, initial_active_idx: int = 0,
         if action == "sync":
             kick_off_sync_siblings(state)
             continue
+        if action == "pull-all":
+            kick_off_pull_all(state)
+            continue
         if action == "switch-workspace":
             # Re-derive the title once the active workspace changes, so the
             # OSC re-emit loop above picks the new name up next tick.
@@ -488,10 +567,19 @@ def run(stdscr, cfg, workspaces, initial_active_idx: int = 0,
             continue
         if action == "confirm":
             stdscr.timeout(-1)  # confirm sub-loop wants blocking input
+            # Hold `in_review` for the duration of the confirm sub-loop
+            # so the fs-watcher queues any events that fire under us
+            # rather than refreshing rows the user is mid-deciding on.
+            # Cleared in `finally` so an exception in `handle_confirm`
+            # can't leave us stuck in review-mode forever; the drain
+            # then fires any events that landed during the window.
+            state.in_review = True
             try:
                 handle_confirm(stdscr, state)
             finally:
+                state.in_review = False
                 stdscr.timeout(100)
+                drain_pending_refreshes()
 
 
 def _set_terminal_title(title: str) -> None:
@@ -539,7 +627,28 @@ def main() -> int:
             initial_active_idx = i
             break
 
-    title_name = (workspaces[initial_active_idx].name
+    # Ephemeral-workspace detection: when launched from inside a git
+    # repo not already covered by a configured workspace folder,
+    # mint a transient workspace pointing at the detected repo and
+    # make it the active one. The user lands in something useful
+    # without first configuring a workspace. If the detected repo
+    # IS already covered, activate that covering workspace instead
+    # (still honours "the launch location wins over the persisted
+    # active workspace" — just avoids a duplicate entry).
+    from core.ephemeral import (
+        build_ephemeral_workspace, find_git_repo_root,
+        repo_covered_by_workspace,
+    )
+    detected_repo = find_git_repo_root()
+    if detected_repo is not None:
+        covering = repo_covered_by_workspace(detected_repo, workspaces)
+        if covering is not None:
+            initial_active_idx = workspaces.index(covering)
+        else:
+            workspaces.insert(0, build_ephemeral_workspace(detected_repo))
+            initial_active_idx = 0
+
+    title_name = (workspaces[initial_active_idx].display_name
                   if workspaces else "")
     _set_terminal_title(
         f"{APP_DISPLAY_NAME} · {title_name}" if title_name else APP_DISPLAY_NAME)

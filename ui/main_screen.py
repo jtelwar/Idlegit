@@ -15,14 +15,15 @@ from .geometry import (
     clamp_scroll, draw_scroll_overflow, field_visible, safe_addstr, truncate,
 )
 from .hints import (
-    KEY_CTRL_R, KEY_CTRL_S, KEY_ENTER, KEY_ESC, KEY_LEFT, KEY_LEFT_RIGHT,
-    KEY_SHIFT_TAB, KEY_TAB, KEY_UP_DOWN, Hint, render_hints,
+    KEY_CTRL_P, KEY_CTRL_R, KEY_CTRL_S, KEY_ENTER, KEY_ESC, KEY_LEFT,
+    KEY_LEFT_RIGHT, KEY_RIGHT, KEY_SHIFT_TAB, KEY_TAB, KEY_UP_DOWN, Hint,
+    render_hints,
 )
 from .modals import (
     draw_action_menu, draw_align_heads_prompt, draw_branch_name_prompt,
-    draw_branch_picker, draw_clone_modal, draw_commit_view_modal,
-    draw_detached_recovery_prompt,
-    draw_diff_viewer, draw_remotes_modal, draw_reset_prompt,
+    draw_branch_picker, draw_clone_modal, draw_commit_msg_editor,
+    draw_commit_view_modal, draw_detached_recovery_prompt,
+    draw_diff_viewer, draw_help_screen, draw_remotes_modal, draw_reset_prompt,
     draw_task_action_menu, draw_workflow_picker,
     draw_workspace_creator, draw_workspace_menu, draw_app_menu,
 )
@@ -96,20 +97,19 @@ def _esc_hint(state: State) -> Hint:
         return Hint(KEY_ESC, "back to repos")
     holder = _focused_message_holder(state)
     if holder is not None and holder.message:
-        return Hint(KEY_ESC, "clear message")
+        return Hint(KEY_ESC, "clear msg")
     if state.has_messages:
         return Hint(KEY_ESC, "discard + quit")
     return Hint(KEY_ESC, "quit")
 
 
 def _title_row_hints(state: State) -> List[Hint]:
-    """Hints for the Idlegit title row — Tab opens the workspaces
-    picker (the global switcher), Up/Down navigate."""
+    """Hints for the Idlegit title row — Enter opens the app menu
+    (matches the row's underline affordance — Tab works too but
+    isn't advertised, since one canonical hint per action keeps
+    the status line readable). Up/Down navigate."""
     hints = [Hint(KEY_UP_DOWN, "navigate")]
-    if len(state.workspaces) > 1:
-        hints.append(Hint(KEY_TAB, "workspaces…"))
-    else:
-        hints.append(Hint(KEY_TAB, "workspaces… (only one)"))
+    hints.append(Hint(KEY_ENTER, "menu…"))
     return hints
 
 
@@ -137,12 +137,16 @@ def _body_row_hints(state: State) -> List[Hint]:
         hints.append(Hint(KEY_TAB, "actions…"))
 
     if holder is not None:
-        # Editable row: typing edits the message inline. Surface
-        # "Enter commit + push" only when there's something to commit
-        # so the user isn't promised an action that won't run.
+        # Editable row: typing edits the message inline. Suggest /
+        # suggest-all only make sense on an empty field; the larger
+        # editor is always available (compose-from-scratch when empty,
+        # edit-in-place when there's content). Both Shift hints are
+        # gated to `holder is not None` so they never appear on a
+        # subtree row or a clean repo with no message holder.
         if not holder.message:
             hints.append(Hint(KEY_LEFT, "suggest"))
             hints.append(Hint(f"Shift+{KEY_LEFT}", "suggest all"))
+        hints.append(Hint(f"Shift+{KEY_RIGHT}", "edit msg"))
         if state.has_messages:
             hints.append(Hint(KEY_ENTER, "review + commit"))
     else:
@@ -185,13 +189,14 @@ def _main_hints_global(state: State) -> List[Hint]:
     """Second footer line — always-applicable shortcuts. Shift+Tab,
     Ctrl+R / Ctrl+S, and the context-aware Esc, in that order."""
     if state.focused_panel == "tasks":
-        panel_hint = Hint(KEY_SHIFT_TAB, "back to repos")
+        panel_hint = Hint(KEY_SHIFT_TAB, "<- repos")
     else:
-        panel_hint = Hint(KEY_SHIFT_TAB, "tasks panel")
+        panel_hint = Hint(KEY_SHIFT_TAB, "-> tasks")
     return [
         panel_hint,
         Hint(KEY_CTRL_R, "refresh"),
         Hint(KEY_CTRL_S, "smart-sync"),
+        Hint(KEY_CTRL_P, "pull all"),
         _esc_hint(state),
     ]
 
@@ -202,8 +207,8 @@ def draw_main(stdscr, state: State) -> None:
 
     body_h = _body_height_for(state, h)
 
-    # Row 0 — Idlegit title (selectable; Tab opens the workspaces
-    # picker) followed by a muted version label where the workspace
+    # Row 0 — Idlegit title (selectable; Enter or Tab opens the app
+    # menu) followed by a muted version label where the workspace
     # name used to live. Focus is signalled with an underline rather
     # than a colour shift: every "shade brighter than bold magenta"
     # in the xterm-256 palette ends up reading as pink/orchid on
@@ -373,7 +378,9 @@ def draw_main(stdscr, state: State) -> None:
                     or state.diff_viewer is not None
                     or state.remotes_modal is not None
                     or state.clone_modal is not None
-                    or state.commit_view_modal is not None)
+                    or state.commit_view_modal is not None
+                    or state.commit_msg_editor is not None
+                    or state.help_screen is not None)
     if state.action_menu is not None:
         draw_action_menu(stdscr, state, sidebar_x)
     if state.branch_picker is not None:
@@ -410,6 +417,17 @@ def draw_main(stdscr, state: State) -> None:
         draw_commit_view_modal(stdscr, state, sidebar_x)
     if state.diff_viewer is not None:
         draw_diff_viewer(stdscr, state, sidebar_x)
+    # Commit-message editor paints last so it sits on top of every
+    # other modal. It's typically opened from the bare main screen,
+    # but layering it on top means a stray open while another modal
+    # is up doesn't render half-buried.
+    if state.commit_msg_editor is not None:
+        draw_commit_msg_editor(stdscr, state, sidebar_x)
+    # Help screen is a peer of the app menu — opened from it but
+    # paints on top so the user can read the docs without seeing the
+    # menu chrome underneath.
+    if state.help_screen is not None:
+        draw_help_screen(stdscr, state, sidebar_x)
 
     # Sidebar drawn LAST so it's always the freshest paint on screen —
     # avoids the resize artifacts where stale cells from the old layout
@@ -424,7 +442,14 @@ def draw_main(stdscr, state: State) -> None:
     # accepting input at once. We don't touch state.selected, so the
     # cursor reappears on the same column when focus returns.
     cursor_set = False
-    if (not modal_active and state.selected >= 0
+    # Commit-message editor owns the cursor while it's open — paint the
+    # caret last, AFTER sidebar redraw, so the modal's textarea has a
+    # visible cursor even though `modal_active` is True.
+    if state.commit_msg_editor is not None:
+        from .modals.commit_msg_editor import apply_commit_msg_editor_cursor
+        if apply_commit_msg_editor_cursor(stdscr, state):
+            cursor_set = True
+    if (not cursor_set and not modal_active and state.selected >= 0
             and state.focused_panel == "repos"):
         body_idx = state.selected
         if 0 <= body_idx < len(body_rows) and body_idx in y_for_body:

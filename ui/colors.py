@@ -84,6 +84,13 @@ PAIR_DLG_PASTEL_BLUE_ACTIVE = 54
 # terminal default — the border cells deliberately sit OUTSIDE the
 # panel fill so the dlg_bg doesn't extend past the box.
 PAIR_DLG_BORDER = 55
+# Inset text-field background — meant to read as darker than the
+# panel chrome (PAIR_DLG_PANEL_LIGHT below). Uses the xterm-256
+# cube's true black (colour 16, always `#000000`) on 256-colour
+# terminals so the contrast doesn't depend on theme rendering of
+# `COLOR_BLACK`. 8-colour fallback re-uses dlg_bg and the field
+# differentiates via an A_UNDERLINE attribute per row.
+PAIR_DLG_FIELD = 56
 # Active-panel variant — same fg, but a slightly lighter bg so the panel
 # reads as "currently focused" without going as far as inverse video.
 PAIR_SB_FG_ACTIVE = 17
@@ -128,17 +135,25 @@ def init_colors() -> None:
     curses.init_pair(PAIR_HEADER, curses.COLOR_MAGENTA, bg)
     curses.init_pair(PAIR_AHEAD, curses.COLOR_CYAN, bg)
     curses.init_pair(PAIR_BEHIND, curses.COLOR_MAGENTA, bg)
-    # Dialog / sidebar panel background. ANSI `COLOR_BLACK` (= 0)
-    # is rendered by the terminal theme — most modern themes paint
-    # it as a dark grey rather than pure #000000, which is the
-    # "lighter grey panel" appearance idlegit has historically had.
-    # The active variant bumps to xterm 236 (~RGB 48/48/48) so a
-    # focused panel reads as "raised" against the resting panel bg
-    # without going as far as inverse video; on <256-colour
-    # terminals it collapses back to COLOR_BLACK and focus is
-    # carried purely by the cyan accent.
-    sb_bg = curses.COLOR_BLACK
-    sb_bg_active = 236 if curses.COLORS >= 256 else sb_bg
+    # Sidebar (task panel) background. We deliberately AVOID
+    # `curses.COLOR_BLACK` (= ANSI colour 0) here because it's
+    # remapped by the terminal theme — iTerm2 typically paints it
+    # close to the terminal default bg (so the panel "disappears"
+    # against the main screen), while Cursor's terminal paints it
+    # as a perceptible dark grey. Using fixed xterm-256 cube colours
+    # gives every 256-colour terminal the same look:
+    #   resting: xterm 235 (#262626) — a clearly distinct dark grey
+    #   active : xterm 237 (#3a3a3a) — one notch lighter so the
+    #            focused panel reads as "raised" without inverse
+    #            video.
+    # On <256-colour terminals we fall back to ANSI black + the
+    # focus accent (cyan) carries the active state, same as before.
+    if curses.COLORS >= 256:
+        sb_bg = 235
+        sb_bg_active = 237
+    else:
+        sb_bg = curses.COLOR_BLACK
+        sb_bg_active = sb_bg
     curses.init_pair(PAIR_SB_FG, curses.COLOR_WHITE, sb_bg)
     if curses.COLORS >= 256:
         # xterm grey (240) — dimmer than COLOR_WHITE + A_DIM, gives a
@@ -184,14 +199,24 @@ def init_colors() -> None:
         curses.init_pair(PAIR_PASTEL_YELLOW_ACTIVE, curses.COLOR_YELLOW, sb_bg_active)
         curses.init_pair(PAIR_PASTEL_BLUE_ACTIVE, curses.COLOR_CYAN, sb_bg_active)
 
-    # Dialog (modal) panel background — independent of the sidebar
-    # so the two surfaces can diverge later. Currently the same
-    # values: COLOR_BLACK on every terminal (theme renders it as a
-    # dark grey on most modern themes — the "lighter grey panel"
-    # appearance the modals have historically had), bumping to
-    # xterm 236 for the active variant on 256-colour terminals.
-    dlg_bg = curses.COLOR_BLACK
-    dlg_bg_active = 236 if curses.COLORS >= 256 else dlg_bg
+    # Dialog (modal) panel background. On 256-colour terminals we
+    # pin the panel to xterm 235 (`#262626`, a fixed mid-grey) instead
+    # of `curses.COLOR_BLACK` so the panel is visibly distinct from
+    # the surrounding screen AND can host a darker inset field
+    # (`PAIR_DLG_FIELD`, true black) — the "raised panel with recessed
+    # text-area" UI metaphor. The active variant (xterm 236) is one
+    # shade lighter for focused-row highlights, preserving the
+    # existing visual ordering panel < active < text. 8-colour
+    # terminals fall back to ANSI black for both (there's no darker-
+    # than-black available there); the field differentiates via
+    # A_UNDERLINE instead — see the field-fill branch in
+    # `draw_commit_msg_editor`.
+    if curses.COLORS >= 256:
+        dlg_bg = 235
+        dlg_bg_active = 236
+    else:
+        dlg_bg = curses.COLOR_BLACK
+        dlg_bg_active = dlg_bg
     curses.init_pair(PAIR_DLG_FG, curses.COLOR_WHITE, dlg_bg)
     curses.init_pair(PAIR_DLG_CYAN, curses.COLOR_CYAN, dlg_bg)
     curses.init_pair(PAIR_DLG_OK, curses.COLOR_GREEN, dlg_bg)
@@ -214,6 +239,13 @@ def init_colors() -> None:
         curses.init_pair(PAIR_DLG_PASTEL_RED_ACTIVE, 174, dlg_bg_active)
         curses.init_pair(PAIR_DLG_PASTEL_YELLOW_ACTIVE, 179, dlg_bg_active)
         curses.init_pair(PAIR_DLG_PASTEL_BLUE_ACTIVE, 109, dlg_bg_active)
+        # Inset field bg — uses xterm-256 colour 16 (#000000, true
+        # black from the cube), NOT `curses.COLOR_BLACK` (= colour 0,
+        # which most themes remap to a dark-grey "ANSI black"). The
+        # explicit-cube colour bypasses the theme so the field always
+        # reads as a recessed near-black panel against the slightly-
+        # lighter panel chrome (PAIR_DLG_PANEL_LIGHT below).
+        curses.init_pair(PAIR_DLG_FIELD, curses.COLOR_WHITE, 16)
     else:
         curses.init_pair(PAIR_DLG_FG_DISABLED, curses.COLOR_WHITE, dlg_bg)
         curses.init_pair(PAIR_DLG_FG_HINT_TEXT, curses.COLOR_WHITE, dlg_bg)
@@ -225,6 +257,11 @@ def init_colors() -> None:
         curses.init_pair(PAIR_DLG_PASTEL_RED_ACTIVE, curses.COLOR_RED, dlg_bg_active)
         curses.init_pair(PAIR_DLG_PASTEL_YELLOW_ACTIVE, curses.COLOR_YELLOW, dlg_bg_active)
         curses.init_pair(PAIR_DLG_PASTEL_BLUE_ACTIVE, curses.COLOR_CYAN, dlg_bg_active)
+        # 8-color fallback: no truly-darker shade available, so the
+        # textarea uses the same bg as the panel. The renderer adds an
+        # A_UNDERLINE attribute per row in this mode to keep the field
+        # visually distinct without a colour change.
+        curses.init_pair(PAIR_DLG_FIELD, curses.COLOR_WHITE, dlg_bg)
     # Modal border foreground: a shade lighter than dlg_bg so the box
     # reads as a soft outline rather than the screaming-white the
     # PAIR_DLG_FG_HINT_TEXT (xterm 250) gave. xterm 237 (~RGB 58/58/58)

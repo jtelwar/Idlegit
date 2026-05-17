@@ -166,6 +166,9 @@ def is_safe_ref_arg(ref: str) -> bool:
 
 
 def first_line(text: str) -> str:
+    """First non-blank line of `text`, stripped. Returns the sentinel
+    `"(no output)"` when input is empty or whitespace-only — task-row
+    messages prefer that to a blank cell when surfacing git's stderr."""
     if not text:
         return "(no output)"
     for ln in text.strip().splitlines():
@@ -692,6 +695,58 @@ def list_registered_submodule_paths(repo_path: Path) -> "set[str]":
         if len(parts) == 2:
             paths.add(parts[1].strip())
     return paths
+
+
+def has_only_submodule_pointer_changes(repo_path: Path) -> bool:
+    """True iff every change in `repo_path`'s working tree is a
+    modification to a registered submodule's gitlink. False when the
+    tree is clean (nothing to propagate), when any non-submodule path is
+    dirty, or when any submodule path shows up as a deletion / addition
+    / untracked entry (those need human attention — staging them would
+    rewrite or destroy the gitlink).
+
+    Smart-sync uses this as a precondition before auto-bumping a
+    parent's submodule pointer after the canonical sync: if the parent
+    has unrelated work in progress, propagation backs off and leaves
+    the user to commit on their own."""
+    submodule_paths = list_registered_submodule_paths(repo_path)
+    if not submodule_paths:
+        return False
+    rc, out, _ = git(repo_path, ["status", "--porcelain=v1", "-z"])
+    if rc != 0:
+        return False
+    parts = out.split("\x00")
+    saw_pointer_change = False
+    i = 0
+    while i < len(parts):
+        entry = parts[i]
+        i += 1
+        if len(entry) < 3:
+            continue
+        xy = entry[:2]
+        path_str = entry[3:]
+        # `-z` emits the rename source as a separate NUL-chunk after
+        # the status row — skip it so we don't reparse it as a status.
+        if xy[0] in ("R", "C") or xy[1] in ("R", "C"):
+            i += 1
+        if xy == "??":
+            # Any untracked path means there's non-submodule dirt to
+            # worry about; bail without claiming propagation.
+            return False
+        if path_str not in submodule_paths:
+            return False
+        # The submodule path must be a pure modification ("M" only —
+        # not addition / deletion / typechange / conflict / etc.).
+        # Anything else should be human-resolved; auto-committing
+        # could record a brand-new gitlink, unregister the submodule,
+        # or land mid-merge state.
+        x, y = xy[0], xy[1]
+        if x not in (" ", "M") or y not in (" ", "M"):
+            return False
+        if x == " " and y == " ":
+            return False
+        saw_pointer_change = True
+    return saw_pointer_change
 
 
 def safe_stage_all(repo_path: Path) -> Tuple[bool, str]:
@@ -1395,6 +1450,11 @@ def cancel_run(slug: str, run_id: int) -> Tuple[bool, str]:
 
 
 def query_target_state(path: Path, max_commits: int = 5) -> TargetState:
+    """Snapshot the fields the action-menu header needs for a target
+    checkout: current branch, upstream tracking ref, ahead/behind counts,
+    origin URL, and the last `max_commits` commits on HEAD. Read-only —
+    no git mutations. Empty/zero fields on any sub-query failure so the
+    menu can still open against a detached / unborn / origin-less repo."""
     branch = ""
     rc, out, _ = git(path, ["branch", "--show-current"])
     if rc == 0:
@@ -1903,6 +1963,12 @@ def _scan_path_status(path: Path) -> Tuple[
 
 
 def collect_changes(repo: Repo, auto_stage: bool) -> List[FileChange]:
+    """Build the FileChange list driving the review screen and the
+    commit-message suggester for `repo`. When `auto_stage` is True, the
+    unstaged + untracked sides feed in alongside the staged set
+    (matches the "stage all" pipeline); when False, only already-staged
+    paths show up. Pure transform over the snapshot already captured
+    on the Repo dataclass — no re-querying git here."""
     return _collect_changes_at(
         repo.path, repo.staged, repo.unstaged, repo.untracked, auto_stage)
 
@@ -1991,6 +2057,10 @@ def suggest_commit_message_for_paths(
 
 
 def format_size(num_bytes: int) -> str:
+    """Human-readable size for the LFS-warning rows on the review
+    screen. Always MB or GB — the LFS threshold is MB-scaled so any
+    value worth flagging lives in that band, and the narrower set of
+    units keeps the column visually tidy."""
     mb = num_bytes / (1024 * 1024)
     if mb < 1024:
         return f"{mb:.1f} MB"

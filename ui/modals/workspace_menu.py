@@ -63,8 +63,15 @@ def _hints_nav_mode(state, menu: WorkspaceMenu) -> list:
                                   "(can't remove last folder)"))
         elif row.kind == "add_folder":
             hints.append(Hint(KEY_ENTER, "type a new folder path"))
+        elif row.kind == "ignore_pattern":
+            hints.append(Hint(KEY_ENTER, "edit pattern"))
+            hints.append(Hint(KEY_BACKSPACE, "remove pattern"))
+        elif row.kind == "add_ignore_pattern":
+            hints.append(Hint(KEY_ENTER, "type a new ignore pattern"))
         elif row.kind == "clone":
             hints.append(Hint(KEY_ENTER, "open clone dialog"))
+        elif row.kind == "save_ephemeral":
+            hints.append(Hint(KEY_ENTER, "persist as workspace"))
         elif row.kind == "bool":
             hints.append(Hint(KEY_SPACE, "toggle"))
             hints.append(Hint(KEY_BACKSPACE, "clear override"))
@@ -128,6 +135,18 @@ _OVERRIDE_ROWS: Tuple[WorkspaceMenuRow, ...] = (
         label="Prevent silent merge (sync)",
         attr_name="default_prevent_smart_sync_silent_merge", kind="bool",
         hint_text="smart-sync: FF-only for losers — no auto merge commits (default: off)"),
+    WorkspaceMenuRow(
+        label="Auto-push submodule parent",
+        attr_name="default_auto_push_submodule_parent", kind="bool",
+        hint_text="after sync, commit+push any parent whose only dirt is the bumped submodule (default: on)"),
+    WorkspaceMenuRow(
+        label="Auto-recurse submodules",
+        attr_name="auto_recurse_submodules", kind="bool",
+        hint_text="pull/fetch with --recurse-submodules=on-demand so submodule checkouts advance with the parent (default: on)"),
+    WorkspaceMenuRow(
+        label="Fetch on manual refresh",
+        attr_name="fetch_on_manual_refresh", kind="bool",
+        hint_text="Ctrl+R does `git fetch --all` per repo so ahead/behind is fresh; off keeps Ctrl+R instant + offline (default: off)"),
     WorkspaceMenuRow(label="DISPLAY", attr_name="", kind="header"),
     WorkspaceMenuRow(
         label="Name truncation",
@@ -199,9 +218,19 @@ def _build_rows(ws: Workspace) -> List[WorkspaceMenuRow]:
     per existing folder, the "+ Add folder" sentinel, then the static
     overrides schema. Folder row `attr_name` carries the index back into
     `ws.folders` so the handler can edit the right entry."""
-    rows: List[WorkspaceMenuRow] = [
-        WorkspaceMenuRow(label="FOLDERS", attr_name="", kind="header"),
-    ]
+    rows: List[WorkspaceMenuRow] = []
+    # When the workspace is ephemeral (auto-minted from cwd), expose
+    # a one-shot promote-to-permanent row at the top so the user can
+    # save it without leaving the menu. Persisted workspaces don't
+    # need this — the row is hidden once the flag is cleared.
+    if ws.ephemeral:
+        rows.append(WorkspaceMenuRow(
+            label="EPHEMERAL WORKSPACE", attr_name="", kind="header"))
+        rows.append(WorkspaceMenuRow(
+            label="+ Save as workspace…",
+            attr_name="", kind="save_ephemeral"))
+    rows.append(WorkspaceMenuRow(
+        label="FOLDERS", attr_name="", kind="header"))
     for i in range(len(ws.folders)):
         rows.append(WorkspaceMenuRow(
             label=f"folder {i + 1}", attr_name=str(i), kind="folder"))
@@ -209,6 +238,21 @@ def _build_rows(ws: Workspace) -> List[WorkspaceMenuRow]:
         label="+ Add folder…", attr_name="", kind="add_folder"))
     rows.append(WorkspaceMenuRow(
         label="+ Clone repository…", attr_name="", kind="clone"))
+    # FILE WATCH IGNORE: gitignore-style patterns that suppress
+    # fs-watcher auto-refresh for matching paths. Empty by default;
+    # the section header still shows so the user can find the entry
+    # point ("+ Add pattern…") without scrolling through overrides.
+    rows.append(WorkspaceMenuRow(
+        label="FILE WATCH IGNORE", attr_name="", kind="header"))
+    for i in range(len(ws.fs_watch_ignore)):
+        rows.append(WorkspaceMenuRow(
+            label=f"pattern {i + 1}", attr_name=str(i),
+            kind="ignore_pattern"))
+    rows.append(WorkspaceMenuRow(
+        label="+ Add pattern…", attr_name="",
+        kind="add_ignore_pattern",
+        hint_text="gitignore syntax — *.log, build/**, !keep.log, "
+                  "leading / anchors, trailing / for dirs"))
     rows.extend(_OVERRIDE_ROWS)
     return rows
 
@@ -380,6 +424,39 @@ def _persist(state: State) -> None:
         pass
 
 
+def _save_ephemeral_workspace(state: State) -> None:
+    """Promote the active ephemeral workspace to a persisted one.
+    Flips the `ephemeral` flag off so `save_workspaces` will include
+    it on the next write, then writes the workspaces file
+    immediately. Rebuilds the menu rows so the "Save as workspace…"
+    entry disappears and the title brackets vanish.
+
+    Surfaces a task confirming the action so the user sees feedback
+    in the sidebar — silent state changes feel broken on a TUI."""
+    ws = state.active_workspace
+    if ws is None or not ws.ephemeral:
+        return
+    ws.ephemeral = False
+    # Mirror the bracketed-name → bare-name flip onto the live State
+    # field too, otherwise the title row keeps rendering "[name]"
+    # until the next workspace switch.
+    state.workspace_name = ws.display_name
+    t = state.tasks.add(f"save workspace: {ws.name}")
+    try:
+        save_workspaces(state.workspaces, state.active_workspace_index)
+    except OSError as e:
+        # Roll back the flip on disk failure so a retried save can
+        # try again rather than leaving an in-memory state that
+        # disagrees with the persisted file.
+        ws.ephemeral = True
+        state.workspace_name = ws.display_name
+        state.tasks.update(t, "fail", f"could not write: {e}")
+        _rebuild_rows(state)
+        return
+    state.tasks.update(t, "ok", "added to idlegit.workspaces")
+    _rebuild_rows(state)
+
+
 # ---------- Folder-row mutation -----------------------------------------
 
 
@@ -406,6 +483,44 @@ def _commit_folder_edit(state: State, idx: int, raw: str) -> bool:
         ws.folders.append(p)
     else:
         ws.folders[idx] = p
+    _persist(state)
+    return True
+
+
+def _commit_ignore_pattern_edit(state: State, idx: int, raw: str) -> bool:
+    """Set or append `ws.fs_watch_ignore[idx]` to `raw` (trimmed),
+    persist, and mirror the change onto `state.fs_watch_ignore` so
+    the live watcher picks it up on the next event (RepoWatcher
+    re-checks the patterns tuple per event and recompiles its
+    PathSpec on change). Returns True if the edit applied; False on
+    an empty buffer (caller treats as a no-op cancel)."""
+    ws = state.active_workspace
+    if ws is None:
+        return False
+    text = raw.strip()
+    if not text:
+        return False
+    if idx == len(ws.fs_watch_ignore):
+        ws.fs_watch_ignore.append(text)
+    else:
+        ws.fs_watch_ignore[idx] = text
+    state.fs_watch_ignore = list(ws.fs_watch_ignore)
+    _persist(state)
+    return True
+
+
+def _remove_ignore_pattern(state: State, idx: int) -> bool:
+    """Drop `ws.fs_watch_ignore[idx]`, persist, mirror onto State.
+    Unlike folders, there's no "can't remove the last" guard — an
+    empty pattern list is the default and reverts the watcher to
+    its un-filtered behaviour."""
+    ws = state.active_workspace
+    if ws is None:
+        return False
+    if idx < 0 or idx >= len(ws.fs_watch_ignore):
+        return False
+    del ws.fs_watch_ignore[idx]
+    state.fs_watch_ignore = list(ws.fs_watch_ignore)
     _persist(state)
     return True
 
@@ -554,7 +669,8 @@ def draw_workspace_menu(stdscr, state: State, sidebar_x: int) -> None:
     inner_w = w - 4
 
     ws = state.active_workspace
-    title = f"Workspace settings — {ws.name if ws else '(no workspace)'}"
+    title = (
+        f"Workspace settings — {ws.display_name if ws else '(no workspace)'}")
     safe_addstr(stdscr, y + 1, inner_x, title[:inner_w],
                 curses.A_BOLD | curses.color_pair(PAIR_DLG_CYAN))
 
@@ -590,7 +706,13 @@ def draw_workspace_menu(stdscr, state: State, sidebar_x: int) -> None:
                              menu, row, focused, sb)
             continue
 
-        if row.kind in ("add_folder", "clone"):
+        if row.kind == "ignore_pattern":
+            _draw_ignore_pattern_row(stdscr, line_y, inner_x, inner_w,
+                                     state, menu, row, focused, sb)
+            continue
+
+        if row.kind in ("add_folder", "add_ignore_pattern",
+                        "clone", "save_ephemeral"):
             prefix = "→ " if focused else "  "
             text = (prefix + row.label).ljust(inner_w)[:inner_w]
             attr = (curses.color_pair(PAIR_DLG_CYAN) | curses.A_BOLD
@@ -654,6 +776,55 @@ def draw_workspace_menu(stdscr, state: State, sidebar_x: int) -> None:
 
     _draw_menu_hints(stdscr, state, menu, y + h - 2, inner_x, inner_w,
                      sb | curses.A_DIM)
+
+
+def _draw_ignore_pattern_row(stdscr, line_y: int, inner_x: int,
+                             inner_w: int, state: State,
+                             menu: WorkspaceMenu, row: WorkspaceMenuRow,
+                             focused: bool, sb: int) -> None:
+    """Render one fs_watch_ignore pattern row — the pattern string on
+    the left, in edit mode swapped for the live edit buffer. No badge
+    (unlike folders, there's nothing to validate live — pathspec just
+    consumes the line as a gitignore pattern)."""
+    ws = state.active_workspace
+    try:
+        idx = int(row.attr_name)
+    except ValueError:
+        idx = -1
+    current = (ws.fs_watch_ignore[idx]
+               if ws is not None and 0 <= idx < len(ws.fs_watch_ignore)
+               else "")
+    prefix = "→ " if focused else "  "
+    field_w = max(20, inner_w - len(prefix))
+
+    if focused and menu.editing:
+        text = menu.edit_buffer
+        cur = max(0, min(menu.edit_cursor, len(text)))
+        if len(text) <= field_w - 1:
+            visible = text
+            cur_x_off = cur
+        else:
+            half = (field_w - 1) // 2
+            start = max(0, min(cur - half, len(text) - (field_w - 1)))
+            visible = text[start:start + field_w - 1]
+            cur_x_off = cur - start
+        body = visible.ljust(field_w)
+        attr = (curses.color_pair(PAIR_DLG_CYAN) | curses.A_BOLD
+                | curses.A_UNDERLINE)
+        safe_addstr(stdscr, line_y, inner_x, prefix, attr)
+        safe_addstr(stdscr, line_y, inner_x + len(prefix), body, attr)
+        try:
+            stdscr.move(line_y, inner_x + len(prefix) + cur_x_off)
+            curses.curs_set(2)
+        except curses.error:
+            pass
+        return
+
+    visible = truncate(current, field_w, "end")
+    body = visible.ljust(field_w)
+    attr = sb | curses.A_REVERSE if focused else sb
+    safe_addstr(stdscr, line_y, inner_x,
+                (prefix + body).ljust(inner_w)[:inner_w], attr)
 
 
 def _draw_folder_row(stdscr, line_y: int, inner_x: int, inner_w: int,
@@ -812,10 +983,45 @@ def handle_workspace_menu_key(state: State, key: int) -> None:
             return
         return
 
+    if row.kind == "ignore_pattern":
+        if key in (10, 13, curses.KEY_ENTER):
+            ws = state.active_workspace
+            if ws is None:
+                return
+            try:
+                idx = int(row.attr_name)
+            except ValueError:
+                return
+            current = (ws.fs_watch_ignore[idx]
+                       if 0 <= idx < len(ws.fs_watch_ignore) else "")
+            _enter_edit_mode(menu, current)
+            return
+        if key in (curses.KEY_BACKSPACE, 127, 8, curses.KEY_DC):
+            try:
+                idx = int(row.attr_name)
+            except ValueError:
+                return
+            if _remove_ignore_pattern(state, idx):
+                _rebuild_rows(state)
+            return
+        return
+
+    if row.kind == "add_ignore_pattern":
+        if key in (10, 13, curses.KEY_ENTER, ord(" ")):
+            _enter_edit_mode(menu, "")
+            return
+        return
+
     if row.kind == "clone":
         if key in (10, 13, curses.KEY_ENTER, ord(" ")):
             from .clone import open_clone_modal
             open_clone_modal(state)
+            return
+        return
+
+    if row.kind == "save_ephemeral":
+        if key in (10, 13, curses.KEY_ENTER, ord(" ")):
+            _save_ephemeral_workspace(state)
             return
         return
 
@@ -861,8 +1067,10 @@ def _handle_edit_key(state: State, menu: WorkspaceMenu, key: int) -> None:
         if ws is None:
             _exit_edit_mode(menu)
             return
-        # Determine target index. Folder rows carry their index in
-        # attr_name; the add_folder sentinel commits at len(ws.folders).
+        # Determine target index + dispatch by row kind. Folder rows
+        # carry their index in attr_name; the add_folder sentinel
+        # commits at len(ws.folders). The ignore-pattern rows follow
+        # the same pattern against ws.fs_watch_ignore.
         if row.kind == "folder":
             try:
                 idx = int(row.attr_name)
@@ -871,6 +1079,26 @@ def _handle_edit_key(state: State, menu: WorkspaceMenu, key: int) -> None:
                 return
         elif row.kind == "add_folder":
             idx = len(ws.folders)
+        elif row.kind == "ignore_pattern":
+            try:
+                idx = int(row.attr_name)
+            except ValueError:
+                _exit_edit_mode(menu)
+                return
+            if not _commit_ignore_pattern_edit(state, idx, text):
+                _exit_edit_mode(menu)
+                return
+            _exit_edit_mode(menu)
+            _rebuild_rows(state)
+            return
+        elif row.kind == "add_ignore_pattern":
+            idx = len(ws.fs_watch_ignore)
+            if not _commit_ignore_pattern_edit(state, idx, text):
+                _exit_edit_mode(menu)
+                return
+            _exit_edit_mode(menu)
+            _rebuild_rows(state)
+            return
         else:
             _exit_edit_mode(menu)
             return

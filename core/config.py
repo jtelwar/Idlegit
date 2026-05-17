@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import configparser
 import os
+import re
 import shutil
 import sys
 from dataclasses import dataclass
@@ -183,6 +184,44 @@ DEFAULT_PROMPT_FOR_BRANCH = True
 # When True, smart-sync refuses non-FF merges when aligning losers (strict
 # FF-only). Default False allows an automatic merge commit after FF fails.
 DEFAULT_PREVENT_SMART_SYNC_SILENT_MERGE = False
+# When True, smart-sync follows up its canonical alignment by staging,
+# committing, and pushing each parent whose ONLY dirty change is the
+# now-stale submodule gitlink(s) — cascading upward as long as every
+# intermediate parent also has only-submodule dirt. Default ON so the
+# common case ("sync the submodule, ship the parent") works without
+# extra keystrokes; flip OFF if a workspace wants the parent commit to
+# stay a manual decision.
+DEFAULT_AUTO_PUSH_SUBMODULE_PARENT = True
+# Task logging — when on, every terminal task transition (ok / fail /
+# warn) appends a line to `task_log_path`. Default off so the file
+# isn't created unless the user opts in. Path defaults to the user
+# data dir's `tasks.log`; an empty string in the conf resolves to that
+# default. `task_log_max_lines` caps the file size in line count and
+# rotates oldest-first when exceeded; <=0 disables the cap entirely.
+DEFAULT_TASK_LOG_ENABLED = False
+DEFAULT_TASK_LOG_PATH = ""
+DEFAULT_TASK_LOG_MAX_LINES = 0
+# Filesystem-watched auto-refresh: when ON, idlegit listens for OS-level
+# fs events (via watchdog) under each repo's working tree + `.git/` and
+# kicks a lightweight per-repo refresh after `auto_refresh_debounce_ms`
+# of quiet. OFF returns to the historical "Ctrl+R only" behaviour.
+DEFAULT_AUTO_REFRESH_ON_FS_CHANGE = True
+DEFAULT_AUTO_REFRESH_DEBOUNCE_MS = 400
+# When True, idlegit's own pull / fetch operations pass
+# `--recurse-submodules=on-demand` so the working trees of submodules
+# whose gitlinks just advanced get synced as part of the same op (no
+# separate `git submodule update` needed). Doesn't touch the user's
+# `git config` — entirely internal to idlegit's subprocess calls.
+DEFAULT_AUTO_RECURSE_SUBMODULES = True
+# When True, Ctrl+R does `git fetch --all` per repo before re-reading
+# state, so the displayed ahead/behind reflects actual upstream rather
+# than whatever the local `@{u}` ref was at last fetch. Off by default
+# — Ctrl+R has historically been instant + offline, and adding network
+# calls per repo can slow it noticeably on workspaces with many repos
+# or a flaky network. Working trees are NEVER modified by this fetch
+# (just refs); use the action menu's Pull or auto-push-after-commit
+# to actually advance HEAD.
+DEFAULT_FETCH_ON_MANUAL_REFRESH = False
 
 
 def _warn_config(message: str) -> None:
@@ -240,6 +279,15 @@ class Config:
     default_prompt_for_branch: bool = DEFAULT_PROMPT_FOR_BRANCH
     default_prevent_smart_sync_silent_merge: bool = (
         DEFAULT_PREVENT_SMART_SYNC_SILENT_MERGE)
+    default_auto_push_submodule_parent: bool = (
+        DEFAULT_AUTO_PUSH_SUBMODULE_PARENT)
+    task_log_enabled: bool = DEFAULT_TASK_LOG_ENABLED
+    task_log_path: str = DEFAULT_TASK_LOG_PATH
+    task_log_max_lines: int = DEFAULT_TASK_LOG_MAX_LINES
+    auto_refresh_on_fs_change: bool = DEFAULT_AUTO_REFRESH_ON_FS_CHANGE
+    auto_refresh_debounce_ms: int = DEFAULT_AUTO_REFRESH_DEBOUNCE_MS
+    auto_recurse_submodules: bool = DEFAULT_AUTO_RECURSE_SUBMODULES
+    fetch_on_manual_refresh: bool = DEFAULT_FETCH_ON_MANUAL_REFRESH
 
 
 def load_config() -> Config:
@@ -271,6 +319,15 @@ def load_config() -> Config:
     default_prompt_for_branch = DEFAULT_PROMPT_FOR_BRANCH
     default_prevent_smart_sync_silent_merge = (
         DEFAULT_PREVENT_SMART_SYNC_SILENT_MERGE)
+    default_auto_push_submodule_parent = (
+        DEFAULT_AUTO_PUSH_SUBMODULE_PARENT)
+    task_log_enabled = DEFAULT_TASK_LOG_ENABLED
+    task_log_path = DEFAULT_TASK_LOG_PATH
+    task_log_max_lines = DEFAULT_TASK_LOG_MAX_LINES
+    auto_refresh_on_fs_change = DEFAULT_AUTO_REFRESH_ON_FS_CHANGE
+    auto_refresh_debounce_ms = DEFAULT_AUTO_REFRESH_DEBOUNCE_MS
+    auto_recurse_submodules = DEFAULT_AUTO_RECURSE_SUBMODULES
+    fetch_on_manual_refresh = DEFAULT_FETCH_ON_MANUAL_REFRESH
 
     _CONFIG_WARNINGS.clear()
     _ensure_config_ready()
@@ -338,6 +395,30 @@ def load_config() -> Config:
             default_prevent_smart_sync_silent_merge = cp.getboolean(
                 "idlegit", "default_prevent_smart_sync_silent_merge",
                 fallback=DEFAULT_PREVENT_SMART_SYNC_SILENT_MERGE)
+            default_auto_push_submodule_parent = cp.getboolean(
+                "idlegit", "default_auto_push_submodule_parent",
+                fallback=DEFAULT_AUTO_PUSH_SUBMODULE_PARENT)
+            task_log_enabled = cp.getboolean(
+                "idlegit", "task_log_enabled",
+                fallback=DEFAULT_TASK_LOG_ENABLED)
+            task_log_path = cp.get(
+                "idlegit", "task_log_path",
+                fallback=DEFAULT_TASK_LOG_PATH).strip()
+            task_log_max_lines = cp.getint(
+                "idlegit", "task_log_max_lines",
+                fallback=DEFAULT_TASK_LOG_MAX_LINES)
+            auto_refresh_on_fs_change = cp.getboolean(
+                "idlegit", "auto_refresh_on_fs_change",
+                fallback=DEFAULT_AUTO_REFRESH_ON_FS_CHANGE)
+            auto_refresh_debounce_ms = cp.getint(
+                "idlegit", "auto_refresh_debounce_ms",
+                fallback=DEFAULT_AUTO_REFRESH_DEBOUNCE_MS)
+            auto_recurse_submodules = cp.getboolean(
+                "idlegit", "auto_recurse_submodules",
+                fallback=DEFAULT_AUTO_RECURSE_SUBMODULES)
+            fetch_on_manual_refresh = cp.getboolean(
+                "idlegit", "fetch_on_manual_refresh",
+                fallback=DEFAULT_FETCH_ON_MANUAL_REFRESH)
         except (configparser.Error, OSError, ValueError) as e:
             _warn_config(f"{CONFIG_FILE.name}: using defaults ({e})")
 
@@ -377,7 +458,81 @@ def load_config() -> Config:
         default_prompt_for_branch=default_prompt_for_branch,
         default_prevent_smart_sync_silent_merge=(
             default_prevent_smart_sync_silent_merge),
+        default_auto_push_submodule_parent=(
+            default_auto_push_submodule_parent),
+        task_log_enabled=task_log_enabled,
+        task_log_path=task_log_path,
+        task_log_max_lines=max(0, task_log_max_lines),
+        auto_refresh_on_fs_change=auto_refresh_on_fs_change,
+        auto_refresh_debounce_ms=max(50, auto_refresh_debounce_ms),
+        auto_recurse_submodules=auto_recurse_submodules,
+        fetch_on_manual_refresh=fetch_on_manual_refresh,
     )
+
+
+def set_conf_value(key: str, value: str) -> bool:
+    """Update one `key = value` line in idlegit.conf in-place, preserving
+    everything else (comments, ordering, key padding, inline `;` hints).
+    If the key isn't present, it's appended to the `[idlegit]` section.
+    If the file doesn't exist, it's seeded from the bundled default
+    template first via `_ensure_config_ready`.
+
+    Used by app-menu toggles (today: task logging on/off) that flip a
+    global setting the user expects to survive across restarts.
+    `configparser` round-trips lose the inline comments we ship in the
+    default template, so we go line-based instead. Returns True iff the
+    file was written; False on any I/O failure (the menu surfaces a
+    warn task in that case)."""
+    _ensure_config_ready()
+    try:
+        text = CONFIG_FILE.read_text(encoding="utf-8")
+    except OSError:
+        return False
+
+    # Match: optional leading whitespace, the key, `=`, then the
+    # value-and-comment tail up to end-of-line. We replace only the
+    # value portion (before any `;` inline comment), leaving the
+    # comment and trailing whitespace untouched.
+    pattern = re.compile(
+        rf"^([ \t]*{re.escape(key)}[ \t]*=[ \t]*)([^;\n]*?)([ \t]*(?:;[^\n]*)?)$",
+        re.MULTILINE,
+    )
+
+    def _replace(m: "re.Match") -> str:
+        return f"{m.group(1)}{value}{m.group(3)}"
+
+    new_text, n = pattern.subn(_replace, text, count=1)
+    if n == 0:
+        # Key missing — append under the [idlegit] section. Insert at
+        # the end of the section (right before the next `[section]`
+        # header or end-of-file), so it sits with its peers.
+        section_pat = re.compile(
+            r"(^\[idlegit\][^\n]*\n(?:(?!^\[).*\n?)*)",
+            re.MULTILINE,
+        )
+        insertion = f"{key} = {value}\n"
+        new_text, n = section_pat.subn(
+            lambda m: m.group(1).rstrip() + "\n" + insertion + "\n",
+            text, count=1)
+        if n == 0:
+            # No `[idlegit]` section at all — prepend it.
+            new_text = (
+                f"[idlegit]\n{insertion}\n" + text)
+
+    # Atomic write so a crash mid-write can't leave a half-rewritten
+    # conf. `Path.replace` is atomic on POSIX; on Windows it's atomic
+    # for the same volume (which CONFIG_FILE.parent always is).
+    tmp = CONFIG_FILE.with_suffix(CONFIG_FILE.suffix + ".tmp")
+    try:
+        tmp.write_text(new_text, encoding="utf-8")
+        tmp.replace(CONFIG_FILE)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        return False
+    return True
 
 
 # ---------- Workspace overrides schema ------------------------------------
@@ -397,6 +552,7 @@ WORKSPACE_OVERRIDE_TYPES: "dict[str, str]" = {
     "default_auto_ff": "bool",
     "default_prompt_for_branch": "bool",
     "default_prevent_smart_sync_silent_merge": "bool",
+    "default_auto_push_submodule_parent": "bool",
     "suggest_added": "int",
     "suggest_updated": "int",
     "suggest_deleted": "int",
@@ -413,6 +569,10 @@ WORKSPACE_OVERRIDE_TYPES: "dict[str, str]" = {
     "lfs_warn_mb": "int",
     "actions_poll_seconds": "float",
     "auto_remove_completed_tasks_after_interval": "float",
+    "auto_refresh_on_fs_change": "bool",
+    "auto_refresh_debounce_ms": "int",
+    "auto_recurse_submodules": "bool",
+    "fetch_on_manual_refresh": "bool",
 }
 
 
@@ -429,6 +589,7 @@ WORKSPACE_OVERRIDE_TARGETS: "dict[str, str]" = {
     "default_prompt_for_branch": "prompt_for_branch",
     "default_prevent_smart_sync_silent_merge": (
         "prevent_smart_sync_silent_merge"),
+    "default_auto_push_submodule_parent": "auto_push_submodule_parent",
     "suggest_added": "suggest_added",
     "suggest_updated": "suggest_updated",
     "suggest_deleted": "suggest_deleted",
@@ -445,6 +606,10 @@ WORKSPACE_OVERRIDE_TARGETS: "dict[str, str]" = {
     "lfs_warn_mb": "lfs_warn_bytes",
     "actions_poll_seconds": "actions_poll_seconds",
     "auto_remove_completed_tasks_after_interval": "auto_remove_completed_after",
+    "auto_refresh_on_fs_change": "auto_refresh_on_fs_change",
+    "auto_refresh_debounce_ms": "auto_refresh_debounce_ms",
+    "auto_recurse_submodules": "auto_recurse_submodules",
+    "fetch_on_manual_refresh": "fetch_on_manual_refresh",
 }
 
 
@@ -509,6 +674,33 @@ def state_attr_value_from_override(key: str, value):
 
 
 # ---------- Workspaces loader / saver -------------------------------------
+
+
+def _parse_fs_watch_ignore_block(text: str) -> List[str]:
+    """Parse a multi-line gitignore-style block: one pattern per line,
+    blank lines + `#` comments dropped. Patterns are kept verbatim
+    (case, whitespace within the pattern, trailing `/`) so the watcher
+    layer can compile them with `pathspec` and get full gitignore
+    semantics without re-canonicalising here."""
+    patterns: List[str] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        patterns.append(line)
+    return patterns
+
+
+def _format_fs_watch_ignore_block(patterns: List[str]) -> str:
+    """Render an fs_watch_ignore list back into a multi-line conf
+    block. Matches `_format_folders_block`'s indentation so the saved
+    file stays readable when an editor expands the continuation."""
+    if not patterns:
+        return ""
+    lines = [patterns[0]]
+    for p in patterns[1:]:
+        lines.append("                        " + p)
+    return "\n".join(lines)
 
 
 def _parse_folders_block(text: str, anchor: Path) -> List[Path]:
@@ -591,15 +783,22 @@ def load_workspaces() -> "tuple[List[Workspace], int]":
             folders_raw, WORKSPACES_FILE.parent)
         if not folders:
             continue
+        # `fs_watch_ignore` is a multi-line gitignore-style block,
+        # parsed the same way as `folders` (one pattern per line) but
+        # without path resolution. Blank lines and `#` comments are
+        # dropped at the parse layer so the runtime list reads cleanly.
+        ignore_raw = cp.get(section, "fs_watch_ignore", fallback="")
+        fs_watch_ignore = _parse_fs_watch_ignore_block(ignore_raw)
         overrides: dict = {}
         for key in cp[section]:
-            if key == "folders":
+            if key in ("folders", "fs_watch_ignore"):
                 continue
             value = coerce_override_value(key, cp.get(section, key))
             if value is not None:
                 overrides[key] = value
         workspaces.append(Workspace(
-            name=name, folders=folders, overrides=overrides))
+            name=name, folders=folders, overrides=overrides,
+            fs_watch_ignore=fs_watch_ignore))
 
     # Second pass: workspace-scoped subtrees. `[workspace.X.subtree.Y]`
     # attaches to workspace X; if X doesn't exist we silently drop the
@@ -665,14 +864,27 @@ def save_workspaces(workspaces: List[Workspace],
     [idlegit] block; load_workspaces handles a missing block as
     "default to index 0"."""
     cp = configparser.ConfigParser()
-    if 0 <= active_index < len(workspaces):
+    # Ephemeral workspaces (launched-from-cwd transients) MUST NOT
+    # be persisted — they're regenerated every session and writing
+    # them out would pollute idlegit.workspaces with whatever
+    # directory the user happened to launch from.
+    persistable = [ws for ws in workspaces if not ws.ephemeral]
+    if (0 <= active_index < len(workspaces)
+            and not workspaces[active_index].ephemeral):
         cp["idlegit"] = {
             "active_workspace": workspaces[active_index].name,
         }
-    for ws in workspaces:
+    for ws in persistable:
         section = f"workspace.{ws.name}"
         cp[section] = {}
         cp[section]["folders"] = _format_folders_block(ws.folders)
+        # Emit fs_watch_ignore directly under folders so related
+        # path/pattern config sits together. Skip the key entirely
+        # when the list is empty so legacy workspaces don't grow a
+        # noisy empty block on first save.
+        if ws.fs_watch_ignore:
+            cp[section]["fs_watch_ignore"] = _format_fs_watch_ignore_block(
+                ws.fs_watch_ignore)
         for key in WORKSPACE_OVERRIDE_TYPES:
             if key not in ws.overrides:
                 continue
@@ -744,6 +956,16 @@ def apply_workspace_overrides(state, cfg: Config, ws: Workspace) -> None:
     state.prompt_for_branch = cfg.default_prompt_for_branch
     state.prevent_smart_sync_silent_merge = (
         cfg.default_prevent_smart_sync_silent_merge)
+    state.auto_push_submodule_parent = (
+        cfg.default_auto_push_submodule_parent)
+    state.auto_refresh_on_fs_change = cfg.auto_refresh_on_fs_change
+    state.auto_refresh_debounce_ms = cfg.auto_refresh_debounce_ms
+    state.auto_recurse_submodules = cfg.auto_recurse_submodules
+    state.fetch_on_manual_refresh = cfg.fetch_on_manual_refresh
+    # fs_watch_ignore is workspace-scoped only — no idlegit.conf-level
+    # default to fall back to. A workspace switch always replaces the
+    # State copy, so the previous workspace's patterns don't bleed in.
+    state.fs_watch_ignore = list(ws.fs_watch_ignore)
     state.subtrees = list(ws.subtrees)
     # Now overlay the workspace's overrides.
     for key, value in ws.overrides.items():

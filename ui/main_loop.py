@@ -21,6 +21,7 @@ from .modals import (
     handle_detached_recovery_prompt_key,
     handle_diff_viewer_key,
     open_action_menu,
+    open_commit_msg_editor,
     open_diff_viewer,
     open_task_action_menu,
     open_workspace_menu,
@@ -71,10 +72,12 @@ def handle_task_panel_key(state: State, key: int) -> Optional[str]:
         state.focused_panel = "repos"
         return None
 
-    if key in (18, curses.KEY_F5):
+    if key == 18:  # Ctrl+R — refresh
         return "refresh"
     if key == 19:
         return "sync"
+    if key == 16:  # Ctrl+P — pull all
+        return "pull-all"
 
     if n == 0:
         return None
@@ -152,14 +155,17 @@ def handle_main_key(state: State, key: int) -> Optional[str]:
     if state.focused_panel == "tasks":
         return handle_task_panel_key(state, key)
 
-    if key in (18, curses.KEY_F5):  # Ctrl+R or F5 — refresh state, prune tasks
+    if key == 18:  # Ctrl+R — refresh state, prune tasks
         return "refresh"
     if key == 19:  # Ctrl+S — fetch + checkout every tracked sibling
         return "sync"
+    if key == 16:  # Ctrl+P — ff-only pull every repo with an upstream
+        return "pull-all"
 
-    # Title row navigation (selected = -2). Tab opens the workspaces
-    # picker (global switcher); ←/→ are no-ops here since cycling
-    # belongs to the workspace switcher row below.
+    # Title row navigation (selected = -2). Enter (matches the
+    # row's underline affordance) and Tab both open the app menu;
+    # ←/→ are no-ops here since cycling belongs to the workspace
+    # switcher row below.
     if state.on_title_row:
         if key == curses.KEY_UP:
             # Wrap to the bottom of the body — same feel as the
@@ -171,7 +177,7 @@ def handle_main_key(state: State, key: int) -> Optional[str]:
             state.selected = -1
             _reset_field_cursor(state)
             return None
-        if key == 9:  # Tab — opens the workspaces picker
+        if key == 9 or key in (10, 13, curses.KEY_ENTER):
             open_app_menu(state)
             return None
         if key == 27:
@@ -225,6 +231,13 @@ def handle_main_key(state: State, key: int) -> Optional[str]:
                 (cur_child is not None and cur_child[1].refreshing):
             return None  # action in flight — ignore until lock releases
         open_action_menu(state)
+        return None
+
+    if key == curses.KEY_SRIGHT:  # Shift+Right — open the large commit-msg editor
+        # Silently ignored when the focused row isn't an editable
+        # commit-message holder; same gating logic as the inline field
+        # below — opens only on dirty repos / dirty submodule rows.
+        open_commit_msg_editor(state)
         return None
 
     target_message_holder = _focused_message_holder(state)

@@ -2,23 +2,33 @@
 from __future__ import annotations
 
 import curses
-from concurrent.futures import ThreadPoolExecutor
+import threading
 from typing import List, Tuple
 
 from core.models import Repo
 from core.config import APP_DISPLAY_NAME, DEFAULT_TRUNCATION_MODE, VERSION
-from core.git_ops import MAX_PARALLEL_GIT_JOBS, link_siblings
+from core.git_ops import link_siblings
 from core.workers import refresh_repo_with_remote_state
 
 from .colors import PAIR_BRANCH, PAIR_HEADER, PAIR_OK
 from .geometry import safe_addstr
 from .sidebar import SPINNER_FRAMES
 
+
+# Loading-screen poll interval. The pre-Esc-cancel version called
+# `curses.napms(80)` between frames, which blocked the input buffer
+# entirely so a press during load only registered after every refresh
+# had landed (felt like a frozen app). Switching to a `getch` with
+# the same effective frame budget keeps the spinner animating AND
+# lets us react to Esc immediately.
+_FRAME_POLL_MS = 80
+
+
 def refresh_all_workspaces(stdscr,
                            workspace_repos: List[Tuple[str, List[Repo], object]],
                            name_max: int,
                            name_mode: str = DEFAULT_TRUNCATION_MODE,
-                           active_index: int = 0) -> None:
+                           active_index: int = 0) -> bool:
     """Refresh every repo across every configured workspace in parallel,
     rendering a grouped loading screen so the user sees all workspaces
     at once instead of one in isolation.
@@ -29,41 +39,77 @@ def refresh_all_workspaces(stdscr,
     main UI will land in once loading completes; it gets an "(active)"
     marker on its header row. Total work is parallel across all repos
     in all workspaces, so a 3-workspace startup completes in roughly
-    the same wall-clock time as a single-workspace one."""
+    the same wall-clock time as a single-workspace one.
+
+    Returns True on a clean completion, False when the user pressed
+    Esc to abort. On cancel, in-flight refreshes keep running in
+    their daemon threads and die with the process — the caller is
+    expected to return from `run()` promptly rather than continue
+    setting up the main UI."""
     all_repos: List[Repo] = [r for _, repos, _ in workspace_repos
                              for r in repos]
     if not all_repos:
-        return
+        return True
     # Track completion by repo identity so concurrent threads can flip
     # their own bit without coordinating on a shared index.
     done: dict = {id(r): False for r in all_repos}
 
     def work(r: Repo) -> None:
-        refresh_repo_with_remote_state(r)
+        # Exceptions are swallowed so a single broken repo doesn't
+        # leave the loading screen stuck — the repo just stays
+        # spinning forever, which the user can Esc out of and re-
+        # investigate after the main UI loads with whatever did
+        # succeed. The previous `f.result()` re-raise pattern bubbled
+        # the first exception up through the executor and tore the
+        # app down before the user saw anything.
+        try:
+            refresh_repo_with_remote_state(r)
+        except Exception:  # noqa: BLE001
+            pass
         done[id(r)] = True
 
+    # Daemon threads (rather than ThreadPoolExecutor) so an Esc-driven
+    # cancel doesn't have to wait for `shutdown(wait=True)` to drain
+    # the in-flight refreshes before we can return. The executor's
+    # workers aren't daemons by default — they outlive the function
+    # return and keep the process alive, which is the opposite of
+    # what "cancel" should mean.
+    for r in all_repos:
+        threading.Thread(target=work, args=(r,), daemon=True).start()
+
     curses.curs_set(0)
-    max_workers = max(1, min(len(all_repos), MAX_PARALLEL_GIT_JOBS))
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = [ex.submit(work, r) for r in all_repos]
-        frame = 0
-        while not all(f.done() for f in futures):
-            draw_workspace_loading(
-                stdscr, workspace_repos, done, name_max, name_mode,
-                active_index, SPINNER_FRAMES[frame % len(SPINNER_FRAMES)])
-            curses.napms(80)
-            frame += 1
+    stdscr.timeout(_FRAME_POLL_MS)
+    frame = 0
+    cancelled = False
+    while not all(done.values()):
         draw_workspace_loading(
             stdscr, workspace_repos, done, name_max, name_mode,
-            active_index, "✓")
-        curses.napms(120)
-        for f in futures:
-            f.result()  # surface any thread exception
+            active_index, SPINNER_FRAMES[frame % len(SPINNER_FRAMES)])
+        try:
+            key = stdscr.getch()
+        except KeyboardInterrupt:
+            cancelled = True
+            break
+        if key == 27:  # Esc — cancel load and signal "quit" to caller
+            cancelled = True
+            break
+        # KEY_RESIZE / -1 (timeout) / any other key falls through and
+        # the next iteration redraws + polls again.
+        frame += 1
+
+    if cancelled:
+        return False
+
+    draw_workspace_loading(
+        stdscr, workspace_repos, done, name_max, name_mode,
+        active_index, "✓")
+    curses.napms(120)
     # Link siblings within each workspace independently — a submodule
     # inside one workspace shouldn't be linked to a same-URL repo in
     # a different workspace.
     for _, repos, subtrees in workspace_repos:
         link_siblings(repos, subtrees)
+    return True
 
 
 def draw_workspace_loading(stdscr,
@@ -120,7 +166,7 @@ def draw_workspace_loading(stdscr,
                 summary, curses.color_pair(PAIR_BRANCH))
 
     y = top + 4
-    for i, (ws_name, repos, _) in enumerate(workspace_repos):
+    for i, (ws_name, _repos, _) in enumerate(workspace_repos):
         is_active = (i == active_index)
         if ws_done[i]:
             mark, mark_attr = "✓", curses.color_pair(PAIR_OK)
