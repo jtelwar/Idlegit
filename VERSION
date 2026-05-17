@@ -1,4 +1,8 @@
-0.22.9
+0.22.10
+
+### 0.22.10
+- 2026-05-17: commit_worker shows a "working" task at start so the gesture registers immediately even when the pre-stage pull is slow.
+- 2026-05-17: kick_off_workers supervisor releases refresh locks in a finally so a raising refresh_repo can't strand a repo in refreshing state.
 
 ### 0.22.9
 - 2026-05-17: test bootstrap also writes user.name/email to the temp gitconfig so CI integration tests don't hit "Please tell me who you are" on merge/propagate commits.

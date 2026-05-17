@@ -1329,14 +1329,22 @@ def commit_worker(state: State, repo: Repo, msg: str,
     so a re-opened review screen sees an empty state immediately,
     regardless of how far along this worker is in the pipeline. None
     defaults preserve compatibility for any out-of-tree caller."""
+    name = state.task_repo_label(repo)
+    # Early-visibility task so the user sees the panel react the
+    # moment review is accepted. Without this, the first per-step
+    # task (stage / commit / push / pull-on-move) can be delayed
+    # several seconds by the pre-stage pull (network +
+    # `--recurse-submodules=on-demand`) and the gesture looks dead.
+    # Also replaces the legacy `<name>: failed` fallback row — same
+    # signal carried by this task's status on exception.
+    pipeline_task = state.tasks.add(f"{name}: working")
     try:
         _commit_worker_inner(state, repo, msg, lfs_cands, staged_paths,
                              amend, track_workflow, then_run_after_push,
                              then_run_params_after_push)
+        state.tasks.update(pipeline_task, "ok", "")
     except Exception as e:
-        name = state.task_repo_label(repo)
-        t = state.tasks.add(f"{name}: failed")
-        state.tasks.update(t, "fail", first_line(str(e)))
+        state.tasks.update(pipeline_task, "fail", first_line(str(e)))
 
 
 def _commit_worker_inner(state: State, repo: Repo, msg: str,
@@ -1574,15 +1582,17 @@ def commit_worker_for_child(state: State, parent: Repo, ref: ChildRef,
     are snapshots captured + cleared from `ref.repo` at queue time in
     `kick_off_workers`. See `commit_worker` for the rationale (review-
     screen state appears empty as soon as the user accepts)."""
+    name = (f"{state.task_repo_label(ref.repo)} "
+            f"(in {state.task_repo_label(parent)})")
+    # Early-visibility task — see `commit_worker` for the rationale.
+    pipeline_task = state.tasks.add(f"{name}: working")
     try:
         _commit_worker_for_child_inner(
             state, parent, ref, msg, staged_paths, amend,
             track_workflow, then_run_after_push, then_run_params_after_push)
+        state.tasks.update(pipeline_task, "ok", "")
     except Exception as e:
-        name = (f"{state.task_repo_label(ref.repo)} "
-                f"(in {state.task_repo_label(parent)})")
-        t = state.tasks.add(f"{name}: failed")
-        state.tasks.update(t, "fail", first_line(str(e)))
+        state.tasks.update(pipeline_task, "fail", first_line(str(e)))
 
 
 def _commit_worker_for_child_inner(state: State, parent: Repo,
@@ -1910,17 +1920,36 @@ def kick_off_workers(state: State, blocks: List[ReviewBlock]) -> None:
         workers.append(w)
 
     def supervisor() -> None:
-        for w in workers:
-            w.join()
-        for r in state.repos:
-            refresh_repo(r)
-            if id(r) in locked_repos:
-                r.release_refresh()
-        link_siblings(state.repos, state.subtrees)
-        for parent in state.repos:
-            for ref in parent.children:
-                if id(ref) in locked_refs:
-                    ref.release_refresh()
+        try:
+            for w in workers:
+                w.join()
+            # Per-repo try/except so a failing refresh_repo (corrupt
+            # index, missing .git, network hiccup mid-workflow-poll)
+            # can't escape the loop and skip the release_refresh calls
+            # that follow — that's how repos got "stuck refreshing"
+            # forever, blocking the action menu with no way to recover
+            # short of restarting idlegit.
+            for r in state.repos:
+                try:
+                    refresh_repo(r)
+                except Exception:  # noqa: BLE001
+                    pass
+            try:
+                link_siblings(state.repos, state.subtrees)
+            except Exception:  # noqa: BLE001
+                pass
+        finally:
+            # Releases run in a finally so any earlier exception STILL
+            # frees the locks. Without this, an exception in
+            # refresh_repo / link_siblings strands every locked repo
+            # and child ref.
+            for r in state.repos:
+                if id(r) in locked_repos:
+                    r.release_refresh()
+            for parent in state.repos:
+                for ref in parent.children:
+                    if id(ref) in locked_refs:
+                        ref.release_refresh()
 
     threading.Thread(target=supervisor, daemon=True).start()
 
