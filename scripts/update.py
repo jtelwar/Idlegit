@@ -291,8 +291,14 @@ def _run_installer(install_dir: Path, assume_yes: bool) -> None:
     """Hand off to the installer that ships inside the new release
     tarball. We always run the *new* install.py (not the one bundled
     with the running update.py) so install-pipeline changes ride
-    along with the release. Forwards IDLEGIT_* env vars + `-y`."""
-    installer = install_dir / "install.py"
+    along with the release. Forwards IDLEGIT_* env vars + `-y`.
+
+    Resolution: current layout is `scripts/install.py`; older releases
+    had `install.py` at the tarball root, so fall back there for
+    backward compatibility when a user updates from a very old build."""
+    installer = install_dir / "scripts" / "install.py"
+    if not installer.is_file():
+        installer = install_dir / "install.py"  # legacy layout
     if not installer.is_file():
         die(f"install.py not found in tarball ({install_dir})")
     cmd = [sys.executable, str(installer)]

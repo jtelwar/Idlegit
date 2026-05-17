@@ -75,9 +75,13 @@ Or in-app: `Tab` on the title row → **Check for updates** →
 - `git` on `$PATH`
 - Optional: `gh` (GitHub Actions panel), `git-lfs` (LFS toggle on the
   review screen)
-- The one runtime Python dep is
-  [`wcwidth`](https://pypi.org/project/wcwidth/); on Windows the
-  `[windows]` extra also pulls `windows-curses`
+- Runtime Python deps:
+  [`wcwidth`](https://pypi.org/project/wcwidth/) (terminal cell
+  widths), [`watchdog`](https://pypi.org/project/watchdog/) (fs
+  auto-refresh),
+  [`pathspec`](https://pypi.org/project/pathspec/) (gitignore-style
+  fs-watch ignore patterns). On Windows the `[windows]` extra also
+  pulls `windows-curses`.
 
 ## Configuration + getting started
 

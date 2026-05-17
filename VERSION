@@ -1,4 +1,10 @@
-0.22.11
+0.22.13
+
+### 0.22.13
+- 2026-05-17: updater now looks for `scripts/install.py` (current layout) with fallback to `install.py` at the tarball root for older releases.
+
+### 0.22.12
+- 2026-05-17: README runtime-deps list now includes watchdog and pathspec.
 
 ### 0.22.11
 - 2026-05-17: tests workflow now also triggers on push to master + workflow_dispatch so the status badge actually populates.
