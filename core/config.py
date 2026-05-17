@@ -27,9 +27,24 @@ import shutil
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List
+from typing import TYPE_CHECKING, List
 
-from .models import SubtreeSpec, Workspace
+if TYPE_CHECKING:  # pragma: no cover - import-time-only typing
+    from .models import Workspace
+
+# `SubtreeSpec` and `Workspace` are constructor-only at runtime — type
+# hints are stringified via `from __future__ import annotations` and
+# the TYPE_CHECKING block above keeps tooling happy without paying an
+# import cost at runtime. The actual classes are imported lazily inside
+# `load_workspaces` (the only call site that calls the constructors).
+# Why this matters: setuptools' `version = { attr = "core.config.VERSION" }`
+# directive falls back to a standalone `exec_module` of this file when
+# its StaticModule AST parser can't resolve VERSION as a literal — and
+# VERSION here IS a function call (`_read_version()` below), not a
+# literal, so the fallback always runs at build time. A top-level
+# `from .models import …` fails in that standalone load because there's
+# no enclosing `core` package, breaking the release pipeline with
+# `ModuleNotFoundError: No module named 'core'`.
 
 # Project root from this module's perspective. config.py lives in
 # `core/`; the VERSION file and `idlegit.default.conf` template both
@@ -737,6 +752,11 @@ def load_workspaces() -> "tuple[List[Workspace], int]":
     ([], 0) when the file is missing or malformed — the caller
     (idlegit.run) treats that as the signal to launch the creator
     wizard before the main UI takes over."""
+    # Local import (see top-of-file note): keeps the module importable
+    # as a standalone file during setuptools' `version = { attr = ... }`
+    # build-time exec_module fallback.
+    from .models import SubtreeSpec, Workspace
+
     _ensure_workspaces_file_ready()
     if not WORKSPACES_FILE.exists():
         _WORKSPACE_WARNINGS.clear()

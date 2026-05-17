@@ -98,4 +98,4 @@ Idlegit is licensed under the [MIT License](LICENSE).
 
 ---
 
-\** NB no legal warranty to this effect is implied or offered. Don't come for me if this thing calls `rm -rf .git`.  _(Pretty sure I checked for that...)_
+\* NB no legal warranty to this effect is implied or offered. Don't come for me if this thing calls `rm -rf .git`.  _(Pretty sure I checked for that...)_

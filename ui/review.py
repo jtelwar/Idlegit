@@ -43,6 +43,7 @@ from .colors import (
 )
 from .geometry import clamp_scroll, draw_scroll_overflow, safe_addstr
 from .hints import (
+    KEY_CTRL_K,
     KEY_ENTER,
     KEY_ESC,
     KEY_LEFT_RIGHT,
@@ -1113,8 +1114,35 @@ def _review_hints(focusables: List[Tuple[int, str, object]],
             hints.append(Hint(KEY_SPACE, space_label))
             hints.append(Hint(KEY_TAB, "view diff"))
             hints.append(Hint(KEY_SHIFT_TAB, "back to repos"))
+    # Ctrl+K resets every Repo's then-run state (after-push +
+    # after-workflow chains + workflow-tracking opt-ins). Only
+    # advertised when there's something to clear, so a workspace
+    # with no chains set doesn't carry a redundant hint.
+    if blocks is not None and _any_then_runs_set(blocks):
+        hints.append(Hint(KEY_CTRL_K, "clear chains"))
     hints.append(Hint(KEY_ESC, "back"))
     return hints
+
+
+def _any_then_runs_set(blocks: List[ReviewBlock]) -> bool:
+    """True iff any review block's target repo has a then-run target,
+    workflow tracking opt-in, or chained after-workflow target
+    currently set. Drives the conditional `Ctrl+K clear chains` hint
+    — no signal to clear → no hint."""
+    seen: "set[int]" = set()
+    for b in blocks:
+        repo = b.target_repo if b.target_repo is not None else (
+            b.target_child.repo if b.target_child is not None else None)
+        if repo is None or id(repo) in seen:
+            continue
+        seen.add(id(repo))
+        if repo.then_run_after_push:
+            return True
+        if repo.then_run_after_workflow:
+            return True
+        if any(repo.track_workflow.values()):
+            return True
+    return False
 
 
 def draw_review(stdscr, state: State, blocks: List[ReviewBlock],

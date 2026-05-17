@@ -507,6 +507,21 @@ def handle_confirm(stdscr, state: State) -> None:
 
             if key == 27:  # Esc
                 return
+            if key == 11:  # Ctrl+K — clear all then-run chains
+                # Manual reset escape hatch for the case where the
+                # spec's "queue → forget" auto-clear hasn't fired
+                # yet (after-workflow chains stay until `_poll_run`
+                # pops them; the user may want to reset before that
+                # lands). Wipes every Repo's then-run state plus
+                # `track_workflow` so the next review starts clean.
+                # Doesn't touch commit messages or staged-paths.
+                for r in state.repos:
+                    r.track_workflow.clear()
+                    r.then_run_after_push = ""
+                    r.then_run_params_after_push.clear()
+                    r.then_run_after_workflow.clear()
+                    r.then_run_params_after_workflow.clear()
+                continue
             if key in (10, 13, curses.KEY_ENTER):
                 if panel_focus == "left":
                     # Don't fire commits until every block has finished

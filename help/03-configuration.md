@@ -34,6 +34,30 @@ watcher. Per-workspace ignore patterns live under each
 **AUTO REFRESH** section and the workspace menu's **FILE WATCH
 IGNORE** section. See the *Auto-refresh* help page for details.
 
+`fetch_on_manual_refresh` (default `false`) makes *Ctrl+R* run
+`git fetch --all` per repo before re-reading state, so the
+ahead/behind columns reflect actual upstream rather than the last
+fetch. Off by default — *Ctrl+R* has historically been instant +
+offline; turning this on adds ~200ms/repo against a fast remote.
+Working trees are never modified by *Ctrl+R*.
+
+## Submodule handling
+
+`auto_recurse_submodules` (default `true`) makes idlegit's pull /
+fetch operations pass `--recurse-submodules=on-demand` so a
+parent's working tree advances AND its submodule checkouts get
+synced to the new gitlinks in one shot. Internal only — never
+writes to your `git config submodule.recurse`. Affects:
+
+- The action menu's **Pull** / **Fetch**.
+- The commit pipeline's pre-stage pull.
+- *Ctrl+P* "pull all".
+- The pre-pull step in *Ctrl+S* smart-sync.
+
+Editable in the workspace settings modal's **SMART-SYNC** section
+(toggle row "Auto-recurse submodules"). Outside-of-idlegit
+`git pull` is unchanged.
+
 ## Task logging
 
 When `task_log_enabled` is on, every task that lands in a terminal

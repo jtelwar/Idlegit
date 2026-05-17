@@ -1301,7 +1301,11 @@ def kick_off_review_suggest(state: State, block: ReviewBlock) -> None:
 def commit_worker(state: State, repo: Repo, msg: str,
                   lfs_cands: List[LFSCandidate],
                   staged_paths: Optional["dict[str, bool]"] = None,
-                  amend: bool = False) -> None:
+                  amend: bool = False,
+                  track_workflow: Optional["dict[str, bool]"] = None,
+                  then_run_after_push: str = "",
+                  then_run_params_after_push: Optional["dict[str, str]"] = None,
+                  ) -> None:
     """Run the full stage / commit / push / sync pipeline for one repo,
     publishing each step into the sidebar. After a successful push, kicks
     off GitHub Actions tracking for any workflows the user opted in to on
@@ -1316,10 +1320,19 @@ def commit_worker(state: State, repo: Repo, msg: str,
     folding any staged changes (and the new message) into the latest
     local commit. The review-pane toolbar gates this on `ahead > 0`
     so a published commit never gets rewritten — but the worker
-    trusts the caller and doesn't re-validate."""
+    trusts the caller and doesn't re-validate.
+
+    `track_workflow` / `then_run_after_push` / `then_run_params_after_push`
+    are snapshots captured at queue time in `kick_off_workers`. Per the
+    spec "once review is accepted, then-runs are forgotten", the Repo's
+    own fields are cleared there; this worker reads from the snapshot
+    so a re-opened review screen sees an empty state immediately,
+    regardless of how far along this worker is in the pipeline. None
+    defaults preserve compatibility for any out-of-tree caller."""
     try:
         _commit_worker_inner(state, repo, msg, lfs_cands, staged_paths,
-                             amend)
+                             amend, track_workflow, then_run_after_push,
+                             then_run_params_after_push)
     except Exception as e:
         name = state.task_repo_label(repo)
         t = state.tasks.add(f"{name}: failed")
@@ -1329,7 +1342,10 @@ def commit_worker(state: State, repo: Repo, msg: str,
 def _commit_worker_inner(state: State, repo: Repo, msg: str,
                          lfs_cands: List[LFSCandidate],
                          staged_paths: Optional["dict[str, bool]"] = None,
-                         amend: bool = False
+                         amend: bool = False,
+                         track_workflow: Optional["dict[str, bool]"] = None,
+                         then_run_after_push: str = "",
+                         then_run_params_after_push: Optional["dict[str, str]"] = None,
                          ) -> None:
     auto_stage = state.auto_stage
     auto_push = state.auto_push
@@ -1450,11 +1466,22 @@ def _commit_worker_inner(state: State, repo: Repo, msg: str,
     # cached snapshot from before the commit.
     rc_h, head_out, _ = git(repo.path, ["rev-parse", "HEAD"])
     pushed_sha = head_out.strip() if rc_h == 0 else ""
-    tracked = [name for name, on in repo.track_workflow.items() if on]
+    # Snapshot values (captured + cleared from Repo at queue time in
+    # kick_off_workers) drive these — reading from `repo.…` here
+    # would race the review screen re-open since its UI reads from
+    # the same Repo fields. None means the caller didn't bother
+    # snapshotting; fall back to Repo so out-of-tree callers don't
+    # silently lose state.
+    track_wf_map = (track_workflow if track_workflow is not None
+                    else repo.track_workflow)
+    tracked = [name for name, on in track_wf_map.items() if on]
     if tracked and pushed_sha:
         kick_off_post_push_run_tracking(
             state, repo, repo.branch, pushed_sha, tracked)
-    repo.track_workflow.clear()
+    if track_workflow is None:
+        # Legacy non-snapshot path — clear on Repo so we don't loop
+        # the same tracked workflow next push.
+        repo.track_workflow.clear()
 
     # "Then run after push" — fired once the push itself completes,
     # regardless of any tracked workflow runs. Two shapes:
@@ -1463,12 +1490,16 @@ def _commit_worker_inner(state: State, repo: Repo, msg: str,
     #     the just-pushed sha. Per-action parameter buffers live in
     #     `then_run_params_after_push` (today only "tag", but the
     #     same dict will hold workflow_dispatch inputs in the
-    #     future). We pop the slot's params unconditionally so a
-    #     follow-up push doesn't double-fire stale values.
-    after_push_target = repo.then_run_after_push
-    after_push_params = dict(repo.then_run_params_after_push)
-    repo.then_run_after_push = ""
-    repo.then_run_params_after_push.clear()
+    #     future). Like `track_workflow` above, the snapshot
+    #     supersedes Repo when provided.
+    if then_run_after_push or then_run_params_after_push is not None:
+        after_push_target = then_run_after_push
+        after_push_params = dict(then_run_params_after_push or {})
+    else:
+        after_push_target = repo.then_run_after_push
+        after_push_params = dict(repo.then_run_params_after_push)
+        repo.then_run_after_push = ""
+        repo.then_run_params_after_push.clear()
     if after_push_target == "__add_tag__":
         tag_name = after_push_params.get("tag", "").strip()
         tag_label = state.task_repo_label(repo)
@@ -1519,7 +1550,10 @@ def _commit_worker_inner(state: State, repo: Repo, msg: str,
 def commit_worker_for_child(state: State, parent: Repo, ref: ChildRef,
                             msg: str,
                             staged_paths: Optional["dict[str, bool]"] = None,
-                            amend: bool = False
+                            amend: bool = False,
+                            track_workflow: Optional["dict[str, bool]"] = None,
+                            then_run_after_push: str = "",
+                            then_run_params_after_push: Optional["dict[str, str]"] = None,
                             ) -> None:
     """Run the stage / commit / push pipeline against `ref.nested_path` —
     the working tree of a nested submodule checkout inside `parent`.
@@ -1534,10 +1568,16 @@ def commit_worker_for_child(state: State, parent: Repo, ref: ChildRef,
     checkbox state, or None to fall back to legacy auto_stage. `amend`
     swaps the commit step to `git commit --amend -m msg` (same gating
     rule as the top-level worker — caller is responsible for ensuring
-    the latest commit hasn't been pushed)."""
+    the latest commit hasn't been pushed).
+
+    `track_workflow` / `then_run_after_push` / `then_run_params_after_push`
+    are snapshots captured + cleared from `ref.repo` at queue time in
+    `kick_off_workers`. See `commit_worker` for the rationale (review-
+    screen state appears empty as soon as the user accepts)."""
     try:
-        _commit_worker_for_child_inner(state, parent, ref, msg,
-                                       staged_paths, amend)
+        _commit_worker_for_child_inner(
+            state, parent, ref, msg, staged_paths, amend,
+            track_workflow, then_run_after_push, then_run_params_after_push)
     except Exception as e:
         name = (f"{state.task_repo_label(ref.repo)} "
                 f"(in {state.task_repo_label(parent)})")
@@ -1549,7 +1589,13 @@ def _commit_worker_for_child_inner(state: State, parent: Repo,
                                    ref: ChildRef, msg: str,
                                    staged_paths: Optional["dict[str, bool]"]
                                    = None,
-                                   amend: bool = False) -> None:
+                                   amend: bool = False,
+                                   track_workflow: Optional["dict[str, bool]"]
+                                   = None,
+                                   then_run_after_push: str = "",
+                                   then_run_params_after_push: Optional["dict[str, str]"]
+                                   = None,
+                                   ) -> None:
     auto_stage = state.auto_stage
     auto_push = state.auto_push
     tasks = state.tasks
@@ -1640,21 +1686,31 @@ def _commit_worker_for_child_inner(state: State, parent: Repo,
 
     rc_h, head_out, _ = git(ref.nested_path, ["rev-parse", "HEAD"])
     pushed_sha = head_out.strip() if rc_h == 0 else ""
-    tracked = [n for n, on in ref.repo.track_workflow.items() if on]
+    # Snapshot values supersede `ref.repo.…` reads when provided. See
+    # `_commit_worker_inner` for the rationale (review-screen state
+    # appears empty as soon as queue time, regardless of where this
+    # worker is in the pipeline).
+    track_wf_map = (track_workflow if track_workflow is not None
+                    else ref.repo.track_workflow)
+    tracked = [n for n, on in track_wf_map.items() if on]
     if tracked and pushed_sha:
         kick_off_post_push_run_tracking(
             state, ref.repo, nested_branch, pushed_sha, tracked)
-    ref.repo.track_workflow.clear()
+    if track_workflow is None:
+        ref.repo.track_workflow.clear()
 
     # "Then run after push" for the canonical — same semantics as
     # the top-level commit_worker version, including the
     # "__add_tag__" sentinel for creating a lightweight tag at the
-    # pushed sha. Reads the action's per-parameter buffer dict,
-    # popping it so a follow-up push doesn't replay stale params.
-    after_push_target = ref.repo.then_run_after_push
-    after_push_params = dict(ref.repo.then_run_params_after_push)
-    ref.repo.then_run_after_push = ""
-    ref.repo.then_run_params_after_push.clear()
+    # pushed sha. Snapshot supersedes ref.repo when provided.
+    if then_run_after_push or then_run_params_after_push is not None:
+        after_push_target = then_run_after_push
+        after_push_params = dict(then_run_params_after_push or {})
+    else:
+        after_push_target = ref.repo.then_run_after_push
+        after_push_params = dict(ref.repo.then_run_params_after_push)
+        ref.repo.then_run_after_push = ""
+        ref.repo.then_run_params_after_push.clear()
     if after_push_target == "__add_tag__":
         tag_name = after_push_params.get("tag", "").strip()
         tag_label = (f"{state.task_repo_label(ref.repo)} "
@@ -1750,8 +1806,20 @@ def kick_off_workers(state: State, blocks: List[ReviewBlock]) -> None:
     child_blocks = {id(b.target_child): b for b in blocks
                     if b.target_child is not None}
 
+    # Per-repo plan now also carries a snapshot of the after-push
+    # then-run state (workflow-tracking opt-ins, the `__add_tag__` /
+    # workflow-dispatch target, the per-action params buffer). We
+    # snapshot + clear from Repo HERE at queue time — not later
+    # inside `commit_worker` — so the review screen's
+    # `_then_run_current` reads (which look at Repo directly) see an
+    # empty state as soon as the user has accepted the review. Without
+    # this, re-opening the review while commit_worker was still
+    # mid-pipeline (or via any of its early-return paths) would show
+    # the previous gesture's tag/workflow still set.
     repo_plans: List[Tuple[Repo, str, List[LFSCandidate],
-                           "dict[str, bool]", bool]] = []
+                           "dict[str, bool]", bool,
+                           "dict[str, bool]", str,
+                           "dict[str, str]"]] = []
     for repo in state.repos:
         msg = repo.message.strip()
         if not msg:
@@ -1768,10 +1836,25 @@ def kick_off_workers(state: State, blocks: List[ReviewBlock]) -> None:
         repo_cands = list(block.lfs_candidates) if block else []
         staged = dict(block.staged_paths) if block else {}
         amend = bool(block.amend) if block else False
-        repo_plans.append((repo, msg, repo_cands, staged, amend))
+        # Snapshot + clear the after-push then-run state. After-
+        # workflow chains (`then_run_after_workflow`) are read much
+        # later by `_poll_run` and so are NOT cleared here — they
+        # stay on Repo and remain susceptible to leak across review
+        # screens. The Ctrl+K "clear chains" gesture covers that
+        # explicitly if the user wants to reset.
+        track_wf = dict(repo.track_workflow)
+        then_push = repo.then_run_after_push
+        then_push_params = dict(repo.then_run_params_after_push)
+        repo.track_workflow.clear()
+        repo.then_run_after_push = ""
+        repo.then_run_params_after_push.clear()
+        repo_plans.append((repo, msg, repo_cands, staged, amend,
+                           track_wf, then_push, then_push_params))
 
     child_plans: List[Tuple[Repo, ChildRef, str,
-                            "dict[str, bool]", bool]] = []
+                            "dict[str, bool]", bool,
+                            "dict[str, bool]", str,
+                            "dict[str, str]"]] = []
     for parent in state.repos:
         for ref in parent.children:
             if ref.kind != "submodule":
@@ -1785,28 +1868,42 @@ def kick_off_workers(state: State, blocks: List[ReviewBlock]) -> None:
             block = child_blocks.get(id(ref))
             staged = dict(block.staged_paths) if block else {}
             amend = bool(block.amend) if block else False
-            child_plans.append((parent, ref, msg, staged, amend))
+            # Submodule child's then-run state lives on `ref.repo`
+            # (the canonical) — same snapshot + clear pattern as the
+            # top-level branch above.
+            track_wf = dict(ref.repo.track_workflow)
+            then_push = ref.repo.then_run_after_push
+            then_push_params = dict(ref.repo.then_run_params_after_push)
+            ref.repo.track_workflow.clear()
+            ref.repo.then_run_after_push = ""
+            ref.repo.then_run_params_after_push.clear()
+            child_plans.append((parent, ref, msg, staged, amend,
+                                track_wf, then_push, then_push_params))
 
     if not repo_plans and not child_plans:
         return
 
-    locked_repos = {id(repo) for repo, _, _, _, _ in repo_plans}
-    locked_refs = {id(ref) for _, ref, _, _, _ in child_plans}
+    locked_repos = {id(plan[0]) for plan in repo_plans}
+    locked_refs = {id(plan[1]) for plan in child_plans}
 
     workers: List[threading.Thread] = []
-    for repo, msg, repo_cands, staged, amend in repo_plans:
+    for (repo, msg, repo_cands, staged, amend,
+            track_wf, then_push, then_push_params) in repo_plans:
         w = threading.Thread(
             target=commit_worker,
-            args=(state, repo, msg, repo_cands, staged, amend),
+            args=(state, repo, msg, repo_cands, staged, amend,
+                  track_wf, then_push, then_push_params),
             daemon=True,
         )
         w.start()
         workers.append(w)
 
-    for parent, ref, msg, staged, amend in child_plans:
+    for (parent, ref, msg, staged, amend,
+            track_wf, then_push, then_push_params) in child_plans:
         w = threading.Thread(
             target=commit_worker_for_child,
-            args=(state, parent, ref, msg, staged, amend),
+            args=(state, parent, ref, msg, staged, amend,
+                  track_wf, then_push, then_push_params),
             daemon=True,
         )
         w.start()
@@ -3135,12 +3232,32 @@ def kick_off_sync_siblings(state: State) -> None:
             # `kick_off_inline_refresh`) — each `refresh_repo` is a
             # handful of independent git subprocesses, network-free,
             # so contention is just the subprocess fork cost.
+            # Wrap the refresh in a per-repo guard so a single failing
+            # `refresh_repo` (corrupt index, missing .git/, …) can't
+            # raise out of the finally and skip the rest of the
+            # cleanup. A raised exception here would otherwise leave
+            # spinner flags stuck True forever AND the header task in
+            # "running" status — both blocking, no way for the user
+            # to recover without restarting the app.
+            def _refresh_safe(r: Repo) -> None:
+                try:
+                    refresh_repo(r)
+                except Exception:  # noqa: BLE001
+                    pass
             if state.repos:
                 max_workers = min(
                     len(state.repos), MAX_PARALLEL_GIT_JOBS)
                 with ThreadPoolExecutor(max_workers=max_workers) as ex:
-                    list(ex.map(refresh_repo, state.repos))
-            link_siblings(state.repos, state.subtrees)
+                    list(ex.map(_refresh_safe, state.repos))
+            try:
+                link_siblings(state.repos, state.subtrees)
+            except Exception:  # noqa: BLE001
+                # link_siblings is mostly a re-link of in-memory
+                # ChildRef objects, but it does call git for HEAD/
+                # branch/etc. on each nested checkout. Treat the same
+                # as a per-repo refresh failure — swallow so cleanup
+                # still runs.
+                pass
 
             for canonical in canonicals_with_siblings:
                 _smart_sync_set_canonical_tree_refreshing(canonical, False)
@@ -3373,6 +3490,7 @@ def kick_off_pull_all(state: State) -> None:
     # summary count is stable.
     counters_lock = threading.Lock()
     n_pulled = [0]
+    n_up_to_date = [0]
     n_skipped_no_upstream = [0]
     n_failed = [0]
 
@@ -3392,16 +3510,28 @@ def kick_off_pull_all(state: State) -> None:
                     with counters_lock:
                         n_skipped_no_upstream[0] += 1
                     return
+                # Snapshot HEAD around the pull so the summary can
+                # distinguish "actually pulled new commits" from
+                # "already up-to-date" — `_pull_prefer_ff_then_merge`
+                # returns True for both and the count would otherwise
+                # collapse them into one bucket (an earlier version
+                # of the summary always reported 0 up-to-date because
+                # ok_count = total - pulled - failed - skipped was
+                # provably zero).
+                _, before, _ = git(r.path, ["rev-parse", "HEAD"])
                 ok = _pull_prefer_ff_then_merge(
                     r.path, state.tasks, name,
                     allow_merge_fallback=False,
                     recurse_submodules=state.auto_recurse_submodules,
                     parent_task=parent_task)
+                _, after, _ = git(r.path, ["rev-parse", "HEAD"])
                 with counters_lock:
-                    if ok:
-                        n_pulled[0] += 1
-                    else:
+                    if not ok:
                         n_failed[0] += 1
+                    elif before.strip() == after.strip():
+                        n_up_to_date[0] += 1
+                    else:
+                        n_pulled[0] += 1
 
             if acquired:
                 max_workers = min(len(acquired), MAX_PARALLEL_GIT_JOBS)
@@ -3426,10 +3556,8 @@ def kick_off_pull_all(state: State) -> None:
             parts: List[str] = []
             if n_pulled[0]:
                 parts.append(f"{n_pulled[0]} pulled")
-            ok_count = (len(acquired) - n_pulled[0] - n_failed[0]
-                        - n_skipped_no_upstream[0])
-            if ok_count > 0:
-                parts.append(f"{ok_count} up-to-date")
+            if n_up_to_date[0]:
+                parts.append(f"{n_up_to_date[0]} up-to-date")
             if n_skipped_no_upstream[0]:
                 parts.append(
                     f"{n_skipped_no_upstream[0]} no upstream")

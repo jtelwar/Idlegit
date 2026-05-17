@@ -13,7 +13,7 @@
   for a merge fallback). Honours the workspace's
   `auto_recurse_submodules` setting.
 - *Tab* on the title row — open the app menu (workspaces, updates,
-  task logging, help).
+  auto-refresh, task logging, help).
 - *Shift+Tab* — toggle focus between the repos panel and the task
   sidebar.
 
@@ -46,10 +46,21 @@
 ## Review screen
 
 - *↑* / *↓* — navigate files / commit-message field.
-- *Space* — toggle stage on the focused file.
+- *Space* — toggle stage on the focused file (right pane); toggle
+  workflow-tracking / LFS-tracking checkboxes (left pane).
+- *←* / *→* — cycle a then-run target (workflow name / "add tag" /
+  none) when the focused row is a then-run selector.
 - *Tab* on a file — open the diff viewer.
-- *Enter* — confirm the commit (stages, commits, pushes).
-- *Esc* — back to the main screen, discarding nothing.
+- *Shift+Tab* — toggle focus between left (commit blocks) and
+  right (files / toolbar) pane.
+- *Enter* — confirm the commits (stages, commits, pushes, fires
+  then-runs). On a toolbar button: invokes that button.
+- *Ctrl+K* — clear every repo's then-run chains (tag / workflow
+  dispatch / tracking opt-ins) without committing. Only advertised
+  in the hint footer when something is actually set. See the
+  *Review screen* help page for the full chain semantics.
+- *Esc* — back to the main screen, discarding nothing (messages,
+  staged-paths, and unfired then-runs all persist for next time).
 
 ## Modal convention
 

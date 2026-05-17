@@ -22,7 +22,7 @@
  - New features, refactors that have user-facing changes, or significant design/UX changes - bump the minor version.
  - Major version should only ever be incremented by a human - advise if you think there have been breaking changes to warrant a major version increase.
 
-6. Maintain log of recent work in [text](VERSION) upon completing a task. Add a sub-heading for each version number if it doesn't exist, then an entry with CURRENT date in short form - and **short** description of assigned task that has been completed. Do not fill with technical details or explanations. Three lines maximum per entry, aim for one.
+6. Maintain log of recent work in [text](VERSION) upon completing a task. Add a sub-heading for each version number if it doesn't exist, then an entry with CURRENT date in short form - and **short** description of assigned task that has been completed. Only describe changes - do not give explanations or reasons unless absolutely necessary for clarity. Do not fill with technical details or explanations. Three lines maximum per entry, aim for one.
 
 7. When given a new task, if your current task is complete and [text](VERSION) is updated according to rules 5 and 6, overwrite [text](./AGENTS/CURRENT_TASK.md) with a concise description of your task, then maintain a log of progress in that file.
 If the task is not complete yet and you are given a new task, you should make a CURRENT_TASK_2{3,4,etc}, and leave the existing in-progress task file.

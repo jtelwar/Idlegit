@@ -33,17 +33,30 @@ Switch between workspaces two ways:
 
 ## Picking up changes
 
-Idlegit does **not** poll the filesystem. The repo-state column you
-see on screen is a snapshot taken when the workspace was loaded (or
-last refreshed) — files edited outside the app, a `git pull` run
-from another terminal, or a teammate's push that landed since you
-last looked, won't show until you ask for a refresh.
+Idlegit watches the filesystem by default (via `watchdog`) and
+re-queries any repo whose working tree or `.git/` changes on disk.
+Editing a file in your editor, a `git checkout` in another
+terminal, or a hook that writes to the tree all surface as a row
+update within ~400ms.
 
-Press *Ctrl+R* on the main screen to re-query every repo. The same
-binding works while the task sidebar has focus.
+If the watcher is off (per-workspace setting), or the change
+happened on a network mount where fs events are unreliable, three
+manual gestures cover the gaps:
+
+- *Ctrl+R* — re-query every repo locally (no network).
+- *Ctrl+P* — `pull --ff-only` every repo with an upstream so
+  ahead/behind reflects actual remote state.
+- *Ctrl+S* — smart-sync: align every submodule checkout across the
+  workspace.
+
+All three work from anywhere on the main screen (title, workspace
+switcher, repo list, task sidebar).
 
 ## Where to go next
 
 - *Keyboard shortcuts* — every binding, grouped by panel.
 - *Configuration* — what lives in `idlegit.conf` and how to tune it.
 - *Smart-sync* — how submodule sibling alignment works.
+- *Auto-refresh* — filesystem-watched row updates + ignore patterns.
+- *Review screen* — what happens between Enter and the commit
+  landing, including then-run chains.

@@ -1,13 +1,25 @@
-0.22.4
+0.22.7
+
+### 0.22.7
+- 2026-05-17: pull-all summary now reports `up-to-date` correctly (was always 0 because `_pull_prefer_ff_then_merge` returns True for both moved and already-up-to-date) — track HEAD before/after the pull per repo to distinguish.
+- 2026-05-17: smart-sync's final-refresh parallel map is now exception-safe — a failing `refresh_repo` no longer escapes the `finally` and leaves spinners stuck + the header task in "running".
+- 2026-05-17: help pages updated — review-screen page (06) added covering then-runs and Ctrl+K; configuration page documents `fetch_on_manual_refresh` and `auto_recurse_submodules`; keyboard-shortcuts page documents Ctrl+K and the full review-pane gesture set; getting-started page no longer says "idlegit does not poll the filesystem" (it does, via watchdog, since 0.19.0).
+
+### 0.22.6
+- 2026-05-17: then-run-after-push state (tag / workflow dispatch / `track_workflow` opt-ins) now clears at the moment review is accepted instead of inside `commit_worker` post-push.
+- 2026-05-17: New Ctrl+K gesture on the review screen wipes every Repo's then-run state.
+
+### 0.22.5
+- 2026-05-17: fix release pipeline — `core/config.py`'s `from .models import …` moved behind a `TYPE_CHECKING` guard + lazy local import inside `load_workspaces`, so setuptools' `version = { attr = "core.config.VERSION" }` directive can `exec_module` the file standalone at build time. Previously the relative import failed during pip install with `ModuleNotFoundError: No module named 'core'`.
 
 ### 0.22.4
-- 2026-05-17: "Add tag" from the recent-commit dialog now pushes the tag iff the commit is reachable from any `origin/*` ref — fixes the case where a tagged commit was created locally but never made it to the remote (workflow never fired); for unpushed commits it leaves the tag local and surfaces a warn task pointing the user at the missing branch push so the tag-via-origin orphan-commit case can't happen
+- 2026-05-17: "Add tag" from the recent-commit dialog now pushes the tag iff the commit is reachable from any `origin/*` ref.
 
 ### 0.22.3
 - 2026-05-17: updated hint texts
 
 ### 0.22.2
-- 2026-05-17: pull-all (Ctrl+P) now adds a parent "pull all" task with `n pulled / n up-to-date / n no upstream / n locked / n failed` summary so the gesture is visible even when every repo silently no-ops; smart-sync icon-state lag fixed — final refresh + link_siblings now runs BEFORE the `refreshing` flags clear and the header task is marked terminal, so the main loop stays on the 100ms tick during the post-sync refresh instead of dropping to its 1s idle cadence
+- 2026-05-17: pull-all (Ctrl+P) now adds a parent "pull all" task with `n pulled / n up-to-date / n no upstream / n locked / n failed` summary so the gesture is visible even when every repo silently no-ops; smart-sync icon-state lag fixed — final refresh + link_siblings now runs BEFORE the `refreshing` flags clear and the header task is marked terminal.
 
 ### 0.22.1
 - 2026-05-17: Shortened some hint texts
