@@ -50,7 +50,19 @@ def bootstrap_git_config_global() -> None:
     is then redundant but harmless."""
     fd, path = tempfile.mkstemp(prefix="idlegit-test-gitconfig-")
     with os.fdopen(fd, "w") as f:
-        f.write("[protocol \"file\"]\n\tallow = always\n")
+        # `user.name` / `user.email` are required for any git operation
+        # that creates a commit (merge fallback, propagate-bump, etc.)
+        # On CI there's no ~/.gitconfig and `_run`'s GIT_AUTHOR_NAME /
+        # GIT_COMMITTER_NAME env vars only apply to subprocesses _run
+        # itself spawns — idlegit's `git()` helper (with its own env)
+        # would otherwise fail with "Please tell me who you are."
+        f.write(
+            "[user]\n"
+            "\tname = idlegit-test\n"
+            "\temail = test@idlegit.local\n"
+            "[protocol \"file\"]\n"
+            "\tallow = always\n"
+        )
     os.environ["GIT_CONFIG_GLOBAL"] = path
 
     def _cleanup() -> None:
