@@ -1,4 +1,7 @@
-0.22.7
+0.22.8
+
+### 0.22.8
+- 2026-05-17: test infrastructure — `tests/_helpers.py` now bootstraps a throwaway `GIT_CONFIG_GLOBAL` containing `protocol.file.allow=always` at module load, so idlegit's own `git()` helper (which inherits `os.environ` and didn't get the `-c` injection that `_run` applied per-call) can fetch / pull / push against the `file://` remotes the integration tests stand up. Git 2.38+ made the file protocol opt-in for indirect/recurse contexts, which broke `test_manual_pull_merges_when_diverged`, `test_merges_divergent_loser_by_default`, and `test_propagate_commits_and_pushes_parent` on CI. Shipped runtime behaviour unchanged (production users still get strict defaults).
 
 ### 0.22.7
 - 2026-05-17: pull-all summary now reports `up-to-date` correctly (was always 0 because `_pull_prefer_ff_then_merge` returns True for both moved and already-up-to-date) — track HEAD before/after the pull per repo to distinguish.

@@ -5,9 +5,11 @@ below) before `from _helpers import …`, since the smart-test hook invokes
 test files via path-import and the `tests` package isn't on sys.path."""
 from __future__ import annotations
 
+import atexit
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -21,7 +23,46 @@ def bootstrap_paths() -> None:
             sys.path.insert(0, p)
 
 
+def bootstrap_git_config_global() -> None:
+    """Inject `protocol.file.allow=always` into the test process's
+    `GIT_CONFIG_GLOBAL` so idlegit's own subprocess calls — which
+    inherit `os.environ` and don't have the `-c` injection that
+    `_run` applies — can fetch / pull / push against `file://` remote
+    paths created inside the test fixtures.
+
+    Git 2.38 (Oct 2022) hardened the default to refuse `transport
+    'file'` unless `protocol.file.allow` is set, which broke the CI
+    runs of integration tests that exercise the pull / propagate
+    pipelines through idlegit's `git()` helper. The dev machine
+    happened to have an older git or a permissive user config and
+    didn't notice.
+
+    Implementation: write a tiny throwaway gitconfig that contains
+    only the `[protocol "file"] allow = always` directive, point
+    `GIT_CONFIG_GLOBAL` at it for the rest of the process lifetime,
+    and clean up the file on interpreter shutdown. We touch only
+    `os.environ` — the user's real `~/.gitconfig` is unaffected.
+
+    `_run` already calls `env.setdefault("GIT_CONFIG_GLOBAL", os.devnull)`
+    on its env copy; once we set `os.environ["GIT_CONFIG_GLOBAL"]`
+    here, that setdefault becomes a no-op so `_run` also reads the
+    permissive file. `_run`'s explicit `-c protocol.file.allow=always`
+    is then redundant but harmless."""
+    fd, path = tempfile.mkstemp(prefix="idlegit-test-gitconfig-")
+    with os.fdopen(fd, "w") as f:
+        f.write("[protocol \"file\"]\n\tallow = always\n")
+    os.environ["GIT_CONFIG_GLOBAL"] = path
+
+    def _cleanup() -> None:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    atexit.register(_cleanup)
+
+
 bootstrap_paths()
+bootstrap_git_config_global()
 
 
 def _run(cwd: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
