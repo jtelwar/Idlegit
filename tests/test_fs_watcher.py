@@ -954,28 +954,25 @@ class KickOffActionContentionTests(unittest.TestCase):
         parent.release_refresh()
 
 
-class SubmoduleAndFetchFlagsTests(unittest.TestCase):
-    """`auto_recurse_submodules` (default on) + `fetch_on_manual_refresh`
-    (default off) round-trip through `load_config` and apply to State
-    via `apply_workspace_overrides`. Workspace-scoped overrides are
-    coerced through the standard schema like every other override."""
+class FetchOnManualRefreshFlagTests(unittest.TestCase):
+    """`fetch_on_manual_refresh` (default off) round-trips through
+    `load_config` and applies to State via `apply_workspace_overrides`.
+    Workspace-scoped overrides are coerced through the standard schema
+    like every other override."""
 
-    def test_defaults_present_in_config(self):
+    def test_default_present_in_config(self):
         cfg = config.Config()
-        self.assertTrue(cfg.auto_recurse_submodules)
         self.assertFalse(cfg.fetch_on_manual_refresh)
 
-    def test_load_config_picks_up_user_overrides(self):
+    def test_load_config_picks_up_user_override(self):
         with tempfile.TemporaryDirectory() as td:
             conf_path = Path(td) / "idlegit.conf"
             conf_path.write_text(
                 "[idlegit]\n"
-                "auto_recurse_submodules = false\n"
                 "fetch_on_manual_refresh = true\n"
             )
             with mock.patch.object(config, "CONFIG_FILE", conf_path):
                 cfg = config.load_config()
-        self.assertFalse(cfg.auto_recurse_submodules)
         self.assertTrue(cfg.fetch_on_manual_refresh)
 
     def test_apply_workspace_overrides_propagates_to_state(self):
@@ -983,14 +980,10 @@ class SubmoduleAndFetchFlagsTests(unittest.TestCase):
         cfg = config.Config()
         ws = Workspace(
             name="W", folders=[Path("/tmp")],
-            overrides={
-                "auto_recurse_submodules": False,
-                "fetch_on_manual_refresh": True,
-            })
-        # State defaults to True/False — apply should flip both.
+            overrides={"fetch_on_manual_refresh": True})
+        # State defaults to False — apply should flip it.
         state = State(repos=[], workspace_name="W")
         config.apply_workspace_overrides(state, cfg, ws)
-        self.assertFalse(state.auto_recurse_submodules)
         self.assertTrue(state.fetch_on_manual_refresh)
 
 

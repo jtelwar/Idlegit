@@ -43,20 +43,16 @@ Working trees are never modified by *Ctrl+R*.
 
 ## Submodule handling
 
-`auto_recurse_submodules` (default `true`) makes idlegit's pull /
-fetch operations pass `--recurse-submodules=on-demand` so a
-parent's working tree advances AND its submodule checkouts get
-synced to the new gitlinks in one shot. Internal only — never
-writes to your `git config submodule.recurse`. Affects:
+Idlegit never passes `--recurse-submodules` to its `pull` / `fetch`
+calls. The flag re-checks out each submodule to the parent's
+recorded gitlink, which silently orphans any local-only submodule
+commits ahead of that gitlink. Use *Ctrl+S* (smart-sync) to align
+submodule checkouts safely — its `sync_sibling` step refuses to
+orphan commits and surfaces a task row when manual intervention is
+needed.
 
-- The action menu's **Pull** / **Fetch**.
-- The commit pipeline's pre-stage pull.
-- *Ctrl+P* "pull all".
-- The pre-pull step in *Ctrl+S* smart-sync.
-
-Editable in the workspace settings modal's **SMART-SYNC** section
-(toggle row "Auto-recurse submodules"). Outside-of-idlegit
-`git pull` is unchanged.
+`git clone` started from the **Clone** modal still recurses (initial
+clone — no HEAD to rewind).
 
 ## Task logging
 

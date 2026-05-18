@@ -373,6 +373,13 @@ class TaskMetadata:
     # the chained workflow that'll fire on success.
     pending_after_workflow: Optional[str] = None
     pending_target: Optional[str] = None
+    # Local-pipeline cancel signal. Set by the task-detail modal's
+    # Cancel action when the focused task is a running commit / push
+    # pipeline. The worker polls this between git subprocess calls
+    # (and `git_cancellable` polls it during the actual wait) so the
+    # cancel takes effect promptly. Optional because plain bookkeeping
+    # rows that aren't cancellable don't need one.
+    cancel_event: Optional["threading.Event"] = None
 
 
 class Tasks:
@@ -1518,11 +1525,6 @@ class State:
     # the user's cursor mid-decision.
     auto_refresh_on_fs_change: bool = True
     auto_refresh_debounce_ms: int = 400
-    # When True, idlegit's pull / fetch / sibling-sync operations
-    # pass `--recurse-submodules=on-demand` so a parent's working
-    # tree advances AND its submodule checkouts get synced to the
-    # new gitlinks in one shot. Workspace-scoped via overrides.
-    auto_recurse_submodules: bool = True
     # When True, Ctrl+R runs `git fetch --all` per repo BEFORE the
     # local state re-read, so the displayed ahead/behind reflects
     # actual upstream rather than the last fetch. Off by default —

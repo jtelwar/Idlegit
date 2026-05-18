@@ -1,4 +1,13 @@
-0.22.13
+0.24.0
+
+### 0.24.0
+- 2026-05-18: removed `auto_recurse_submodules` config + workspace toggle; idlegit's pull/fetch paths no longer pass `--recurse-submodules` (use Ctrl+S smart-sync to align submodule checkouts safely). Clone still recurses.
+
+### 0.23.1
+- 2026-05-17: `auto_recurse_submodules` default flipped to off + pre-flight safety check strips `--recurse-submodules=on-demand` from every pull when any submodule's HEAD is ahead of or diverged from the parent's recorded gitlink, surfacing a warn task instead of silently orphaning commits.
+
+### 0.23.0
+- 2026-05-17: cancel commit/push from the task-detail modal — new git_cancellable helper terminates the underlying subprocess so the pre-stage pull and push interrupt within ~250ms.
 
 ### 0.22.13
 - 2026-05-17: updater now looks for `scripts/install.py` (current layout) with fallback to `install.py` at the tarball root for older releases.

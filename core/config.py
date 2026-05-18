@@ -222,12 +222,6 @@ DEFAULT_TASK_LOG_MAX_LINES = 0
 # of quiet. OFF returns to the historical "Ctrl+R only" behaviour.
 DEFAULT_AUTO_REFRESH_ON_FS_CHANGE = True
 DEFAULT_AUTO_REFRESH_DEBOUNCE_MS = 400
-# When True, idlegit's own pull / fetch operations pass
-# `--recurse-submodules=on-demand` so the working trees of submodules
-# whose gitlinks just advanced get synced as part of the same op (no
-# separate `git submodule update` needed). Doesn't touch the user's
-# `git config` — entirely internal to idlegit's subprocess calls.
-DEFAULT_AUTO_RECURSE_SUBMODULES = True
 # When True, Ctrl+R does `git fetch --all` per repo before re-reading
 # state, so the displayed ahead/behind reflects actual upstream rather
 # than whatever the local `@{u}` ref was at last fetch. Off by default
@@ -301,7 +295,6 @@ class Config:
     task_log_max_lines: int = DEFAULT_TASK_LOG_MAX_LINES
     auto_refresh_on_fs_change: bool = DEFAULT_AUTO_REFRESH_ON_FS_CHANGE
     auto_refresh_debounce_ms: int = DEFAULT_AUTO_REFRESH_DEBOUNCE_MS
-    auto_recurse_submodules: bool = DEFAULT_AUTO_RECURSE_SUBMODULES
     fetch_on_manual_refresh: bool = DEFAULT_FETCH_ON_MANUAL_REFRESH
 
 
@@ -341,7 +334,6 @@ def load_config() -> Config:
     task_log_max_lines = DEFAULT_TASK_LOG_MAX_LINES
     auto_refresh_on_fs_change = DEFAULT_AUTO_REFRESH_ON_FS_CHANGE
     auto_refresh_debounce_ms = DEFAULT_AUTO_REFRESH_DEBOUNCE_MS
-    auto_recurse_submodules = DEFAULT_AUTO_RECURSE_SUBMODULES
     fetch_on_manual_refresh = DEFAULT_FETCH_ON_MANUAL_REFRESH
 
     _CONFIG_WARNINGS.clear()
@@ -428,9 +420,6 @@ def load_config() -> Config:
             auto_refresh_debounce_ms = cp.getint(
                 "idlegit", "auto_refresh_debounce_ms",
                 fallback=DEFAULT_AUTO_REFRESH_DEBOUNCE_MS)
-            auto_recurse_submodules = cp.getboolean(
-                "idlegit", "auto_recurse_submodules",
-                fallback=DEFAULT_AUTO_RECURSE_SUBMODULES)
             fetch_on_manual_refresh = cp.getboolean(
                 "idlegit", "fetch_on_manual_refresh",
                 fallback=DEFAULT_FETCH_ON_MANUAL_REFRESH)
@@ -480,7 +469,6 @@ def load_config() -> Config:
         task_log_max_lines=max(0, task_log_max_lines),
         auto_refresh_on_fs_change=auto_refresh_on_fs_change,
         auto_refresh_debounce_ms=max(50, auto_refresh_debounce_ms),
-        auto_recurse_submodules=auto_recurse_submodules,
         fetch_on_manual_refresh=fetch_on_manual_refresh,
     )
 
@@ -586,7 +574,6 @@ WORKSPACE_OVERRIDE_TYPES: "dict[str, str]" = {
     "auto_remove_completed_tasks_after_interval": "float",
     "auto_refresh_on_fs_change": "bool",
     "auto_refresh_debounce_ms": "int",
-    "auto_recurse_submodules": "bool",
     "fetch_on_manual_refresh": "bool",
 }
 
@@ -623,7 +610,6 @@ WORKSPACE_OVERRIDE_TARGETS: "dict[str, str]" = {
     "auto_remove_completed_tasks_after_interval": "auto_remove_completed_after",
     "auto_refresh_on_fs_change": "auto_refresh_on_fs_change",
     "auto_refresh_debounce_ms": "auto_refresh_debounce_ms",
-    "auto_recurse_submodules": "auto_recurse_submodules",
     "fetch_on_manual_refresh": "fetch_on_manual_refresh",
 }
 
@@ -980,7 +966,6 @@ def apply_workspace_overrides(state, cfg: Config, ws: Workspace) -> None:
         cfg.default_auto_push_submodule_parent)
     state.auto_refresh_on_fs_change = cfg.auto_refresh_on_fs_change
     state.auto_refresh_debounce_ms = cfg.auto_refresh_debounce_ms
-    state.auto_recurse_submodules = cfg.auto_recurse_submodules
     state.fetch_on_manual_refresh = cfg.fetch_on_manual_refresh
     # fs_watch_ignore is workspace-scoped only — no idlegit.conf-level
     # default to fall back to. A workspace switch always replaces the

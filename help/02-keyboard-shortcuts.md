@@ -10,8 +10,8 @@
 - *Ctrl+P* — `pull --ff-only` every repo in the workspace that has
   an upstream. Repos without an upstream are silently skipped;
   non-FF pulls fail with a task entry (use the action menu's Pull
-  for a merge fallback). Honours the workspace's
-  `auto_recurse_submodules` setting.
+  for a merge fallback). Submodule checkouts are never auto-advanced
+  — use *Ctrl+S* (smart-sync) for that.
 - *Tab* on the title row — open the app menu (workspaces, updates,
   auto-refresh, task logging, help).
 - *Shift+Tab* — toggle focus between the repos panel and the task

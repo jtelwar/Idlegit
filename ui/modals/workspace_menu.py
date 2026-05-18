@@ -140,10 +140,6 @@ _OVERRIDE_ROWS: Tuple[WorkspaceMenuRow, ...] = (
         attr_name="default_auto_push_submodule_parent", kind="bool",
         hint_text="after sync, commit+push any parent whose only dirt is the bumped submodule (default: on)"),
     WorkspaceMenuRow(
-        label="Auto-recurse submodules",
-        attr_name="auto_recurse_submodules", kind="bool",
-        hint_text="pull/fetch with --recurse-submodules=on-demand so submodule checkouts advance with the parent (default: on)"),
-    WorkspaceMenuRow(
         label="Fetch on manual refresh",
         attr_name="fetch_on_manual_refresh", kind="bool",
         hint_text="Ctrl+R does `git fetch --all` per repo so ahead/behind is fresh; off keeps Ctrl+R instant + offline (default: off)"),

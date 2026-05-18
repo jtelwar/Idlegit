@@ -15,11 +15,12 @@ from .models import (
 )
 from .git_ops import (
     apply_lfs_tracking, discover_repos, dispatch_workflow, first_line,
-    get_run_view, gh_available, git,
+    get_run_view, gh_available, git, git_cancellable,
     has_only_submodule_pointer_changes,
     link_siblings, list_branches,
     list_recent_runs, merge_remote_workflow_states, parse_github_slug,
-    refresh_repo, safe_stage_all, signature_mtime, suggest_commit_message,
+    refresh_repo, safe_stage_all, signature_mtime,
+    suggest_commit_message,
     suggest_commit_message_at, suggest_commit_message_for_paths,
     sync_sibling, sync_subtree, is_safe_ref_arg,
     working_tree_signature,
@@ -35,21 +36,19 @@ _align_heads_prompt_lock = threading.Lock()
 def _pull_prefer_ff_then_merge(
         path: Path, tasks: Tasks, name: str, *,
         allow_merge_fallback: bool,
-        recurse_submodules: bool = False,
-        parent_task: "Optional[Task]" = None) -> bool:
+        parent_task: "Optional[Task]" = None,
+        cancel_event: "Optional[threading.Event]" = None) -> bool:
     """`git pull --ff-only`, then optionally `git pull --no-rebase --no-edit`
     when the caller allows merge commits. No rebase / no force. Returns
     False on failure (a task row records the error). On success: when HEAD
     moved, adds an ok task; when already up to date, no task (matches the
     commit pipeline's historical no-noise behaviour).
 
-    `recurse_submodules` (default False for compatibility) maps to
-    `--recurse-submodules=on-demand`: git updates each submodule's
-    working tree only when the parent's gitlink moved to a commit the
-    submodule hasn't seen, matching what the user expects from "pull
-    the parent and have submodule code on disk match." Callers pass
-    `state.auto_recurse_submodules` so the workspace setting drives
-    every pull through this helper.
+    Never passes `--recurse-submodules`: that flag re-checkouts each
+    submodule to the parent's recorded gitlink, which silently
+    orphans local-only submodule commits ahead of the gitlink. Use
+    Ctrl+S (smart-sync) to align submodule checkouts safely via
+    `sync_sibling`, which refuses to orphan commits.
 
     `parent_task` (default None) — when supplied, every child task row
     added by this call gets parented under it via `tasks.add(..., parent=...)`.
@@ -60,25 +59,32 @@ def _pull_prefer_ff_then_merge(
     add no task at all)."""
     _, head_before, _ = git(path, ["rev-parse", "HEAD"])
     pull_args = ["pull", "--ff-only"]
-    if recurse_submodules:
-        pull_args.append("--recurse-submodules=on-demand")
-    rc, _, err = git(path, pull_args)
+    rc, _, err = git_cancellable(path, pull_args, cancel_event=cancel_event)
     _, head_after, _ = git(path, ["rev-parse", "HEAD"])
     if rc == 0:
         if head_before.strip() != head_after.strip():
             t = tasks.add(f"{name}: pull", parent=parent_task)
             tasks.update(t, "ok")
         return True
+    if rc == 130:
+        # User cancelled — surface a warn row and bail without
+        # trying the merge fallback (that'd also block on network).
+        t = tasks.add(f"{name}: pull", parent=parent_task)
+        tasks.update(t, "warn", "cancelled")
+        return False
     if not allow_merge_fallback:
         t = tasks.add(f"{name}: pull --ff-only", parent=parent_task)
         tasks.update(t, "fail",
                      first_line(err) or "cannot fast-forward")
         return False
     merge_args = ["pull", "--no-rebase", "--no-edit"]
-    if recurse_submodules:
-        merge_args.append("--recurse-submodules=on-demand")
-    rc2, _, err2 = git(path, merge_args)
+    rc2, _, err2 = git_cancellable(
+        path, merge_args, cancel_event=cancel_event)
     _, head_after2, _ = git(path, ["rev-parse", "HEAD"])
+    if rc2 == 130:
+        t = tasks.add(f"{name}: pull", parent=parent_task)
+        tasks.update(t, "warn", "cancelled")
+        return False
     if rc2 != 0:
         t = tasks.add(f"{name}: pull", parent=parent_task)
         tasks.update(t, "fail",
@@ -643,18 +649,14 @@ def kick_off_action(state: State, action_id: str, *,
       try:
         if action_id == "fetch":
             t = state.tasks.add(f"{target_label}: fetch")
-            fetch_args = ["fetch", "--all"]
-            if state.auto_recurse_submodules:
-                fetch_args.append("--recurse-submodules=on-demand")
-            rc, _, err = git(target_path, fetch_args)
+            rc, _, err = git(target_path, ["fetch", "--all"])
             state.tasks.update(
                 t, "ok" if rc == 0 else "fail",
                 "" if rc == 0 else first_line(err))
         elif action_id == "pull":
             ok = _pull_prefer_ff_then_merge(
                 target_path, state.tasks, target_label,
-                allow_merge_fallback=True,
-                recurse_submodules=state.auto_recurse_submodules)
+                allow_merge_fallback=True)
             if not ok:
                 return
         elif action_id == "push":
@@ -670,8 +672,7 @@ def kick_off_action(state: State, action_id: str, *,
             if has_upstream:
                 ok_pull = _pull_prefer_ff_then_merge(
                     target_path, state.tasks, target_label,
-                    allow_merge_fallback=True,
-                    recurse_submodules=state.auto_recurse_submodules)
+                    allow_merge_fallback=True)
                 if not ok_pull:
                     state.tasks.update(t, "fail", "skipped: cannot pull")
                     return
@@ -1338,11 +1339,23 @@ def commit_worker(state: State, repo: Repo, msg: str,
     # Also replaces the legacy `<name>: failed` fallback row — same
     # signal carried by this task's status on exception.
     pipeline_task = state.tasks.add(f"{name}: working")
+    # Cancel signal — the task-detail modal sets this when the user
+    # picks "Cancel commit/push" on this row. `git_cancellable` polls
+    # it while the long-running network calls (pre-stage pull, push)
+    # block on subprocess.wait, so the cancel takes effect within
+    # ~250ms of the user's keystroke instead of after the push times
+    # out or completes.
+    cancel_event = threading.Event()
+    state.tasks.set_meta(pipeline_task, cancel_event=cancel_event)
     try:
         _commit_worker_inner(state, repo, msg, lfs_cands, staged_paths,
                              amend, track_workflow, then_run_after_push,
-                             then_run_params_after_push)
-        state.tasks.update(pipeline_task, "ok", "")
+                             then_run_params_after_push,
+                             cancel_event=cancel_event)
+        if cancel_event.is_set():
+            state.tasks.update(pipeline_task, "warn", "cancelled")
+        else:
+            state.tasks.update(pipeline_task, "ok", "")
     except Exception as e:
         state.tasks.update(pipeline_task, "fail", first_line(str(e)))
 
@@ -1354,6 +1367,7 @@ def _commit_worker_inner(state: State, repo: Repo, msg: str,
                          track_workflow: Optional["dict[str, bool]"] = None,
                          then_run_after_push: str = "",
                          then_run_params_after_push: Optional["dict[str, str]"] = None,
+                         cancel_event: "Optional[threading.Event]" = None,
                          ) -> None:
     auto_stage = state.auto_stage
     auto_push = state.auto_push
@@ -1401,7 +1415,7 @@ def _commit_worker_inner(state: State, repo: Repo, msg: str,
     if repo.upstream:
         ok_pull = _pull_prefer_ff_then_merge(
             repo.path, tasks, name, allow_merge_fallback=True,
-            recurse_submodules=state.auto_recurse_submodules)
+            cancel_event=cancel_event)
         if not ok_pull:
             return
 
@@ -1452,7 +1466,8 @@ def _commit_worker_inner(state: State, repo: Repo, msg: str,
     rc_u, _, _ = git(repo.path, [
         "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
     if rc_u == 0:
-        rc, _, err = git(repo.path, ["push"])
+        rc, _, err = git_cancellable(
+            repo.path, ["push"], cancel_event=cancel_event)
     else:
         rc_b, b_out, _ = git(repo.path, ["branch", "--show-current"])
         cur_branch = b_out.strip() if rc_b == 0 else ""
@@ -1460,12 +1475,19 @@ def _commit_worker_inner(state: State, repo: Repo, msg: str,
             if not is_safe_ref_arg(cur_branch):
                 tasks.update(push_task, "fail", "unsafe current branch name")
                 return
-            rc, _, err = git(repo.path, [
-                "push", "--set-upstream", "origin", cur_branch])
+            rc, _, err = git_cancellable(
+                repo.path,
+                ["push", "--set-upstream", "origin", cur_branch],
+                cancel_event=cancel_event)
         else:
             rc, err = 1, "no current branch"
     if rc != 0:
-        tasks.update(push_task, "fail", first_line(err))
+        # rc 130 = cancelled; tag the row distinctly so the user sees
+        # the cancel landed rather than a generic push failure.
+        if rc == 130:
+            tasks.update(push_task, "warn", "cancelled")
+        else:
+            tasks.update(push_task, "fail", first_line(err))
         return
     tasks.update(push_task, "ok")
 
@@ -1586,11 +1608,17 @@ def commit_worker_for_child(state: State, parent: Repo, ref: ChildRef,
             f"(in {state.task_repo_label(parent)})")
     # Early-visibility task — see `commit_worker` for the rationale.
     pipeline_task = state.tasks.add(f"{name}: working")
+    cancel_event = threading.Event()
+    state.tasks.set_meta(pipeline_task, cancel_event=cancel_event)
     try:
         _commit_worker_for_child_inner(
             state, parent, ref, msg, staged_paths, amend,
-            track_workflow, then_run_after_push, then_run_params_after_push)
-        state.tasks.update(pipeline_task, "ok", "")
+            track_workflow, then_run_after_push, then_run_params_after_push,
+            cancel_event=cancel_event)
+        if cancel_event.is_set():
+            state.tasks.update(pipeline_task, "warn", "cancelled")
+        else:
+            state.tasks.update(pipeline_task, "ok", "")
     except Exception as e:
         state.tasks.update(pipeline_task, "fail", first_line(str(e)))
 
@@ -1604,6 +1632,8 @@ def _commit_worker_for_child_inner(state: State, parent: Repo,
                                    = None,
                                    then_run_after_push: str = "",
                                    then_run_params_after_push: Optional["dict[str, str]"]
+                                   = None,
+                                   cancel_event: "Optional[threading.Event]"
                                    = None,
                                    ) -> None:
     auto_stage = state.auto_stage
@@ -1682,15 +1712,21 @@ def _commit_worker_for_child_inner(state: State, parent: Repo,
 
     push_task = tasks.add(f"{name}: push")
     if has_upstream:
-        rc, _, err = git(ref.nested_path, ["push"])
+        rc, _, err = git_cancellable(
+            ref.nested_path, ["push"], cancel_event=cancel_event)
     else:
         if not is_safe_ref_arg(nested_branch):
             tasks.update(push_task, "fail", "unsafe current branch name")
             return
-        rc, _, err = git(ref.nested_path, [
-            "push", "--set-upstream", "origin", nested_branch])
+        rc, _, err = git_cancellable(
+            ref.nested_path,
+            ["push", "--set-upstream", "origin", nested_branch],
+            cancel_event=cancel_event)
     if rc != 0:
-        tasks.update(push_task, "fail", first_line(err))
+        if rc == 130:
+            tasks.update(push_task, "warn", "cancelled")
+        else:
+            tasks.update(push_task, "fail", first_line(err))
         return
     tasks.update(push_task, "ok")
 
@@ -3416,18 +3452,13 @@ def kick_off_inline_refresh(state: State) -> None:
             # upstream rather than the last fetch. Fetch failures are
             # silently swallowed — they don't fail the refresh; the
             # local state re-read still runs and the ahead/behind
-            # numbers just stay stale. Recursing submodules in this
-            # fetch piggybacks on the same workspace flag so the
-            # behaviour matches the action menu's Fetch.
+            # numbers just stay stale.
             do_fetch = state.fetch_on_manual_refresh
-            fetch_args = ["fetch", "--all"]
-            if do_fetch and state.auto_recurse_submodules:
-                fetch_args.append("--recurse-submodules=on-demand")
 
             def refresh_one(r: Repo) -> None:
                 if do_fetch:
                     try:
-                        git(r.path, fetch_args)
+                        git(r.path, ["fetch", "--all"])
                     except Exception:  # noqa: BLE001
                         pass
                 refresh_repo_with_remote_state(r)
@@ -3551,7 +3582,6 @@ def kick_off_pull_all(state: State) -> None:
                 ok = _pull_prefer_ff_then_merge(
                     r.path, state.tasks, name,
                     allow_merge_fallback=False,
-                    recurse_submodules=state.auto_recurse_submodules,
                     parent_task=parent_task)
                 _, after, _ = git(r.path, ["rev-parse", "HEAD"])
                 with counters_lock:

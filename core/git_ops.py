@@ -7,6 +7,7 @@ from __future__ import annotations
 import os
 import subprocess
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -117,6 +118,76 @@ def git(path: Path, args: List[str],
     except subprocess.TimeoutExpired as e:
         return 124, e.stdout or "", f"git timed out after {timeout:g}s"
     return p.returncode, p.stdout, p.stderr
+
+
+def git_cancellable(
+        path: Path, args: List[str],
+        cancel_event: "Optional[object]" = None,
+        timeout: float = DEFAULT_GIT_TIMEOUT_SECONDS,
+        poll_interval: float = 0.25) -> Tuple[int, str, str]:
+    """Like `git()` but polls `cancel_event` (a `threading.Event`) while
+    waiting on the subprocess so a user-initiated Cancel can terminate
+    a long-running git operation (push, pull, fetch). Returns the same
+    `(rc, stdout, stderr)` tuple; on cancel, `rc == 130` (the standard
+    "terminated by signal" code) and stderr names the action.
+
+    Uses `Popen` directly so we hold the handle for termination. Falls
+    back to plain `git()` behaviour when `cancel_event` is None — no
+    subprocess overhead for paths that don't need cancellation."""
+    if cancel_event is None:
+        return git(path, args, timeout=timeout)
+    try:
+        proc = subprocess.Popen(
+            ["git", *args],
+            cwd=str(path),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=_git_env(),
+        )
+    except OSError as e:
+        return 1, "", str(e)
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            rc = proc.wait(timeout=poll_interval)
+            break
+        except subprocess.TimeoutExpired:
+            pass
+        if cancel_event.is_set():
+            # Terminate first (SIGTERM), then kill if it doesn't yield.
+            # Either way, drain pipes via communicate() so the buffers
+            # don't deadlock.
+            try:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=2.0)
+            except OSError:
+                pass
+            try:
+                _, err = proc.communicate(timeout=1.0)
+            except (subprocess.TimeoutExpired, OSError):
+                err = ""
+            return 130, "", err or "cancelled"
+        if time.monotonic() > deadline:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            try:
+                _, err = proc.communicate(timeout=1.0)
+            except (subprocess.TimeoutExpired, OSError):
+                err = ""
+            return 124, "", err or f"git timed out after {timeout:g}s"
+    try:
+        stdout = proc.stdout.read() if proc.stdout is not None else ""
+        stderr = proc.stderr.read() if proc.stderr is not None else ""
+    except OSError:
+        stdout, stderr = "", ""
+    return rc, stdout, stderr
 
 
 def git_bounded_output(path: Path, args: List[str],

@@ -130,6 +130,18 @@ def open_task_action_menu(state: State, task: Task) -> None:
             reason=("already finished" if _is_terminal(task.status)
                     else "no run id")))
 
+    # Cancel a running local commit/push pipeline. `meta.cancel_event`
+    # is set on the `<repo>: working` parent task by `commit_worker` /
+    # `commit_worker_for_child`; the `git_cancellable` helper polls it
+    # during the long network steps (pre-stage pull, push) so the
+    # cancel takes effect within ~250ms of this action firing.
+    can_cancel_pipeline = (meta is not None
+                           and meta.cancel_event is not None
+                           and not _is_terminal(task.status))
+    if can_cancel_pipeline:
+        items.append(TaskActionMenuItem(
+            id="cancel_pipeline", label="Cancel commit/push"))
+
     # Then-run management — both for the parent run task (whose pending
     # placeholder lives in its children) and for the placeholder itself.
     pending_child: Optional[Task] = None
@@ -441,6 +453,15 @@ def _dispatch_action(state: State, item_id: str) -> None:
             state.tasks.update(t, "ok" if ok else "fail", msg)
 
         threading.Thread(target=cancel_worker, daemon=True).start()
+        state.task_action_menu = None
+        return
+
+    if item_id == "cancel_pipeline" and meta is not None and meta.cancel_event:
+        # Set the event; the worker's `git_cancellable` call sees it on
+        # its next ~250ms poll and terminates the git subprocess. The
+        # worker then bails through its normal error path which updates
+        # the parent task to "warn / cancelled".
+        meta.cancel_event.set()
         state.task_action_menu = None
         return
 
