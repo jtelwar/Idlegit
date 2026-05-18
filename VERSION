@@ -1,4 +1,7 @@
-0.24.5
+0.24.6
+
+### 0.24.6
+- 2026-05-18: workspace switch via cache hit now kicks a background `kick_off_inline_refresh` after the instant swap so per-repo dirty/branch state catches up with any edits made while the user was on a different workspace (fs_watcher tears down watchers for away-workspace repos, so those edits were never observed and the cached state read as stale until Ctrl+R).
 
 ### 0.24.5
 - 2026-05-18: `kick_off_workers` supervisor releases refresh locks by the Repo / ChildRef instances captured at queue time instead of looking them up in `state.repos` — fixes stuck `refreshing=True` rows that occurred when `state.repos` was replaced (workspace switch with cache miss, fresh discovery) between commit-pipeline acquire and the supervisor's finally.

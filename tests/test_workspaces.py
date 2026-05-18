@@ -491,7 +491,14 @@ class TestSwitchWorkspaceCache(unittest.TestCase):
             s.workspace_name = workspaces[0].name
         return s
 
-    def test_cache_hit_skips_discovery_and_async_refresh(self) -> None:
+    def test_cache_hit_skips_discovery_but_kicks_background_refresh(self) -> None:
+        # Cache hit gives an instant visual swap (no discover_repos),
+        # then kicks an inline refresh so per-repo dirty/branch state
+        # — possibly stale from edits made while the user was on a
+        # different workspace — gets corrected within a frame or two.
+        # fs_watcher tears down watchers for the away workspace, so
+        # without this kick the cached state would remain stale until
+        # the user hit Ctrl+R.
         from core.workers import switch_workspace
         a_repos = [_make_repo("a1"), _make_repo("a2")]
         b_repos = [_make_repo("b1")]
@@ -502,7 +509,7 @@ class TestSwitchWorkspaceCache(unittest.TestCase):
              mock.patch("core.workers.kick_off_inline_refresh") as kick:
             switch_workspace(s, 1)
             disc.assert_not_called()
-            kick.assert_not_called()
+            kick.assert_called_once()
         self.assertIs(s.repos, b_repos)
         self.assertEqual(s.workspace_name, "B")
 

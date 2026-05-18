@@ -3669,9 +3669,14 @@ def kick_off_pull_all(state: State) -> None:
 def switch_workspace(state: State, new_index: int) -> None:
     """Switch the active workspace. The cheap path — and the one taken
     every time after the first — is to swap `state.repos` to the new
-    workspace's `cached_repos`, populated at startup. No re-discovery,
-    no async refresh: each ←/→ keystroke is instant and the previously-
-    fetched per-repo state (branch, head, dirty flags) is preserved.
+    workspace's `cached_repos`, populated at startup. The swap is
+    instant (no re-discovery), and a background `kick_off_inline_refresh`
+    fires at the tail to correct any per-repo state (branch, head,
+    dirty flags) that drifted while the user was on a different
+    workspace — fs_watcher tears down watchers for repos not in the
+    current `state.repos`, so changes made to this workspace's repos
+    while away are never observed and the cached state would otherwise
+    show as stale until the next manual Ctrl+R.
 
     The cache-miss path covers exactly two cases:
       1. A workspace freshly created at runtime via the creator wizard
@@ -3701,12 +3706,22 @@ def switch_workspace(state: State, new_index: int) -> None:
     ws = state.workspaces[new_index]
 
     if ws.cached_repos:
-        # Cache hit — instant swap. The cached list is the same Python
-        # object subsequent kick_off_inline_refresh runs will mutate
-        # in place, so a later Ctrl+R updates both `state.repos` and
+        # Cache hit — instant visual swap to the cached state, then
+        # kick a background refresh below. The cached list is the same
+        # Python object subsequent kick_off_inline_refresh runs will
+        # mutate in place, so a later Ctrl+R (and the background
+        # refresh we kick at the tail) updates both `state.repos` and
         # the workspace's cache simultaneously without copying.
+        #
+        # The refresh matters because fs_watcher only observes events
+        # for paths in the *current* `state.repos` — watchers for the
+        # previous workspace's repos are torn down on switch, so any
+        # edit landing on this workspace's repos while the user was
+        # away never produced a refresh. Without the kick the row
+        # would keep showing the stale-from-last-visit dirty/branch
+        # state until Ctrl+R.
         state.repos = ws.cached_repos
-        kick_refresh = False
+        kick_refresh = True
     else:
         # Cache miss (newly-added workspace) — do the expensive bits.
         # Sync discovery is fast; remote-state refresh stays async so
