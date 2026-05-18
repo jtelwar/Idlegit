@@ -1,4 +1,19 @@
-0.24.0
+0.24.5
+
+### 0.24.5
+- 2026-05-18: `kick_off_workers` supervisor releases refresh locks by the Repo / ChildRef instances captured at queue time instead of looking them up in `state.repos` — fixes stuck `refreshing=True` rows that occurred when `state.repos` was replaced (workspace switch with cache miss, fresh discovery) between commit-pipeline acquire and the supervisor's finally.
+
+### 0.24.4
+- 2026-05-18: Ctrl+R inline refresh now surfaces a warn task `<repo>: refresh skipped — locked by another worker` for every repo whose refresh lock is held, so a stuck-refreshing row is visible in the sidebar instead of a silent no-op.
+
+### 0.24.3
+- 2026-05-18: README Windows install section now calls out `pipx ensurepath` + the "reopen terminal" step so `idlegit` resolves on PATH after install; documents the `%USERPROFILE%\.local\bin\idlegit.exe` fallback.
+
+### 0.24.2
+- 2026-05-18: `_read_version` falls back to `importlib.metadata.version("idlegit")` so the header shows the real version under pipx/wheel installs (the VERSION file isn't shipped to site-packages); `update.py`'s `main` now catches `KeyboardInterrupt` itself so Ctrl+C under the Windows console_scripts shim shows a clean "interrupted" line instead of a traceback.
+
+### 0.24.1
+- 2026-05-18: `idlegit-update` now works on Windows — registered as a console_scripts entry so `pipx install` generates an `idlegit-update.exe` shim, making the in-app "Check for updates → Update now" gesture functional on Windows.
 
 ### 0.24.0
 - 2026-05-18: removed `auto_recurse_submodules` config + workspace toggle; idlegit's pull/fetch paths no longer pass `--recurse-submodules` (use Ctrl+S smart-sync to align submodule checkouts safely). Clone still recurses.

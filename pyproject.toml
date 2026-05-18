@@ -55,6 +55,12 @@ windows = ["windows-curses ; sys_platform == 'win32'"]
 
 [project.scripts]
 idlegit = "idlegit:main"
+# pipx generates an `idlegit-update.exe` shim on Windows from this
+# entry so the in-app "Check for updates → Update now" gesture and
+# the bare `idlegit-update` command both work. Unix users installing
+# via pipx get a matching shim; the `./install` flow keeps using the
+# bash launcher at `scripts/idlegit-update`.
+idlegit-update = "scripts.update:main"
 
 [tool.setuptools.dynamic]
 version = { attr = "core.config.VERSION" }
@@ -63,8 +69,8 @@ version = { attr = "core.config.VERSION" }
 py-modules = ["idlegit"]
 
 [tool.setuptools.packages.find]
-include = ["core*", "ui*"]
-exclude = ["tests*", "scripts*", "agents*"]
+include = ["core*", "ui*", "scripts*"]
+exclude = ["tests*", "agents*"]
 
 # Ruff configuration — pinned to keep CI deterministic across ruff
 # releases. The default rule set (E4/E7/E9 + F) is what the project

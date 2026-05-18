@@ -315,6 +315,20 @@ def _run_installer(install_dir: Path, assume_yes: bool) -> None:
 
 
 def main(argv: "list[str] | None" = None) -> int:
+    """Console-script entry point. Wraps `_run` so Ctrl+C surfaces a
+    clean "interrupted" line and an exit code of 130 regardless of
+    how we were invoked — the `__main__` block below, a pipx-generated
+    `idlegit-update.exe` shim on Windows, or any other importer that
+    calls `main()` and forwards the return code to `sys.exit`."""
+    try:
+        return _run(argv)
+    except KeyboardInterrupt:
+        print()
+        err("interrupted")
+        return 130
+
+
+def _run(argv: "list[str] | None") -> int:
     argv = list(argv if argv is not None else sys.argv)
     assume_yes, check_only, force = parse_args(argv)
 

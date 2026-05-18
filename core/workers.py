@@ -1929,8 +1929,22 @@ def kick_off_workers(state: State, blocks: List[ReviewBlock]) -> None:
     if not repo_plans and not child_plans:
         return
 
-    locked_repos = {id(plan[0]) for plan in repo_plans}
-    locked_refs = {id(plan[1]) for plan in child_plans}
+    # Capture the locked Repo / ChildRef objects directly so the
+    # supervisor's finally releases the exact instances we acquired,
+    # regardless of what `state.repos` looks like by then. A previous
+    # version did `for r in state.repos: if id(r) in locked_ids: …` —
+    # which silently dropped releases when `state.repos` got swapped
+    # out between acquire and finally (workspace switch with cache
+    # miss → `state.repos = fresh` rebuilds the list with new Repo
+    # instances). Result: locks stranded for the rest of the process
+    # lifetime, manifesting as rows stuck in `refreshing=True` with
+    # an empty sidebar (the pipeline tasks have long since marked
+    # terminal) and Ctrl+R unable to recover. Holding references to
+    # the actual locked objects closes that hole — release operates
+    # on the identity we acquired, not whatever happens to share the
+    # path now.
+    locked_repo_refs: List[Repo] = [plan[0] for plan in repo_plans]
+    locked_child_refs: List[ChildRef] = [plan[1] for plan in child_plans]
 
     workers: List[threading.Thread] = []
     for (repo, msg, repo_cands, staged, amend,
@@ -1978,14 +1992,13 @@ def kick_off_workers(state: State, blocks: List[ReviewBlock]) -> None:
             # Releases run in a finally so any earlier exception STILL
             # frees the locks. Without this, an exception in
             # refresh_repo / link_siblings strands every locked repo
-            # and child ref.
-            for r in state.repos:
-                if id(r) in locked_repos:
-                    r.release_refresh()
-            for parent in state.repos:
-                for ref in parent.children:
-                    if id(ref) in locked_refs:
-                        ref.release_refresh()
+            # and child ref. Iterates the captured refs directly so a
+            # `state.repos` swap (workspace switch, fresh discovery)
+            # between acquire and finally can't strand the lock.
+            for r in locked_repo_refs:
+                r.release_refresh()
+            for ref in locked_child_refs:
+                ref.release_refresh()
 
     threading.Thread(target=supervisor, daemon=True).start()
 
@@ -3445,6 +3458,23 @@ def kick_off_inline_refresh(state: State) -> None:
             # will leave them in a consistent state.
             repos_to_refresh = [r for r in next_repos
                                 if r.path in acquired_paths]
+
+            # Surface a warn for every repo we couldn't lock so a stuck
+            # row no longer looks like a silent no-op on Ctrl+R. A
+            # legitimately-held lock (fs_watcher fire mid-flight, ~100ms
+            # window) emits the same warn; the user can press Ctrl+R
+            # again and watch it clear. A wedged row keeps emitting the
+            # warn each Ctrl+R, making the stuck state visible instead
+            # of leaving the user staring at a forever-spinning row.
+            # Force-clearing the lock isn't safe here — the holder may
+            # be mid-write to the Repo's lists — so we report state and
+            # let the user judge.
+            for r in next_repos:
+                if r.path in acquired_paths:
+                    continue
+                t = state.tasks.add(
+                    f"{state.task_repo_label(r)}: refresh skipped")
+                state.tasks.update(t, "warn", "locked by another worker")
 
             # `fetch_on_manual_refresh` (default off) makes Ctrl+R do
             # a `git fetch --all` per repo BEFORE the local state

@@ -48,6 +48,13 @@ idlegit
 
 ### Windows
 
+Install pipx and put its bin dir on PATH:
+```powershell
+py -m pip install --user pipx
+py -m pipx ensurepath
+```
+
+Close and reopen the terminal so the updated PATH takes effect, then:
 ```powershell
 git clone https://github.com/jtelwar/idlegit.git
 cd idlegit
@@ -55,10 +62,18 @@ pipx install ".[windows]"
 idlegit
 ```
 
-On Windows, update with `git pull && pipx reinstall .`. The bash
-`./install` and `idlegit-update` scripts are Unix-only. If a non-UTF-8
-locale (e.g. `LANG=C`) makes the Braille spinner render as tofu, set
-`IDLEGIT_ASCII_GLYPHS=1` for the ASCII fallback.
+If `idlegit` isn't found after `pipx install`, your shell hasn't
+picked up the pipx bin directory yet — re-run `py -m pipx ensurepath`
+and open a fresh terminal. As a fallback you can launch the exe
+directly: `%USERPROFILE%\.local\bin\idlegit.exe`.
+
+`pipx install` also registers an `idlegit-update.exe` shim alongside
+`idlegit.exe`, so the bare `idlegit-update` command and the in-app
+**Check for updates → Update now** gesture both work. The bash
+`./install` script (and its symlinks) are Unix-only — Windows users
+go through pipx. If a non-UTF-8 locale (e.g. `LANG=C`) makes the
+Braille spinner render as tofu, set `IDLEGIT_ASCII_GLYPHS=1` for the
+ASCII fallback.
 
 ## Update
 

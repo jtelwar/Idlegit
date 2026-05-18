@@ -55,13 +55,16 @@ TOOL_DIR = Path(__file__).resolve().parent.parent
 
 def _read_version() -> str:
     """Pull the version string from the `VERSION` file at the project
-    root. Streams the file: the line iterator reads lazily and we
-    return as soon as we have the first non-blank line's leading
-    token, so the rest of the file (free-form changelog / release
-    notes) is never read. Falls back to `"0.0.0"` if the file is
-    missing or empty — a broken install fails loudly later (e.g.
-    the updater treats every release as newer) rather than crashing
-    at import."""
+    root (dev tree + Unix `./install` flatten layout). When the file
+    is missing — the pipx/wheel layout doesn't ship VERSION at the
+    site-packages root — fall back to `importlib.metadata.version`,
+    which reads the version setuptools baked into the wheel's
+    `.dist-info/METADATA` at build time (same source of truth as the
+    file: setuptools' dynamic-version directive resolves
+    `core.config.VERSION` by exec'ing this module against the file
+    at build time). Final fallback to `"0.0.0"` so a broken install
+    fails loudly later (e.g. the updater treats every release as
+    newer) rather than crashing at import."""
     path = TOOL_DIR / "VERSION"
     try:
         with open(path, "r", encoding="utf-8") as fh:
@@ -74,6 +77,11 @@ def _read_version() -> str:
                     # form changelog territory.
                     return token.split()[0]
     except OSError:
+        pass
+    try:
+        from importlib.metadata import PackageNotFoundError, version
+        return version("idlegit")
+    except (ImportError, PackageNotFoundError):
         pass
     return "0.0.0"
 
