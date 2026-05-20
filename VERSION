@@ -1,4 +1,7 @@
-0.24.7
+0.24.8
+
+### 0.24.8
+- 2026-05-20: commit-pipeline supervisor now refreshes + re-links the workspace snapshot captured at queue time instead of the live `state.repos` — fixes pre-commit state reappearing (and the same work being re-committable) when the user switched workspaces mid-pipeline and navigated back.
 
 ### 0.24.7
 - 2026-05-19: `discover_repos` no longer skips hidden directories — `.github` (GitHub's org/user-README repo) and any other dotfolder containing a `.git` is now picked up as a workspace row. The workspace's own `.git/` is still safely ignored (no nested `.git`).

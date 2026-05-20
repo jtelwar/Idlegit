@@ -1945,6 +1945,19 @@ def kick_off_workers(state: State, blocks: List[ReviewBlock]) -> None:
     # path now.
     locked_repo_refs: List[Repo] = [plan[0] for plan in repo_plans]
     locked_child_refs: List[ChildRef] = [plan[1] for plan in child_plans]
+    # Snapshot the workspace's repo + subtree list at queue time so
+    # the supervisor's post-commit refresh + link_siblings operate on
+    # the workspace where the commit happened, not whichever workspace
+    # `state.repos` happens to point at when the join completes. Without
+    # this, a user who switches workspaces mid-pipeline returns to a
+    # cached snapshot frozen at switch-out time: dirty flags and HEAD
+    # never advance, the commit message field appears repopulated, and
+    # hitting Enter again would re-commit (and re-push) the same work.
+    # Identity is preserved — these are the same Repo objects that the
+    # cache lists hold, so mutations land on the right rows even when
+    # the user is parked on a different workspace.
+    snapshot_repos: List[Repo] = list(state.repos)
+    snapshot_subtrees = list(state.subtrees)
 
     workers: List[threading.Thread] = []
     for (repo, msg, repo_cands, staged, amend,
@@ -1979,13 +1992,18 @@ def kick_off_workers(state: State, blocks: List[ReviewBlock]) -> None:
             # that follow — that's how repos got "stuck refreshing"
             # forever, blocking the action menu with no way to recover
             # short of restarting idlegit.
-            for r in state.repos:
+            #
+            # Iterates `snapshot_repos` (captured at queue time), not
+            # `state.repos`, so a mid-pipeline workspace switch can't
+            # leave the originally-committed repos un-refreshed and
+            # showing pre-commit state when the user navigates back.
+            for r in snapshot_repos:
                 try:
                     refresh_repo(r)
                 except Exception:  # noqa: BLE001
                     pass
             try:
-                link_siblings(state.repos, state.subtrees)
+                link_siblings(snapshot_repos, snapshot_subtrees)
             except Exception:  # noqa: BLE001
                 pass
         finally:
