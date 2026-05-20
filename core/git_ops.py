@@ -396,7 +396,15 @@ def discover_repos(workspace: Path) -> List[Repo]:
     """Return the workspace itself (if it's a git repo) plus every immediate
     child folder containing .git, sorted alphabetically. The folder this
     script lives in is included if (and only if) it's also a git repo —
-    handy for managing idlegit's own checkout from idlegit itself."""
+    handy for managing idlegit's own checkout from idlegit itself.
+
+    Hidden directories (dotfolders like `.github`, `.dotfiles`) are NOT
+    excluded — GitHub treats `<owner>/.github` as a real repo (it hosts
+    the org-/user-level README) and there's no reason to hide it from
+    the workspace view. The membership criterion is "directory contains
+    a `.git`", same as for non-hidden children. The workspace's own
+    `.git` directory doesn't satisfy this (no nested `.git`), so it's
+    safely skipped without needing a name filter."""
     repos: List[Repo] = []
     try:
         if (workspace / ".git").exists():
@@ -410,8 +418,6 @@ def discover_repos(workspace: Path) -> List[Repo]:
     for child in children:
         try:
             if not child.is_dir():
-                continue
-            if child.name.startswith("."):
                 continue
             if (child / ".git").exists():
                 repos.append(Repo(rel=child.name, path=child.resolve()))

@@ -77,11 +77,17 @@ class TestDiscoverRepos(_TempWorkspace):
         rels = sorted(r.rel for r in repos)
         self.assertEqual(rels, ["alpha", "beta"])
 
-    def test_skips_dotfolders(self) -> None:
+    def test_discovers_dotfolders_when_they_contain_git(self) -> None:
+        # `.github` is a real GitHub-recognized repo (org/user README
+        # hosting); other dotfolder names users may put repos under
+        # (`.dotfiles`, etc.) are equally valid. The workspace's own
+        # `.git` directory doesn't get picked up because it has no
+        # nested `.git`, so we don't need a name-based exclude for it.
         make_repo(self.tmp, "real")
-        make_repo(self.tmp, ".hidden")
+        make_repo(self.tmp, ".github")
         repos = discover_repos(self.tmp)
-        self.assertEqual([r.rel for r in repos], ["real"])
+        # Sort is case-insensitive in discover_repos (".github" < "real").
+        self.assertEqual([r.rel for r in repos], [".github", "real"])
 
     def test_alphabetical_ordering(self) -> None:
         for name in ("Charlie", "alpha", "Bravo"):
