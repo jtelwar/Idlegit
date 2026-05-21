@@ -37,6 +37,7 @@ from .review import (
     is_toolbar_toggle,
     kick_off_review_files_load,
 )
+from .mouse import normalize_input
 from .sidebar import SPINNER_FRAMES
 
 
@@ -185,7 +186,7 @@ def handle_main_key(state: State, key: int) -> Optional[str]:
         return None
 
     # Workspace switcher row navigation (selected = -1). ←/→ cycles
-    # workspaces; Tab opens the workspace settings modal (was Enter).
+    # workspaces; Enter opens the workspace picker; Tab opens settings.
     if state.on_workspace_row:
         if key == curses.KEY_UP:
             state.selected = -2  # up to the title row
@@ -199,6 +200,10 @@ def handle_main_key(state: State, key: int) -> Optional[str]:
             return _cycle_workspace(state, -1)
         if key == curses.KEY_RIGHT:
             return _cycle_workspace(state, +1)
+        if key in (10, 13, curses.KEY_ENTER):
+            from .modals.workspace_switcher import open_workspace_switcher
+            open_workspace_switcher(state)
+            return None
         if key == 9:  # Tab — opens the workspace settings modal
             open_workspace_menu(state)
             return None
@@ -327,7 +332,7 @@ def confirm_quit(stdscr, state: State) -> bool:
     stdscr.refresh()
     while True:
         try:
-            key = stdscr.getch()
+            key = normalize_input(stdscr.getch())
         except KeyboardInterrupt:
             return True
         if key == -1:
@@ -432,10 +437,12 @@ def _drive_modal_until_closed(stdscr, state: State, slot: str) -> bool:
         draw_main(stdscr, state)
         stdscr.refresh()
         try:
-            key = stdscr.getch()
+            key = normalize_input(stdscr.getch())
         except KeyboardInterrupt:
             setattr(state, slot, None)
             return False
+        if key == -1:
+            continue
         if key == curses.KEY_RESIZE:
             continue
         handler(state, key)
@@ -487,7 +494,7 @@ def handle_confirm(stdscr, state: State) -> None:
                 draw_diff_viewer(stdscr, state)
                 stdscr.refresh()
             try:
-                key = stdscr.getch()
+                key = normalize_input(stdscr.getch())
             except KeyboardInterrupt:
                 return
             if key == -1:

@@ -894,6 +894,25 @@ class BranchPicker:
 
 
 @dataclass
+class RemoteBranchPicker:
+    """Sub-modal for checking out a remote-tracking branch. Refs load
+    asynchronously via `list_remote_tracking_refs` so opening the
+    picker never blocks on repos with many remotes. Enter dispatches
+    `checkout_remote_branch`, which creates a local tracking branch
+    when needed (cardinal-rule safe)."""
+    target_label: str
+    target_path: Path
+    target_repo: Optional[Repo] = None
+    target_parent: Optional[Repo] = None
+    target_child: Optional[ChildRef] = None
+    refs: List[str] = field(default_factory=list)
+    loading: bool = True
+    selected: int = 0
+    scroll: int = 0
+    cancel_event: threading.Event = field(default_factory=threading.Event)
+
+
+@dataclass
 class RemoteRow:
     """One row in the RemotesModal — represents either an existing remote
     (loaded via `list_remotes`) or a pending-add row created in the
@@ -965,6 +984,26 @@ class CloneModal:
 
 
 @dataclass
+class SshKeygenModal:
+    """Create an ed25519 SSH keypair for GitHub. Opened from the app
+    menu. Collects email (ssh-keygen -C) and private-key path; on
+    success shows the public key and a link to GitHub's key settings."""
+    email: str = ""
+    key_path_text: str = ""
+    passphrase: str = ""
+    selected: int = 0
+    edit_field: str = ""   # "" / "email" / "path" / "passphrase"
+    edit_pre_value: str = ""
+    # y/N gate when Generate is requested with an empty passphrase.
+    confirm_empty_passphrase: bool = False
+    working: bool = False
+    done: bool = False
+    error: str = ""
+    public_key: str = ""
+    key_path: Optional[Path] = None
+
+
+@dataclass
 class BranchNamePrompt:
     """Sub-modal for typing a branch name — both for the action menu's
     "Save HEAD to new branch…" recovery flow (mode "save_head", the
@@ -1019,6 +1058,15 @@ class ResetPrompt:
     ahead: int = 0
     count: int = 0
     typed: str = ""  # raw input buffer; empty means count=0
+
+
+@dataclass
+class WorkspaceSwitcher:
+    """Scrollable workspace picker opened from the main-screen workspace
+    row (Enter). `selected` is an index into `state.workspaces`; Enter
+    on a row calls `switch_workspace` and closes the modal."""
+    selected: int = 0
+    scroll: int = 0
 
 
 @dataclass
@@ -1552,6 +1600,7 @@ class State:
     task_scroll: int = 0
     action_menu: Optional[ActionMenu] = None
     branch_picker: Optional[BranchPicker] = None
+    remote_branch_picker: Optional[RemoteBranchPicker] = None
     branch_name_prompt: Optional[BranchNamePrompt] = None
     reset_prompt: Optional[ResetPrompt] = None
     workflow_picker: Optional[WorkflowPicker] = None
@@ -1569,10 +1618,14 @@ class State:
     diff_viewer: Optional[DiffViewer] = None
     task_action_menu: Optional[TaskActionMenu] = None
     workspace_menu: Optional["WorkspaceMenu"] = None
+    workspace_switcher: Optional[WorkspaceSwitcher] = None
     workspace_creator: Optional["WorkspaceCreator"] = None
     app_menu: Optional["AppMenu"] = None
     remotes_modal: Optional[RemotesModal] = None
     clone_modal: Optional[CloneModal] = None
+    # Opened from the app menu — create an ed25519 key for GitHub SSH.
+    ssh_keygen_modal: Optional["SshKeygenModal"] = None
+    auto_start_ssh_agent: bool = True
     # Sub-modal of the action menu's commits pane — Tab on a focused
     # commit row opens it. Drawn on top of the action menu; key
     # routing in idlegit.py ensures it gets keys before the action
@@ -1624,6 +1677,43 @@ class State:
             for child in repo.children:
                 rows.append(("child", repo, child))
         return rows
+
+    def body_focus_key(self) -> Optional[Tuple]:
+        """Stable identity for the focused body row, or None on the
+        title / workspace pseudo-rows. Used after inline refresh to
+        re-seat the cursor on the same repo or nested checkout even
+        when discover reorders the list or inserts submodule rows."""
+        if self.selected < 0:
+            return None
+        rows = self.selectable_rows()
+        if self.selected >= len(rows):
+            return None
+        kind, parent, child = rows[self.selected]
+        if kind == "repo":
+            return ("repo", parent.path)
+        return ("child", parent.path, child.nested_path.resolve())
+
+    def restore_body_focus(self, key: Optional[Tuple]) -> None:
+        """Point `selected` at the body row matching `key`. No-op when
+        `key` is None (caller is on a pseudo-row). If the row vanished,
+        clamp to the previous index without forcing row 0."""
+        if key is None:
+            return
+        rows = self.selectable_rows()
+        for i, row in enumerate(rows):
+            kind, parent, child = row
+            if key[0] == "repo" and kind == "repo" and parent.path == key[1]:
+                self.selected = i
+                return
+            if (key[0] == "child" and kind == "child"
+                    and parent.path == key[1]
+                    and child.nested_path.resolve() == key[2]):
+                self.selected = i
+                return
+        if rows:
+            self.selected = max(0, min(self.selected, len(rows) - 1))
+        else:
+            self.selected = 0
 
     @property
     def total_rows(self) -> int:

@@ -21,11 +21,14 @@ from .hints import (
 )
 from .modals import (
     draw_action_menu, draw_align_heads_prompt, draw_branch_name_prompt,
-    draw_branch_picker, draw_clone_modal, draw_commit_msg_editor,
+    draw_branch_picker, draw_remote_branch_picker,
+    draw_clone_modal, draw_commit_msg_editor,
     draw_commit_view_modal, draw_detached_recovery_prompt,
     draw_diff_viewer, draw_help_screen, draw_remotes_modal, draw_reset_prompt,
+    draw_ssh_keygen_modal,
     draw_task_action_menu, draw_workflow_picker,
     draw_workspace_creator, draw_workspace_menu, draw_app_menu,
+    draw_workspace_switcher,
 )
 from .sidebar import SPINNER_FRAMES, draw_sidebar
 
@@ -117,6 +120,7 @@ def _workspace_row_hints(state: State) -> List[Hint]:
     hints = [Hint(KEY_UP_DOWN, "navigate")]
     if len(state.workspaces) > 1:
         hints.append(Hint(KEY_LEFT_RIGHT, "cycle workspaces"))
+    hints.append(Hint(KEY_ENTER, "switch workspace…"))
     hints.append(Hint(KEY_TAB, "settings…"))
     return hints
 
@@ -229,7 +233,7 @@ def draw_main(stdscr, state: State) -> None:
                 curses.color_pair(PAIR_BRANCH) | curses.A_DIM)
 
     toggle_y = 2
-    # Row 2 — workspace switcher (replaced the "Repositories" header).
+    # Row 2 — workspace switcher (Enter opens the workspace picker).
     # The name is anchored at column 2 regardless of focus so the row
     # never jumps as focus moves; the dim "‹ X ›" chevrons that signal
     # ←/→ cycling slot into the reserved column-0 / trailing space
@@ -366,6 +370,7 @@ def draw_main(stdscr, state: State) -> None:
 
     modal_active = (state.action_menu is not None
                     or state.branch_picker is not None
+                    or state.remote_branch_picker is not None
                     or state.branch_name_prompt is not None
                     or state.detached_recovery_prompt is not None
                     or state.reset_prompt is not None
@@ -380,11 +385,15 @@ def draw_main(stdscr, state: State) -> None:
                     or state.clone_modal is not None
                     or state.commit_view_modal is not None
                     or state.commit_msg_editor is not None
-                    or state.help_screen is not None)
+                    or state.help_screen is not None
+                    or state.ssh_keygen_modal is not None
+                    or state.workspace_switcher is not None)
     if state.action_menu is not None:
         draw_action_menu(stdscr, state, sidebar_x)
     if state.branch_picker is not None:
         draw_branch_picker(stdscr, state, sidebar_x)
+    if state.remote_branch_picker is not None:
+        draw_remote_branch_picker(stdscr, state, sidebar_x)
     if state.branch_name_prompt is not None:
         draw_branch_name_prompt(stdscr, state, sidebar_x)
     if state.detached_recovery_prompt is not None:
@@ -403,6 +412,8 @@ def draw_main(stdscr, state: State) -> None:
     # paints on top — common during the "Create new workspace" flow.
     if state.app_menu is not None:
         draw_app_menu(stdscr, state, sidebar_x)
+    if state.workspace_switcher is not None:
+        draw_workspace_switcher(stdscr, state, sidebar_x)
     if state.workspace_creator is not None:
         draw_workspace_creator(stdscr, state, sidebar_x)
     # Sub-modals of action_menu (remotes, commit view) and
@@ -428,6 +439,8 @@ def draw_main(stdscr, state: State) -> None:
     # menu chrome underneath.
     if state.help_screen is not None:
         draw_help_screen(stdscr, state, sidebar_x)
+    if state.ssh_keygen_modal is not None:
+        draw_ssh_keygen_modal(stdscr, state, sidebar_x)
 
     # Sidebar drawn LAST so it's always the freshest paint on screen —
     # avoids the resize artifacts where stale cells from the old layout

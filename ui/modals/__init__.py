@@ -19,6 +19,10 @@ from .branch_name_prompt import (
 from .branch_picker import (
     draw_branch_picker, handle_branch_picker_key, open_branch_picker,
 )
+from .remote_branch_picker import (
+    draw_remote_branch_picker, handle_remote_branch_picker_key,
+    open_remote_branch_picker,
+)
 from .clone import (
     draw_clone_modal, handle_clone_modal_key, open_clone_modal,
 )
@@ -32,6 +36,10 @@ from .commit_view import (
 )
 from .help import (
     draw_help_screen, handle_help_screen_key, open_help_screen,
+)
+from .ssh_keygen import (
+    draw_ssh_keygen_modal, handle_ssh_keygen_modal_key,
+    open_ssh_keygen_modal,
 )
 from .remotes import (
     draw_remotes_modal, handle_remotes_modal_key, open_remotes_modal,
@@ -62,6 +70,10 @@ from .workspace_menu import (
     draw_workspace_menu, handle_workspace_menu_key, open_workspace_menu,
     tick_menu_path_checks,
 )
+from .workspace_switcher import (
+    draw_workspace_switcher, handle_workspace_switcher_key,
+    open_workspace_switcher,
+)
 from .app_menu import (
     draw_app_menu, handle_app_menu_key, open_app_menu,
     tick_app_menu_update_check,
@@ -74,12 +86,16 @@ __all__ = [
     "draw_branch_name_prompt", "handle_branch_name_prompt_key",
     "open_branch_name_prompt",
     "draw_branch_picker", "handle_branch_picker_key", "open_branch_picker",
+    "draw_remote_branch_picker", "handle_remote_branch_picker_key",
+    "open_remote_branch_picker",
     "draw_clone_modal", "handle_clone_modal_key", "open_clone_modal",
     "draw_commit_msg_editor", "handle_commit_msg_editor_key",
     "open_commit_msg_editor",
     "draw_commit_view_modal", "handle_commit_view_modal_key",
     "open_commit_view_modal",
     "draw_help_screen", "handle_help_screen_key", "open_help_screen",
+    "draw_ssh_keygen_modal", "handle_ssh_keygen_modal_key",
+    "open_ssh_keygen_modal",
     "draw_remotes_modal", "handle_remotes_modal_key", "open_remotes_modal",
     "draw_detached_recovery_prompt", "handle_detached_recovery_prompt_key",
     "open_detached_recovery_prompt",
@@ -96,4 +112,6 @@ __all__ = [
     "open_workspace_menu", "tick_menu_path_checks",
     "draw_app_menu", "handle_app_menu_key",
     "open_app_menu", "tick_app_menu_update_check",
+    "draw_workspace_switcher", "handle_workspace_switcher_key",
+    "open_workspace_switcher",
 ]

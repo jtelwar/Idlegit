@@ -83,6 +83,30 @@ class TestStateSelectableRows(unittest.TestCase):
                          ["repo", "child", "repo", "child", "child"])
         self.assertEqual(s.total_rows, 5)
 
+    def test_restore_body_focus_by_path_not_index(self) -> None:
+        """After refresh the list can gain submodule rows; index-only
+        clamping used to leave the cursor on the wrong row or snap to 0."""
+        a = _make_repo("a")
+        b = _make_repo("b")
+        s = State(repos=[a, b], workspace_name="ws", selected=1)
+        key = s.body_focus_key()
+        self.assertEqual(key, ("repo", b.path))
+        # Simulate refresh: same repos but `a` gained a child row above `b`.
+        c = _make_repo("c")
+        a.children = [
+            ChildRef(repo=c, nested_path=Path("/tmp/a/c"), kind="submodule"),
+        ]
+        s.repos = [a, b]
+        s.restore_body_focus(key)
+        self.assertIs(s.current_repo, b)
+        self.assertEqual(s.selected, 2)
+
+    def test_restore_body_focus_keeps_pseudo_rows(self) -> None:
+        s = State(repos=[_make_repo("a")], workspace_name="ws", selected=-1)
+        self.assertIsNone(s.body_focus_key())
+        s.restore_body_focus(None)
+        self.assertEqual(s.selected, -1)
+
     def test_current_repo_returns_focused(self) -> None:
         a = _make_repo("a")
         b = _make_repo("b")

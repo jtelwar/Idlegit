@@ -607,6 +607,7 @@ def kick_off_action(state: State, action_id: str, *,
     than the user wondering whether their keystroke registered."""
     known_actions = {
         "fetch", "pull", "push", "soft_reset", "switch_branch",
+        "checkout_remote_branch",
         "branch_from_head", "create_branch", "ff_merge",
         "rename_branch", "set_upstream",
         "stash_create", "stash_apply",
@@ -716,6 +717,35 @@ def kick_off_action(state: State, action_id: str, *,
                     "them; manual: `git checkout -b <name>` to keep them")
             else:
                 rc, _, err = git(target_path, ["checkout", branch_arg])
+                state.tasks.update(
+                    t, "ok" if rc == 0 else "fail",
+                    "" if rc == 0 else first_line(err))
+        elif action_id == "checkout_remote_branch":
+            t = state.tasks.add(
+                f"{target_label}: checkout remote {branch_arg}")
+            if not is_safe_ref_arg(branch_arg) or "/" not in branch_arg:
+                state.tasks.update(t, "fail", "unsafe remote ref")
+                return
+            short = branch_arg.split("/", 1)[1]
+            if not short or not is_safe_ref_arg(short):
+                state.tasks.update(t, "fail", "unsafe branch name")
+                return
+            rc, out, _ = git(target_path, ["branch", "--list", short])
+            local_exists = rc == 0 and bool(out.strip())
+            checkout_ref = short if local_exists else branch_arg
+            if not _head_is_ancestor_of(target_path, checkout_ref):
+                state.tasks.update(
+                    t, "warn",
+                    f"HEAD has commits not on {checkout_ref} — would orphan "
+                    "them; manual: `git checkout -b <name>` to keep them")
+            elif local_exists:
+                rc, _, err = git(target_path, ["checkout", short])
+                state.tasks.update(
+                    t, "ok" if rc == 0 else "fail",
+                    "" if rc == 0 else first_line(err))
+            else:
+                rc, _, err = git(target_path, [
+                    "checkout", "-b", short, branch_arg])
                 state.tasks.update(
                     t, "ok" if rc == 0 else "fail",
                     "" if rc == 0 else first_line(err))
@@ -3402,6 +3432,14 @@ def kick_off_inline_refresh(state: State) -> None:
     # supports multi-folder workspaces (which the legacy
     # `state.repos[0].path.parent` anchor couldn't, silently dropping
     # repos discovered from any folder other than the first one).
+    # Pin the workspace this refresh belongs to. The worker runs async;
+    # if the user switches workspaces before it finishes, we must not
+    # assign the discovered list to whichever workspace is *currently*
+    # active — that was the "always one workspace to the left" bug.
+    target_idx = state.active_workspace_index
+    target_ws = state.active_workspace
+    subtrees = (list(target_ws.subtrees) if target_ws is not None
+                else list(state.subtrees))
     folders = list(state.active_folders)
     if not folders:
         if state.repos:
@@ -3424,8 +3462,9 @@ def kick_off_inline_refresh(state: State) -> None:
     # Ctrl+R during an in-flight auto-refresh would race the auto-
     # refresh on the same Repo's `staged`/`unstaged`/etc. lists and
     # leave the row briefly flickering between half-populated states.
+    repos_snapshot = list(state.repos)
     acquired: List[Repo] = []
-    for r in state.repos:
+    for r in repos_snapshot:
         if r.try_acquire_refresh():
             acquired.append(r)
 
@@ -3447,7 +3486,7 @@ def kick_off_inline_refresh(state: State) -> None:
                     seen_paths.add(r.path)
                     fresh.append(r)
             fresh_by_path = {r.path: r for r in fresh}
-            kept_by_path = {r.path: r for r in state.repos
+            kept_by_path = {r.path: r for r in repos_snapshot
                             if r.path in fresh_by_path}
             next_repos: List[Repo] = []
             for r in fresh:
@@ -3516,31 +3555,37 @@ def kick_off_inline_refresh(state: State) -> None:
                     len(repos_to_refresh), MAX_PARALLEL_GIT_JOBS)
                 with ThreadPoolExecutor(max_workers=max_workers) as ex:
                     list(ex.map(refresh_one, repos_to_refresh))
-            link_siblings(next_repos, state.subtrees)
+            link_siblings(next_repos, subtrees)
 
-            state.repos = next_repos
-            ws = state.active_workspace
-            if ws is not None:
-                ws.cached_repos = next_repos
+            if 0 <= target_idx < len(state.workspaces):
+                state.workspaces[target_idx].cached_repos = next_repos
 
-            # `selected = -1` is the title-row workspace selector — keep
-            # it as-is rather than clamping back into the body. Other
-            # values clamp into [0, total_rows-1] so a removed repo
-            # doesn't leave the cursor pointing past the new end.
-            if state.selected != -1:
-                state.selected = max(
-                    0, min(state.selected, max(0, state.total_rows - 1)))
-            state.body_scroll = max(
-                0, min(state.body_scroll, max(0, state.total_rows - 1)))
+            # Only repaint the live UI when the user is still on the
+            # workspace we refreshed — otherwise we'd flash the wrong
+            # repo list (and poison the new workspace's cache).
+            if state.active_workspace_index == target_idx:
+                # Capture focus before swapping the list so navigation
+                # the user made while refresh was in flight is preserved.
+                # Index-only clamping used to snap to row 0 whenever the
+                # body shrank (e.g. submodule rows missing mid-refresh).
+                focus_key = state.body_focus_key()
+                state.repos = next_repos
+                if focus_key is not None:
+                    state.restore_body_focus(focus_key)
+                elif state.selected >= 0:
+                    rows = state.selectable_rows()
+                    if rows:
+                        state.selected = max(
+                            0, min(state.selected, len(rows) - 1))
 
-            # Reconcile fs-watchers against the new repo set: attach for
-            # newly-appeared repos, drop watchers for repos that vanished.
-            # Idempotent + safe to call even when the feature flag is off
-            # (it stops any existing watchers). Lazy import keeps watchdog
-            # off the workers module's import path for tests that stub
-            # workers without touching the watcher manager.
-            from .fs_watcher import reconcile_repo_watchers
-            reconcile_repo_watchers(state)
+                # Reconcile fs-watchers against the new repo set: attach for
+                # newly-appeared repos, drop watchers for repos that vanished.
+                # Idempotent + safe to call even when the feature flag is off
+                # (it stops any existing watchers). Lazy import keeps watchdog
+                # off the workers module's import path for tests that stub
+                # workers without touching the watcher manager.
+                from .fs_watcher import reconcile_repo_watchers
+                reconcile_repo_watchers(state)
         finally:
             # Always release every claim, including for repos that
             # vanished (not in next_repos) or that we skipped because

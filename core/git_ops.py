@@ -279,8 +279,11 @@ def refresh_repo(repo: Repo) -> None:
     repo.staged = []
     repo.unstaged = []
     repo.untracked = []
-    repo.nested_subs = []
-    # siblings + children are filled by link_siblings() after every repo refreshes
+    # Do NOT clear nested_subs here — link_siblings reads it to build
+    # children rows. A concurrent refresh (fs_watcher while Ctrl+R skips
+    # a locked repo) used to leave nested_subs empty mid-flight and
+    # link_siblings would drop every submodule under that parent.
+    # siblings + children are filled by link_siblings() after refresh.
     repo.error = ""
     repo.merging = False
     repo.conflict_paths = []
@@ -357,6 +360,7 @@ def refresh_repo(repo: Repo) -> None:
                     repo.merging = True
                     break
 
+    new_nested_subs: List[Tuple[str, Path]] = []
     if (repo.path / ".gitmodules").exists():
         rc, out, _ = git(repo.path, [
             "config", "-f", ".gitmodules",
@@ -378,7 +382,9 @@ def refresh_repo(repo: Repo) -> None:
                 if rc2 != 0 or not url_out.strip():
                     continue
                 sub_path = (repo.path / path_str.strip()).resolve()
-                repo.nested_subs.append((canonicalize_url(url_out.strip()), sub_path))
+                new_nested_subs.append(
+                    (canonicalize_url(url_out.strip()), sub_path))
+    repo.nested_subs = new_nested_subs
 
     # Nothing staged/untracked to commit — drop any queued message so the
     # UI doesn't keep showing an orphaned draft after refresh (Ctrl+R,

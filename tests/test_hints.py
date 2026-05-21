@@ -145,6 +145,11 @@ class TestWorkspaceRowHints(unittest.TestCase):
         self.assertIn("Tab", keys)
         self.assertTrue(any("Space" in k for k in keys))
 
+    def test_enter_opens_workspace_switcher_hint(self) -> None:
+        hints = _workspace_row_hints(self._state_with(2))
+        actions = [h.action for h in hints]
+        self.assertTrue(any("switch workspace" in a for a in actions))
+
 
 @unittest.skipUnless(UI_AVAILABLE, "ui module unavailable")
 class TestToggleRowHints(unittest.TestCase):
@@ -300,6 +305,31 @@ class TestBranchPickerHints(unittest.TestCase):
         p = self._picker(branches=("main", "dev"), current="main", selected=1)
         actions = [h.action for h in branch_picker_hints(p)]
         self.assertIn("checkout dev", actions)
+
+
+@unittest.skipUnless(UI_AVAILABLE, "ui module unavailable")
+class TestRemoteBranchPickerHints(unittest.TestCase):
+    def _picker(self, refs=("origin/main",), loading=False, selected=0):
+        from core.models import RemoteBranchPicker
+        return RemoteBranchPicker(
+            target_label="x", target_path=Path("/tmp"),
+            refs=list(refs), loading=loading, selected=selected)
+
+    def test_loading_only_back(self) -> None:
+        from ui.modals.remote_branch_picker import _hints as hints_fn
+        self.assertEqual(_pairs(hints_fn(self._picker(loading=True))),
+                         [("Esc", "back")])
+
+    def test_empty_refs_suggests_fetch(self) -> None:
+        from ui.modals.remote_branch_picker import _hints as hints_fn
+        actions = [h.action for h in hints_fn(self._picker(refs=()))]
+        self.assertIn("(no remote branches — fetch first)", actions)
+
+    def test_enter_names_track_checkout(self) -> None:
+        from ui.modals.remote_branch_picker import _hints as hints_fn
+        actions = [h.action for h in hints_fn(
+            self._picker(refs=("origin/dev",)))]
+        self.assertIn("checkout dev (track origin/dev)", actions)
 
 
 @unittest.skipUnless(UI_AVAILABLE, "ui module unavailable")

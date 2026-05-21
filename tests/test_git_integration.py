@@ -234,6 +234,50 @@ class TestLinkSiblings(_TempWorkspace):
         # subtree drift not measured → in_sync stays True.
         self.assertTrue(ref.in_sync)
 
+    def test_link_siblings_during_refresh_keeps_submodule_rows(self) -> None:
+        """Regression: refresh_repo used to clear nested_subs at the start.
+        Ctrl+R's link_siblings could run while fs_watcher held the same
+        repo mid-refresh, rebuilding children from an empty nested_subs."""
+        import threading
+        from unittest import mock
+
+        import core.git_ops as go
+
+        parent, target = self._setup_parent_with_submodule_of_target()
+        link_siblings([parent, target])
+        self.assertEqual(len(parent.children), 1)
+
+        gate = threading.Event()
+        child_counts: list = []
+        real_git = go.git
+
+        def git_wrapper(path, args, *a, **kw):
+            rc, out, err = real_git(path, args, *a, **kw)
+            if (path == parent.path
+                    and len(args) >= 2
+                    and args[0] == "status"
+                    and args[1] == "--porcelain=v1"):
+                gate.set()
+                time.sleep(0.15)
+            return rc, out, err
+
+        def refresh_worker() -> None:
+            with mock.patch.object(go, "git", side_effect=git_wrapper):
+                refresh_repo(parent)
+
+        def link_worker() -> None:
+            self.assertTrue(gate.wait(timeout=2.0))
+            link_siblings([parent, target])
+            child_counts.append(len(parent.children))
+
+        t_refresh = threading.Thread(target=refresh_worker)
+        t_link = threading.Thread(target=link_worker)
+        t_refresh.start()
+        t_link.start()
+        t_refresh.join(timeout=5.0)
+        t_link.join(timeout=5.0)
+        self.assertEqual(child_counts, [1])
+
 
 class TestFindLfsWarnings(_TempWorkspace):
     def test_threshold_zero_disables(self) -> None:
@@ -1566,6 +1610,78 @@ class TestBranchFromHeadAction(_TempWorkspace):
         # The unique file is still there.
         self.assertTrue(
             (repo_path / "Upskill_Lightmap_Prefab_Baker.cs").exists())
+
+
+class TestCheckoutRemoteBranch(_TempWorkspace):
+    """`checkout_remote_branch` creates a local tracking branch from a
+    remote-tracking ref, or checks out an existing local branch with
+    the same short name. Refuses when HEAD has unique commits."""
+
+    def _repo_with_remote_feature(self) -> Path:
+        bare = self.tmp / "u.git"
+        bare.mkdir()
+        _run(bare, "git", "init", "--bare", "-q", "-b", "master")
+        repo = self.tmp / "repo"
+        _run(self.tmp, "git", "clone", "-q", str(bare), "repo")
+        write_file(repo, "README.md", "# r\n")
+        stage_and_commit(repo, "init")
+        _run(repo, "git", "push", "-q", "-u", "origin", "master")
+        _run(repo, "git", "checkout", "-q", "-b", "feature")
+        write_file(repo, "feature.txt", "f\n")
+        stage_and_commit(repo, "add feature")
+        _run(repo, "git", "push", "-q", "origin", "feature")
+        _run(repo, "git", "checkout", "-q", "master")
+        # Drop the local branch so only origin/feature remains.
+        _run(repo, "git", "branch", "-D", "feature")
+        return repo
+
+    def _join_workers(self) -> None:
+        import threading
+        for t in threading.enumerate():
+            if t.daemon and t is not threading.current_thread():
+                t.join(timeout=5.0)
+
+    def test_creates_local_tracking_branch(self) -> None:
+        from core.workers import kick_off_action
+        from core.models import Repo, State
+
+        repo_path = self._repo_with_remote_feature()
+        repo = Repo(rel="r", path=repo_path)
+        state = State(repos=[repo], workspace_name="test")
+        kick_off_action(
+            state, "checkout_remote_branch",
+            target_label="r", target_path=repo_path,
+            target_repo=repo, target_parent=None,
+            branch_arg="origin/feature")
+        self._join_workers()
+        cur = _run(repo_path, "git", "branch",
+                   "--show-current").stdout.strip()
+        self.assertEqual(cur, "feature")
+        self.assertTrue((repo_path / "feature.txt").exists())
+
+    def test_refuses_when_head_has_unique_commits(self) -> None:
+        from core.workers import kick_off_action
+        from core.models import Repo, State
+
+        repo_path = self._repo_with_remote_feature()
+        head = _run(repo_path, "git", "rev-parse", "HEAD").stdout.strip()
+        _run(repo_path, "git", "checkout", "-q", head)
+        write_file(repo_path, "orphan.txt", "x\n")
+        _run(repo_path, "git", "add", "orphan.txt")
+        _run(repo_path, "git", "-c", "user.email=t@x", "-c", "user.name=t",
+             "commit", "-q", "-m", "orphan")
+        repo = Repo(rel="r", path=repo_path)
+        state = State(repos=[repo], workspace_name="test")
+        kick_off_action(
+            state, "checkout_remote_branch",
+            target_label="r", target_path=repo_path,
+            target_repo=repo, target_parent=None,
+            branch_arg="origin/feature")
+        self._join_workers()
+        labels = " ".join(t.label + " " + t.message
+                          for t in state.tasks.snapshot())
+        self.assertIn("orphan", labels)
+        self.assertTrue((repo_path / "orphan.txt").exists())
 
 
 class TestFFMergeAction(_TempWorkspace):

@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -560,6 +562,52 @@ class TestSwitchWorkspaceCache(unittest.TestCase):
         self.assertFalse(s.on_workspace_row)
 
 
+class TestInlineRefreshWorkspacePin(unittest.TestCase):
+    """Inline refresh must update the workspace it started on, not whichever
+    workspace is active when the worker finishes."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self._save_patch = mock.patch("core.config.save_workspaces")
+        self._save_patch.start()
+        self.addCleanup(self._save_patch.stop)
+
+    def test_stale_refresh_does_not_repaint_after_switch(self) -> None:
+        import core.workers as workers_mod
+        from core.workers import kick_off_inline_refresh, switch_workspace
+
+        a_repos = [_make_repo("a1")]
+        b_repos = [_make_repo("b1")]
+        a = Workspace(name="A", folders=[Path("/a")], cached_repos=a_repos)
+        b = Workspace(name="B", folders=[Path("/b")], cached_repos=b_repos)
+        s = State(repos=list(a_repos), workspace_name="A",
+                  workspaces=[a, b], active_workspace_index=0)
+        resume_refresh = threading.Event()
+
+        def discover_side_effect(folder: Path):
+            resume_refresh.wait(timeout=2)
+            return [_make_repo("a-stale")]
+
+        with mock.patch.object(workers_mod, "discover_repos",
+                               side_effect=discover_side_effect), \
+             mock.patch.object(workers_mod, "refresh_repo_with_remote_state"), \
+             mock.patch.object(workers_mod, "kick_off_inline_refresh"), \
+             mock.patch("core.fs_watcher.reconcile_repo_watchers"):
+            kick_off_inline_refresh(s)
+            switch_workspace(s, 1)
+            resume_refresh.set()
+            deadline = time.monotonic() + 2.0
+            while (workers_mod._inline_refresh_in_flight
+                   and time.monotonic() < deadline):
+                time.sleep(0.01)
+
+        self.assertEqual(s.active_workspace_index, 1)
+        self.assertIs(s.repos, b_repos)
+        self.assertEqual(s.repos[0].rel, "b1")
+        self.assertEqual([r.rel for r in a.cached_repos], ["a-stale"])
+
+
 # ---------- Key handler — workspace row + cycling -------------------------
 
 
@@ -610,11 +658,10 @@ class TestWorkspaceRowKeys(unittest.TestCase):
         handle_main_key(s, 9)  # Tab
         self.assertIsNotNone(s.workspace_menu)
 
-    def test_enter_no_op_on_workspace_row(self) -> None:
-        # Tab now opens settings; Enter on the workspace row does
-        # nothing (no per-row commit-pipeline target here).
+    def test_enter_opens_workspace_switcher(self) -> None:
         s = self._state_two_ws()
         handle_main_key(s, 10)
+        self.assertIsNotNone(s.workspace_switcher)
         self.assertIsNone(s.workspace_menu)
 
 

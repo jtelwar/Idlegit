@@ -54,6 +54,13 @@ needed.
 `git clone` started from the **Clone** modal still recurses (initial
 clone — no HEAD to rewind).
 
+## SSH agent
+
+`auto_start_ssh_agent` (default `true`) starts `ssh-agent` at launch when
+no usable `SSH_AUTH_SOCK` is set. The app menu **SSH** section shows agent
+status, toggles autostart, can generate an ed25519 keypair for GitHub, and
+can run `ssh-add` on the usual `~/.ssh/id_ed25519` / `id_rsa` paths.
+
 ## Task logging
 
 When `task_log_enabled` is on, every task that lands in a terminal

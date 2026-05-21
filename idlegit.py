@@ -41,12 +41,14 @@ from ui import (
     handle_align_heads_prompt_key,
     handle_branch_name_prompt_key,
     handle_branch_picker_key,
+    handle_remote_branch_picker_key,
     handle_clone_modal_key,
     handle_commit_msg_editor_key,
     handle_commit_view_modal_key,
     handle_confirm,
     handle_detached_recovery_prompt_key,
     handle_help_screen_key,
+    handle_ssh_keygen_modal_key,
     handle_remotes_modal_key,
     handle_main_key,
     handle_reset_prompt_key,
@@ -55,6 +57,7 @@ from ui import (
     handle_workspace_creator_key,
     handle_workspace_menu_key,
     handle_app_menu_key,
+    handle_workspace_switcher_key,
     init_colors,
     refresh_all_workspaces,
     safe_addstr,
@@ -174,6 +177,8 @@ def _run_workspace_creator_subloop(stdscr, cfg, startup_warnings=None):
         state,
         title="Welcome to Idlegit",
         intro=intro)
+    from ui.mouse import enable_mouse, normalize_input
+    enable_mouse()
     stdscr.timeout(100)
     while state.workspace_creator is not None:
         if state.workspace_creator.result is not None:
@@ -190,7 +195,7 @@ def _run_workspace_creator_subloop(stdscr, cfg, startup_warnings=None):
         draw_workspace_creator(stdscr, state, sidebar_x)
         stdscr.refresh()
         try:
-            key = stdscr.getch()
+            key = normalize_input(stdscr.getch())
         except KeyboardInterrupt:
             return []
         if key == -1:
@@ -222,6 +227,8 @@ def run(stdscr, cfg, workspaces, initial_active_idx: int = 0,
     init_colors()
     _disable_flow_control()
     stdscr.keypad(True)
+    from ui.mouse import enable_mouse
+    enable_mouse()
     stdscr.timeout(100)  # non-blocking getch — drives sidebar animation.
 
     # First-run path: idlegit.workspaces missing or empty drops us into
@@ -322,6 +329,7 @@ def run(stdscr, cfg, workspaces, initial_active_idx: int = 0,
 
 def _run_main_loop(stdscr, state, title):
     from core.fs_watcher import drain_pending_refreshes
+    from ui.mouse import normalize_input
     last_title_emitted = title
     last_title_at = time.monotonic()
     # Track tasks.has_running() across iterations so we can detect the
@@ -424,7 +432,9 @@ def _run_main_loop(stdscr, state, title):
                         or (state.diff_viewer is not None
                             and (state.diff_viewer.loading
                                  or state.diff_viewer.log_loading
-                                 or state.diff_viewer.blame_loading)))
+                                 or state.diff_viewer.blame_loading))
+                        or (state.remote_branch_picker is not None
+                            and state.remote_branch_picker.loading))
         if anim_running:
             state.spinner_frame = (state.spinner_frame + 1) % len(SPINNER_FRAMES)
 
@@ -449,7 +459,7 @@ def _run_main_loop(stdscr, state, title):
         stdscr.timeout(100 if anim_running else 1000)
 
         try:
-            key = stdscr.getch()
+            key = normalize_input(stdscr.getch())
         except KeyboardInterrupt:
             return
         if key == -1:
@@ -489,6 +499,9 @@ def _run_main_loop(stdscr, state, title):
         if state.help_screen is not None:
             handle_help_screen_key(state, key)
             continue
+        if state.ssh_keygen_modal is not None:
+            handle_ssh_keygen_modal_key(state, key)
+            continue
         if state.reset_prompt is not None:
             handle_reset_prompt_key(state, key)
             continue
@@ -500,6 +513,9 @@ def _run_main_loop(stdscr, state, title):
             continue
         if state.task_action_menu is not None:
             handle_task_action_menu_key(state, key)
+            continue
+        if state.remote_branch_picker is not None:
+            handle_remote_branch_picker_key(state, key)
             continue
         if state.branch_picker is not None:
             handle_branch_picker_key(state, key)
@@ -539,6 +555,14 @@ def _run_main_loop(stdscr, state, title):
             continue
         if state.app_menu is not None:
             handle_app_menu_key(state, key)
+            continue
+        if state.workspace_switcher is not None:
+            ws_action = handle_workspace_switcher_key(state, key)
+            if ws_action == "switch-workspace":
+                ws = state.active_workspace
+                if ws is not None:
+                    title = (f"Idlegit · {ws.name}"
+                             if ws.name else "Idlegit")
             continue
 
         action = handle_main_key(state, key)
@@ -598,6 +622,17 @@ def main() -> int:
     cfg = load_config()
     workspaces, persisted_active_idx = load_workspaces()
     startup_warnings = get_load_warnings()
+    from core.ssh import ensure_ssh_agent, ssh_tools_status
+    tools = ssh_tools_status()
+    if cfg.auto_start_ssh_agent and not tools.has_ssh_agent:
+        startup_warnings.append(
+            "SSH: ssh-agent not on PATH — auto-start skipped (install OpenSSH)")
+    else:
+        ssh_status, ssh_warn = ensure_ssh_agent(cfg.auto_start_ssh_agent)
+        if ssh_status == "started":
+            startup_warnings.append("Started ssh-agent for this session")
+        elif ssh_status == "failed" and ssh_warn:
+            startup_warnings.append(f"ssh-agent: {ssh_warn}")
     # Remember the last-active workspace name BEFORE filtering — so if
     # we drop the entry whose folders no longer exist, we can still try
     # to honour the user's previous choice in the resulting list (or

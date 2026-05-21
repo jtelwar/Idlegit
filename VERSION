@@ -1,4 +1,49 @@
-0.24.8
+0.25.14
+
+### 0.25.14
+- 2026-05-21: SSH key wizard greys out Generate and shows orange “(path not empty)” when the path exists.
+
+### 0.25.13
+- 2026-05-21: SSH key wizard blocks Generate when the key path already exists (no overwrite).
+
+### 0.25.12
+- 2026-05-21: inline refresh keeps cursor on the same repo/child row if you navigated during refresh.
+
+### 0.25.11
+- 2026-05-21: fix NameError for mouse wheel helper in main loop.
+
+### 0.25.10
+- 2026-05-21: fix submodules vanishing on Ctrl+R when another refresh held the parent repo lock.
+
+### 0.25.9
+- 2026-05-21: mouse wheel scrolls lists in-app (iTerm and other terminals) instead of terminal backlog.
+
+### 0.25.8
+- 2026-05-21: branch menu adds checkout remote branch picker (lazy-loaded remote-tracking list).
+
+### 0.25.7
+- 2026-05-21: SSH keypair wizard: optional passkey field with y/N confirm before generating without one.
+
+### 0.25.6
+- 2026-05-21: SSH menu checks OpenSSH tools on PATH; agent status probes ssh-add; startup skips autostart without ssh-agent.
+
+### 0.25.5
+- 2026-05-21: app menu shrinks to fit small terminals (scrollable body, spacer above hints).
+
+### 0.25.4
+- 2026-05-21: workspace picker rows show path only (no folder count).
+
+### 0.25.3
+- 2026-05-21: workspace switcher shrinks to fit small terminals — scrollable body with spacer row above hints.
+
+### 0.25.2
+- 2026-05-21: workspace switcher dialog — Enter on the workspace row opens a scrollable picker; Enter on a row switches workspace.
+
+### 0.25.1
+- 2026-05-21: fix workspace switch showing the previous workspace's repos when an inline refresh finished after ←/→.
+
+### 0.25.0
+- 2026-05-21: ssh-agent autostart on launch (`auto_start_ssh_agent`, default on); app menu SSH section with keypair wizard and load-default-keys action.
 
 ### 0.24.8
 - 2026-05-20: commit-pipeline supervisor now refreshes + re-links the workspace snapshot captured at queue time instead of the live `state.repos` — fixes pre-commit state reappearing (and the same work being re-committable) when the user switched workspaces mid-pipeline and navigated back.

@@ -49,6 +49,9 @@ _ACTION_TOGGLE_TASK_LOG = "toggle_task_log"
 _ACTION_TOGGLE_AUTO_REFRESH = "toggle_auto_refresh"
 _ACTION_CYCLE_DEBOUNCE = "cycle_auto_refresh_debounce"
 _ACTION_OPEN_HELP = "open_help"
+_ACTION_TOGGLE_SSH_AGENT = "toggle_ssh_agent"
+_ACTION_CREATE_SSH_KEY = "create_ssh_key"
+_ACTION_SSH_ADD_KEYS = "ssh_add_keys"
 
 # Preset debounce values the menu cycles through. The default config
 # value (400 ms) sits in the middle; jumping to a longer setting helps
@@ -60,6 +63,9 @@ _DEBOUNCE_PRESETS_MS = (200, 400, 800, 1500)
 # Modal sizing.
 MODAL_W = 70
 BODY_TARGET_ROWS = 14  # max rows shown before scroll arrows kick in
+_PAD_TOP = 1
+_PAD_BOTTOM = 1
+_PAD_X = 2
 
 
 # ---------- Version comparison + helpers --------------------------------
@@ -186,6 +192,40 @@ def _auto_refresh_section_rows(state: State) -> "list[AppMenuRow]":
     return rows
 
 
+def _ssh_section_rows(state: State) -> "list[AppMenuRow]":
+    from core.ssh import agent_status_label, keys_loaded_label, ssh_tools_status
+
+    tools = ssh_tools_status()
+    on = state.auto_start_ssh_agent
+    toggle_label = (
+        "Disable auto-start ssh-agent" if on
+        else "Enable auto-start ssh-agent")
+    rows: "list[AppMenuRow]" = [
+        AppMenuRow(label="SSH", attr_name="", kind="header"),
+    ]
+    if tools.missing_tools:
+        rows.append(AppMenuRow(
+            label=f"Missing on PATH: {', '.join(tools.missing_tools)}",
+            attr_name="", kind="app_info"))
+    rows.extend([
+        AppMenuRow(
+            label=f"Agent: {agent_status_label()}",
+            attr_name="", kind="app_info"),
+        AppMenuRow(
+            label=f"Keys: {keys_loaded_label()}",
+            attr_name="", kind="app_info"),
+        AppMenuRow(label=toggle_label,
+                   attr_name=_ACTION_TOGGLE_SSH_AGENT, kind="app_action"),
+        AppMenuRow(
+            label="Create GitHub SSH keypair…",
+            attr_name=_ACTION_CREATE_SSH_KEY, kind="app_action"),
+        AppMenuRow(
+            label="Load default keys into agent",
+            attr_name=_ACTION_SSH_ADD_KEYS, kind="app_action"),
+    ])
+    return rows
+
+
 def _task_logging_section_rows(state: State) -> "list[AppMenuRow]":
     """TASK LOGGING section: read-only status / path / size rows plus
     Open + Clear actions. Path editing is intentionally not surfaced
@@ -261,6 +301,8 @@ def _build_rows(state: State, menu: AppMenu) -> "list[AppMenuRow]":
     rows.extend(_workspaces_section_rows(state))
     rows.append(AppMenuRow(label="", attr_name="", kind="spacer"))
     rows.extend(_auto_refresh_section_rows(state))
+    rows.append(AppMenuRow(label="", attr_name="", kind="spacer"))
+    rows.extend(_ssh_section_rows(state))
     rows.append(AppMenuRow(label="", attr_name="", kind="spacer"))
     rows.extend(_task_logging_section_rows(state))
     return rows
@@ -368,6 +410,15 @@ def _hints(state) -> list:
                     else "enable + save"))
             elif row.attr_name == _ACTION_CYCLE_DEBOUNCE:
                 hints.append(Hint(KEY_ENTER, "cycle preset + save"))
+            elif row.attr_name == _ACTION_TOGGLE_SSH_AGENT:
+                hints.append(Hint(
+                    KEY_ENTER,
+                    "disable + save" if state.auto_start_ssh_agent
+                    else "enable + save"))
+            elif row.attr_name == _ACTION_CREATE_SSH_KEY:
+                hints.append(Hint(KEY_ENTER, "create keypair"))
+            elif row.attr_name == _ACTION_SSH_ADD_KEYS:
+                hints.append(Hint(KEY_ENTER, "ssh-add default keys"))
             else:
                 hints.append(Hint(KEY_ENTER, "check for updates"))
         elif row.kind == "workspace":
@@ -436,6 +487,15 @@ def _fire_app_action(state: State, action_id: str) -> None:
     if action_id == _ACTION_CYCLE_DEBOUNCE:
         _fire_cycle_debounce(state)
         return
+    if action_id == _ACTION_TOGGLE_SSH_AGENT:
+        _fire_toggle_ssh_agent(state)
+        return
+    if action_id == _ACTION_CREATE_SSH_KEY:
+        _fire_create_ssh_key(state)
+        return
+    if action_id == _ACTION_SSH_ADD_KEYS:
+        _fire_ssh_add_keys(state)
+        return
     if action_id == _ACTION_OPEN_HELP:
         # Close the app menu first so the help screen owns the modal
         # stack — opening it on top of the menu would leave the
@@ -476,6 +536,70 @@ def _fire_toggle_task_log(state: State) -> None:
             t, "warn",
             "applied but conf write failed — won't persist across restart")
     _rebuild_rows(state)
+
+
+def _fire_create_ssh_key(state: State) -> None:
+    from core.ssh import ssh_tools_status
+    from .ssh_keygen import open_ssh_keygen_modal
+
+    if not ssh_tools_status().has_ssh_keygen:
+        t = state.tasks.add("create SSH key")
+        state.tasks.update(t, "fail", "ssh-keygen not on PATH — install OpenSSH")
+        return
+    open_ssh_keygen_modal(state)
+
+
+def _fire_toggle_ssh_agent(state: State) -> None:
+    from core.config import set_conf_value
+
+    new_enabled = not state.auto_start_ssh_agent
+    state.auto_start_ssh_agent = new_enabled
+
+    t = state.tasks.add(
+        "enable ssh-agent autostart" if new_enabled
+        else "disable ssh-agent autostart")
+    if set_conf_value("auto_start_ssh_agent",
+                      "true" if new_enabled else "false"):
+        state.tasks.update(
+            t, "ok",
+            "will start agent on launch" if new_enabled
+            else "agent autostart off")
+    else:
+        state.tasks.update(
+            t, "warn",
+            "applied but conf write failed — won't persist across restart")
+    _rebuild_rows(state)
+
+
+def _fire_ssh_add_keys(state: State) -> None:
+    import threading
+    from core.ssh import add_default_keys_to_agent, ensure_ssh_agent, ssh_tools_status
+
+    tools = ssh_tools_status()
+    if not tools.has_ssh_add:
+        t = state.tasks.add("ssh-add default keys")
+        state.tasks.update(t, "fail", "ssh-add not on PATH — install OpenSSH")
+        return
+
+    def worker() -> None:
+        if state.auto_start_ssh_agent:
+            ensure_ssh_agent(True)
+        t = state.tasks.add("ssh-add default keys")
+        added, errors = add_default_keys_to_agent()
+        if added and not errors:
+            state.tasks.update(t, "ok", f"{added} key(s) loaded")
+        elif added:
+            state.tasks.update(
+                t, "warn",
+                f"{added} loaded; {'; '.join(errors)}")
+        elif errors:
+            state.tasks.update(t, "fail", "; ".join(errors))
+        else:
+            state.tasks.update(
+                t, "warn", "no default keys found in ~/.ssh")
+        _rebuild_rows(state)
+
+    threading.Thread(target=worker, daemon=True).start()
 
 
 def _fire_toggle_auto_refresh(state: State) -> None:
@@ -612,24 +736,23 @@ def _exec_idlegit_update() -> None:
 def _draw_workspace_row(stdscr, line_y: int, inner_x: int, inner_w: int,
                         state: State, ws_idx: int, focused: bool,
                         sb: int) -> None:
-    """One workspace row: name on the left, dim path summary in the
-    middle, "active · N folder(s)" tag on the right. Mirrors how the
-    old picker rendered each row so the visual layout the user is
-    used to is preserved inside the new global menu."""
+    """One workspace row: name on the left, first folder path on the
+    right (middle-truncated when tight). Active workspaces get a •
+    prefix and an ``active`` tag when there is room — no folder count."""
     ws = state.workspaces[ws_idx]
     is_active = (ws_idx == state.active_workspace_index)
     prefix = "→ " if focused else ("• " if is_active else "  ")
+    active_tag = "active" if is_active else ""
     name_w = max(12, inner_w // 3)
     name_text = truncate(ws.display_name, name_w, "end")
-    n_folders = len(ws.folders)
-    meta = (f"{n_folders} folder" if n_folders == 1
-            else f"{n_folders} folders")
-    if is_active:
-        meta = "active · " + meta
-    path_w = max(0, inner_w - len(prefix) - name_w - 2 - len(meta) - 1)
+    tag_w = len(active_tag) + (1 if active_tag else 0)
+    path_w = max(0, inner_w - len(prefix) - name_w - 2 - tag_w)
     first_path = (truncate(str(ws.folders[0]), path_w, "middle")
                   if ws.folders and path_w > 0 else "")
-    line = f"{prefix}{name_text.ljust(name_w)}  {first_path.ljust(path_w)} {meta}"
+    line = (f"{prefix}{name_text.ljust(name_w)}  "
+            f"{first_path.ljust(path_w)}")
+    if active_tag:
+        line = f"{line.rstrip()} {active_tag}"
     if focused:
         attr = sb | curses.A_REVERSE
     elif is_active:
@@ -638,12 +761,9 @@ def _draw_workspace_row(stdscr, line_y: int, inner_x: int, inner_w: int,
         attr = sb
     safe_addstr(stdscr, line_y, inner_x,
                 line.ljust(inner_w)[:inner_w], attr)
-    # Overlay the meta segment in PAIR_DLG_OK when the row is the active
-    # workspace and unfocused — the cyan-bold attr above colours the
-    # whole line, but the active marker reads more clearly in green.
-    if not focused and is_active:
+    if not focused and is_active and active_tag:
         meta_x = inner_x + len(prefix) + name_w + 2 + path_w + 1
-        safe_addstr(stdscr, line_y, meta_x, meta,
+        safe_addstr(stdscr, line_y, meta_x, active_tag,
                     curses.color_pair(PAIR_DLG_OK))
 
 
@@ -652,41 +772,61 @@ def draw_app_menu(stdscr, state: State, sidebar_x: int) -> None:
     if menu is None:
         return
     n_rows = len(menu.rows)
-    body_h = max(3, min(BODY_TARGET_ROWS, n_rows))
-    # blank-top (1) + title (1) + spacer/scroll-↑ (1)
-    # + body + spacer/scroll-↓ (1) + footer (1) + blank-bottom (1).
-    # The spacer-row directly under the title is also where the
-    # scroll-↑ indicator lands; one row is enough separation.
-    content_h = 1 + 1 + 1 + body_h + 1 + 1 + 1
-    x, y, w, h = modal_geometry(stdscr, sidebar_x, MODAL_W, content_h)
+    title_rows = 1
+    blank_after_title = 1
+    blank_before_hints = 1
+    hint_rows = 1
+    desired_body = min(BODY_TARGET_ROWS, max(1, n_rows))
+    desired_h = (
+        _PAD_TOP + title_rows + blank_after_title + desired_body
+        + blank_before_hints + hint_rows + _PAD_BOTTOM
+    )
+    x, y, w, h = modal_geometry(stdscr, sidebar_x, MODAL_W, desired_h)
     sb = curses.color_pair(PAIR_DLG_FG)
     draw_modal_fill(stdscr, x, y, w, h, sb)
 
-    inner_x = x + 2
-    inner_w = w - 4
+    inner_x = x + _PAD_X
+    inner_w = max(1, w - 2 * _PAD_X)
+
+    fixed_rows = (
+        _PAD_TOP + title_rows + blank_after_title
+        + blank_before_hints + hint_rows + _PAD_BOTTOM
+    )
+    visible_rows = max(1, h - fixed_rows)
+    if n_rows > 0:
+        visible_rows = min(visible_rows, n_rows)
+
+    list_y = y + _PAD_TOP + title_rows + blank_after_title
+    hint_y = y + h - _PAD_BOTTOM - hint_rows
+    spacer_down_y = list_y + visible_rows
+    scroll_up_y = y + _PAD_TOP + title_rows
 
     # Title row: app name in magenta, " · vX.Y.Z" in dim cyan —
     # mirrors the main-screen title row so the modal reads as
     # "the same Idlegit, in menu mode" rather than a separate
     # surface with its own branding.
-    safe_addstr(stdscr, y + 1, inner_x,
+    safe_addstr(stdscr, y + _PAD_TOP, inner_x,
                 APP_DISPLAY_NAME[:inner_w],
                 curses.A_BOLD | curses.color_pair(PAIR_DLG_MAGENTA))
     name_w = min(len(APP_DISPLAY_NAME), inner_w)
     if name_w < inner_w:
         suffix = f"  v{VERSION}"
-        safe_addstr(stdscr, y + 1, inner_x + name_w,
+        safe_addstr(stdscr, y + _PAD_TOP, inner_x + name_w,
                     suffix[:inner_w - name_w],
                     curses.color_pair(PAIR_DLG_CYAN) | curses.A_DIM)
 
-    menu.scroll = clamp_scroll(menu.selected, menu.scroll, n_rows, body_h)
+    menu.scroll = clamp_scroll(menu.selected, menu.scroll, n_rows, visible_rows)
 
-    for i in range(body_h):
+    if menu.scroll > 0:
+        draw_scroll_overflow(stdscr, scroll_up_y, inner_x, inner_w,
+                             menu.scroll, "up", sb | curses.A_DIM)
+
+    for i in range(visible_rows):
         idx = menu.scroll + i
         if idx >= n_rows:
             break
         row = menu.rows[idx]
-        line_y = y + 3 + i
+        line_y = list_y + i
         focused = (idx == menu.selected)
 
         if row.kind == "header":
@@ -744,15 +884,12 @@ def draw_app_menu(stdscr, state: State, sidebar_x: int) -> None:
                                     state, ws_idx, focused, sb)
             continue
 
-    if menu.scroll > 0:
-        draw_scroll_overflow(stdscr, y + 2, inner_x, inner_w,
-                             menu.scroll, "up", sb | curses.A_DIM)
-    if menu.scroll + body_h < n_rows:
-        below = n_rows - (menu.scroll + body_h)
-        draw_scroll_overflow(stdscr, y + 3 + body_h, inner_x, inner_w,
+    if menu.scroll + visible_rows < n_rows:
+        below = n_rows - (menu.scroll + visible_rows)
+        draw_scroll_overflow(stdscr, spacer_down_y, inner_x, inner_w,
                              below, "down", sb | curses.A_DIM)
 
-    render_hints(stdscr, y + h - 2, inner_x, w - 4, _hints(state),
+    render_hints(stdscr, hint_y, inner_x, inner_w, _hints(state),
                  attr=sb | curses.A_DIM)
 
 

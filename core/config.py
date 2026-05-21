@@ -239,6 +239,10 @@ DEFAULT_AUTO_REFRESH_DEBOUNCE_MS = 400
 # (just refs); use the action menu's Pull or auto-push-after-commit
 # to actually advance HEAD.
 DEFAULT_FETCH_ON_MANUAL_REFRESH = False
+# When true, idlegit starts ssh-agent at launch if SSH_AUTH_SOCK is unset
+# or stale. Keys loaded into the agent survive for the idlegit process
+# and any git/gh subprocesses it spawns.
+DEFAULT_AUTO_START_SSH_AGENT = True
 
 
 def _warn_config(message: str) -> None:
@@ -304,6 +308,7 @@ class Config:
     auto_refresh_on_fs_change: bool = DEFAULT_AUTO_REFRESH_ON_FS_CHANGE
     auto_refresh_debounce_ms: int = DEFAULT_AUTO_REFRESH_DEBOUNCE_MS
     fetch_on_manual_refresh: bool = DEFAULT_FETCH_ON_MANUAL_REFRESH
+    auto_start_ssh_agent: bool = DEFAULT_AUTO_START_SSH_AGENT
 
 
 def load_config() -> Config:
@@ -343,6 +348,7 @@ def load_config() -> Config:
     auto_refresh_on_fs_change = DEFAULT_AUTO_REFRESH_ON_FS_CHANGE
     auto_refresh_debounce_ms = DEFAULT_AUTO_REFRESH_DEBOUNCE_MS
     fetch_on_manual_refresh = DEFAULT_FETCH_ON_MANUAL_REFRESH
+    auto_start_ssh_agent = DEFAULT_AUTO_START_SSH_AGENT
 
     _CONFIG_WARNINGS.clear()
     _ensure_config_ready()
@@ -431,6 +437,9 @@ def load_config() -> Config:
             fetch_on_manual_refresh = cp.getboolean(
                 "idlegit", "fetch_on_manual_refresh",
                 fallback=DEFAULT_FETCH_ON_MANUAL_REFRESH)
+            auto_start_ssh_agent = cp.getboolean(
+                "idlegit", "auto_start_ssh_agent",
+                fallback=DEFAULT_AUTO_START_SSH_AGENT)
         except (configparser.Error, OSError, ValueError) as e:
             _warn_config(f"{CONFIG_FILE.name}: using defaults ({e})")
 
@@ -478,6 +487,7 @@ def load_config() -> Config:
         auto_refresh_on_fs_change=auto_refresh_on_fs_change,
         auto_refresh_debounce_ms=max(50, auto_refresh_debounce_ms),
         fetch_on_manual_refresh=fetch_on_manual_refresh,
+        auto_start_ssh_agent=auto_start_ssh_agent,
     )
 
 
@@ -975,6 +985,7 @@ def apply_workspace_overrides(state, cfg: Config, ws: Workspace) -> None:
     state.auto_refresh_on_fs_change = cfg.auto_refresh_on_fs_change
     state.auto_refresh_debounce_ms = cfg.auto_refresh_debounce_ms
     state.fetch_on_manual_refresh = cfg.fetch_on_manual_refresh
+    state.auto_start_ssh_agent = cfg.auto_start_ssh_agent
     # fs_watch_ignore is workspace-scoped only — no idlegit.conf-level
     # default to fall back to. A workspace switch always replaces the
     # State copy, so the previous workspace's patterns don't bleed in.

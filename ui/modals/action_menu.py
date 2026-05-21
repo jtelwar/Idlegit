@@ -271,6 +271,11 @@ def _build_branch_items(branch_meta) -> List[ActionMenuItem]:
             id="switch_branch", label="switch branch…",
             enabled=not merging,
             reason="" if not merging else "merging"),
+        ActionMenuItem(
+            id="checkout_remote_branch",
+            label="checkout remote branch…",
+            enabled=not merging,
+            reason="" if not merging else "merging"),
         # Detached-HEAD recovery: park HEAD's commits on a fresh branch
         # so the user can push / merge them via the normal flows. Only
         # surfaced when actually detached — not useful otherwise.
@@ -1831,6 +1836,10 @@ def _dispatch_action(state: State, menu: ActionMenu,
     if item.id == "switch_branch":
         from .branch_picker import open_branch_picker
         open_branch_picker(state)
+        return
+    if item.id == "checkout_remote_branch":
+        from .remote_branch_picker import open_remote_branch_picker
+        open_remote_branch_picker(state)
         return
     if item.id == "merge_branch":
         from .branch_picker import open_branch_picker
