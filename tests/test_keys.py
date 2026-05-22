@@ -676,7 +676,7 @@ class TestTaskActionMenu(unittest.TestCase):
         s.tasks.set_meta(t, repo=repo, slug="o/a", run_id=42,
                          workflow_name="Build")
         open_task_action_menu(s, t)
-        self.assertEqual(self._ids(s), ["cancel_run", "close"])
+        self.assertEqual(self._ids(s), ["cancel_run", "view_log", "close"])
 
     def test_running_run_with_url_offers_open_in_browser(self) -> None:
         s = self._state()
@@ -687,7 +687,8 @@ class TestTaskActionMenu(unittest.TestCase):
                          run_url="https://example/runs/42")
         open_task_action_menu(s, t)
         self.assertEqual(
-            self._ids(s), ["cancel_run", "open_in_browser", "close"])
+            self._ids(s),
+            ["cancel_run", "view_log", "open_in_browser", "close"])
 
     def test_browser_open_allows_http_urls_only(self) -> None:
         self.assertTrue(_is_safe_browser_url("https://example.com/runs/1"))
@@ -711,7 +712,8 @@ class TestTaskActionMenu(unittest.TestCase):
         open_task_action_menu(s, parent)
         self.assertEqual(
             self._ids(s),
-            ["cancel_run", "change_then_run", "clear_then_run", "close"],
+            ["cancel_run", "change_then_run", "clear_then_run",
+             "view_log", "close"],
         )
 
     def test_pending_then_run_placeholder_offers_change_and_clear(self) -> None:

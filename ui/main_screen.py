@@ -26,7 +26,7 @@ from .modals import (
     draw_commit_view_modal, draw_detached_recovery_prompt,
     draw_diff_viewer, draw_help_screen, draw_remotes_modal, draw_reset_prompt,
     draw_ssh_keygen_modal,
-    draw_task_action_menu, draw_workflow_picker,
+    draw_task_action_menu, draw_task_log_viewer, draw_workflow_picker,
     draw_workspace_creator, draw_workspace_menu, draw_app_menu,
     draw_workspace_switcher,
 )
@@ -406,6 +406,10 @@ def draw_main(stdscr, state: State) -> None:
         draw_align_heads_prompt(stdscr, state, sidebar_x)
     if state.task_action_menu is not None:
         draw_task_action_menu(stdscr, state, sidebar_x)
+    # Log viewer is opened FROM task_action_menu and paints over it
+    # so dismissing the viewer reveals the detail modal beneath.
+    if state.task_log_viewer is not None:
+        draw_task_log_viewer(stdscr, state, sidebar_x)
     if state.workspace_menu is not None:
         draw_workspace_menu(stdscr, state, sidebar_x)
     # Picker drawn before creator so the creator (when both are open)

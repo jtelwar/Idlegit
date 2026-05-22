@@ -5,7 +5,6 @@ new key material when the target path does not already exist."""
 from __future__ import annotations
 
 import os
-import re
 import shutil
 import subprocess
 import sys

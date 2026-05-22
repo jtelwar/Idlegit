@@ -58,6 +58,10 @@ from .task_detail import (
     draw_task_action_menu, handle_task_action_menu_key,
     open_task_action_menu,
 )
+from .task_log_viewer import (
+    draw_task_log_viewer, handle_task_log_viewer_key,
+    open_task_log_viewer,
+)
 from .workflow_picker import (
     draw_workflow_picker, handle_workflow_picker_key, open_workflow_picker,
 )
@@ -103,6 +107,8 @@ __all__ = [
     "draw_reset_prompt", "handle_reset_prompt_key", "open_reset_prompt",
     "draw_task_action_menu", "handle_task_action_menu_key",
     "open_task_action_menu",
+    "draw_task_log_viewer", "handle_task_log_viewer_key",
+    "open_task_log_viewer",
     "draw_workflow_picker", "handle_workflow_picker_key",
     "open_workflow_picker",
     "commit_workspace_creator", "draw_workspace_creator",

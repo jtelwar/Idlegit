@@ -53,6 +53,7 @@ from ui import (
     handle_main_key,
     handle_reset_prompt_key,
     handle_task_action_menu_key,
+    handle_task_log_viewer_key,
     handle_workflow_picker_key,
     handle_workspace_creator_key,
     handle_workspace_menu_key,
@@ -433,6 +434,8 @@ def _run_main_loop(stdscr, state, title):
                             and (state.diff_viewer.loading
                                  or state.diff_viewer.log_loading
                                  or state.diff_viewer.blame_loading))
+                        or (state.task_log_viewer is not None
+                            and state.task_log_viewer.loading)
                         or (state.remote_branch_picker is not None
                             and state.remote_branch_picker.loading))
         if anim_running:
@@ -510,6 +513,12 @@ def _run_main_loop(stdscr, state, title):
             continue
         if state.align_heads_prompt is not None:
             handle_align_heads_prompt_key(state, key)
+            continue
+        # Log viewer dispatches BEFORE task_action_menu — it's
+        # opened from the detail modal and layers on top, so it
+        # owns the keyboard while it's up.
+        if state.task_log_viewer is not None:
+            handle_task_log_viewer_key(state, key)
             continue
         if state.task_action_menu is not None:
             handle_task_action_menu_key(state, key)

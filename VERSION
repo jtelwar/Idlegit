@@ -1,4 +1,10 @@
-0.25.14
+0.26.0
+
+### 0.26.0
+- 2026-05-22: task detail modal has a `View log` action that opens a scrollable run-log viewer with a colored state pill.
+
+### 0.25.15
+- 2026-05-21: remove unused `re` import in core/ssh.py (CI ruff fix).
 
 ### 0.25.14
 - 2026-05-21: SSH key wizard greys out Generate and shows orange “(path not empty)” when the path exists.

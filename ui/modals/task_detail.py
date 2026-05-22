@@ -14,6 +14,8 @@ from urllib.parse import urlparse
 from core.models import State, Task, TaskActionMenu, TaskActionMenuItem
 from core.git_ops import cancel_run
 
+from .task_log_viewer import open_task_log_viewer
+
 from ..colors import (
     PAIR_DLG_CYAN, PAIR_DLG_ERR,
     PAIR_DLG_FG, PAIR_DLG_OK, PAIR_DLG_WARN,
@@ -166,6 +168,15 @@ def open_task_action_menu(state: State, task: Task) -> None:
             id="change_then_run", label="Change then-run target"))
         items.append(TaskActionMenuItem(
             id="clear_then_run", label="Cancel then-run"))
+
+    # View log — surfaces the gh run log in a scrollable panel. Shown
+    # whenever the task carries a run_id (parent run task or any job
+    # sub-task); the loader handles the "log not ready yet" case for
+    # still-pending runs by surfacing "(no log output yet)".
+    if (meta is not None and meta.run_id is not None
+            and meta.slug):
+        items.append(TaskActionMenuItem(
+            id="view_log", label="View log"))
 
     # Open in browser — workflow runs only.
     if meta is not None and meta.run_url:
@@ -439,6 +450,12 @@ def _dispatch_action(state: State, item_id: str) -> None:
             t = state.tasks.add("open run URL")
             state.tasks.update(t, "warn", "unsafe URL")
         # Modal stays open so user can pick another action afterwards.
+        return
+
+    if item_id == "view_log":
+        open_task_log_viewer(state, task)
+        # Detail modal stays open behind the viewer so dismissing the
+        # viewer lands back on it (matches the sub-picker gesture).
         return
 
     if item_id == "cancel_run" and meta is not None and meta.run_id:

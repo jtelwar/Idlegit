@@ -1529,6 +1529,36 @@ def cancel_run(slug: str, run_id: int) -> Tuple[bool, str]:
     return True, "cancellation requested"
 
 
+# Cap on `gh run view --log` output so a 50MB log doesn't blow up the
+# in-memory line list. The diff-viewer uses the same shape — see
+# `_MAX_DIFF_LINES` over in `ui/modals/diff_viewer.py`.
+_MAX_RUN_LOG_LINES = 50_000
+
+
+def fetch_run_log(slug: str, run_id: int,
+                  job_id: Optional[int] = None,
+                  only_failed: bool = False
+                  ) -> Tuple[bool, List[str], str]:
+    """Fetch a workflow-run log via `gh run view`. Returns
+    `(ok, lines, error)`. On rc != 0 the lines list is empty and
+    `error` carries the first line of gh's stderr. Caps at
+    `_MAX_RUN_LOG_LINES` to keep the viewer's list bounded — when the
+    cap trips, an explicit truncation notice is appended as the last
+    line so the user sees why they hit the end."""
+    args = ["run", "view", str(run_id), "--repo", slug]
+    if job_id is not None:
+        args += ["--job", str(job_id)]
+    args.append("--log-failed" if only_failed else "--log")
+    rc, out, err = gh(args, timeout=60.0)
+    if rc != 0:
+        return False, [], first_line(err)
+    lines = out.splitlines() if out else []
+    if len(lines) > _MAX_RUN_LOG_LINES:
+        lines = lines[:_MAX_RUN_LOG_LINES]
+        lines.append(f"... (truncated at {_MAX_RUN_LOG_LINES} lines)")
+    return True, lines, ""
+
+
 # ---------- Target-state query (for the action menu) -----------------------
 
 

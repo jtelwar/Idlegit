@@ -636,6 +636,31 @@ class DiffViewer:
 
 
 @dataclass
+class TaskLogViewer:
+    """Scrollable read-only viewer for a GitHub Actions run / job log.
+
+    Opened from the task-detail modal's `View log` action when the
+    focused task carries a `run_id` in its `TaskMetadata`. Loads via
+    `gh run view --log` (or `--log-failed` when the task failed,
+    scoped to the job via `--job <id>` when opened from a job
+    sub-task). Esc / Enter closes; the loader respects `cancel_event`
+    so dismissing mid-fetch doesn't leave a dangling subprocess
+    write the modal will discard."""
+    task: Task                # focused task — drives the colored state pill
+    slug: str                 # `owner/name` for `gh ... --repo`
+    run_id: int               # gh databaseId for the run
+    job_id: Optional[int] = None      # set when opened from a job sub-task
+    workflow_name: str = ""           # cached for the title row
+    only_failed: bool = False         # True → `--log-failed`, False → `--log`
+    lines: List[str] = field(default_factory=list)
+    loading: bool = True
+    scroll: int = 0
+    error: str = ""                   # surfaced in the body when the fetch fails
+    cancel_event: threading.Event = field(default_factory=threading.Event)
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+
+@dataclass
 class ReviewBlock:
     """One commit target on the two-panel review screen — a top-level
     repo OR a nested submodule child. Each block owns its own LFS
@@ -1617,6 +1642,11 @@ class State:
     # than alongside the other modals.
     diff_viewer: Optional[DiffViewer] = None
     task_action_menu: Optional[TaskActionMenu] = None
+    # Layered above task_action_menu — opened by the "View log" action
+    # when the focused task has a workflow run id. Key routing in
+    # idlegit.py dispatches to it BEFORE task_action_menu so the
+    # viewer owns the keyboard while it's open.
+    task_log_viewer: Optional[TaskLogViewer] = None
     workspace_menu: Optional["WorkspaceMenu"] = None
     workspace_switcher: Optional[WorkspaceSwitcher] = None
     workspace_creator: Optional["WorkspaceCreator"] = None
