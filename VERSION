@@ -1,4 +1,7 @@
-0.26.0
+0.26.1
+
+### 0.26.1
+- 2026-05-23: refresh + pull-all skip repos with an active commit/push/smart-sync worker; mid-push submodule rows keep their spinner across link_siblings rebuilds.
 
 ### 0.26.0
 - 2026-05-22: task detail modal has a `View log` action that opens a scrollable run-log viewer with a colored state pill.

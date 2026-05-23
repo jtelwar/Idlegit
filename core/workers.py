@@ -1376,7 +1376,14 @@ def commit_worker(state: State, repo: Repo, msg: str,
     # ~250ms of the user's keystroke instead of after the push times
     # out or completes.
     cancel_event = threading.Event()
-    state.tasks.set_meta(pipeline_task, cancel_event=cancel_event)
+    # `holds_repo` is the explicit "this task is mutating repo's working
+    # tree" tag — read by `Tasks.repo_has_active_job` so refresh paths
+    # skip the row while the pipeline is alive. The refresh_lock acquired
+    # by `kick_off_workers` covers the same window, but the lock check
+    # alone misses the brief release-then-reacquire gaps the supervisor
+    # opens around its post-commit `refresh_repo` calls.
+    state.tasks.set_meta(
+        pipeline_task, cancel_event=cancel_event, holds_repo=repo)
     try:
         _commit_worker_inner(state, repo, msg, lfs_cands, staged_paths,
                              amend, track_workflow, then_run_after_push,
@@ -1639,7 +1646,14 @@ def commit_worker_for_child(state: State, parent: Repo, ref: ChildRef,
     # Early-visibility task — see `commit_worker` for the rationale.
     pipeline_task = state.tasks.add(f"{name}: working")
     cancel_event = threading.Event()
-    state.tasks.set_meta(pipeline_task, cancel_event=cancel_event)
+    # `holds_repo` + `holds_child` flag the pipeline against the parent
+    # AND the specific child ref — refresh paths consult both via
+    # `repo_has_active_job` / `child_has_active_job` so neither the
+    # parent's state dot nor the child's nested-row spinner reverts to
+    # a stale value mid-push.
+    state.tasks.set_meta(
+        pipeline_task, cancel_event=cancel_event,
+        holds_repo=parent, holds_child=ref)
     try:
         _commit_worker_for_child_inner(
             state, parent, ref, msg, staged_paths, amend,
@@ -3282,10 +3296,35 @@ def kick_off_sync_siblings(state: State) -> None:
 
     # Lock synchronously so the very next redraw shows spinners on every
     # checkout involved (canonical row + nested submodule ChildRefs).
+    # Each canonical also gets a tagged sentinel task carrying
+    # `holds_repo` — `kick_off_inline_refresh` consults
+    # `repo_has_active_job` to skip refresh on those rows. Without the
+    # tag, smart-sync's direct `refreshing=True` setter doesn't take
+    # the per-repo refresh_lock, so a concurrent Ctrl+R would succeed
+    # at `try_acquire_refresh` and stomp on smart-sync's mid-flight
+    # state. The sentinel is the source of truth for the active-job
+    # check; the lockless `refreshing=True` is still set so the row
+    # spinner animates immediately, before this thread starts running.
+    sentinel_by_canonical: "dict[int, Task]" = {}
     for canonical in canonicals_with_siblings:
         _smart_sync_set_canonical_tree_refreshing(canonical, True)
-    for _parent, ref in subtree_items:
+        sent = state.tasks.add(
+            f"  ↳ smart-sync {state.task_repo_label(canonical)}",
+            parent=header)
+        state.tasks.set_meta(sent, holds_repo=canonical)
+        sentinel_by_canonical[id(canonical)] = sent
+    sentinel_by_subtree: "dict[int, Task]" = {}
+    for parent, ref in subtree_items:
         ref.refreshing = True
+        sent = state.tasks.add(
+            f"  ⊕ smart-sync {state.task_repo_label(ref.repo)}",
+            parent=header)
+        # Subtree alignment writes through the parent's working tree
+        # (subtree pulls land as a parent commit), so tag the parent
+        # as the held repo — refresh of the parent would race the
+        # subtree-pull's commit step otherwise.
+        state.tasks.set_meta(sent, holds_repo=parent)
+        sentinel_by_subtree[id(ref)] = sent
 
     def worker() -> None:
         ok_total = 0
@@ -3301,6 +3340,17 @@ def kick_off_sync_siblings(state: State) -> None:
                     ok, fail = 0, 1
                 finally:
                     refresh_repo(canonical)
+                    # Release the active-job tag as soon as this
+                    # canonical's local work is done so refresh paths
+                    # can resume on it. The lockless `refreshing=True`
+                    # flag stays high until the outer `finally` below
+                    # so the row keeps spinning until the final batch
+                    # refresh + link rebuild lands.
+                    sent = sentinel_by_canonical.get(id(canonical))
+                    if sent is not None:
+                        state.tasks.update(
+                            sent, "ok" if fail == 0 else "warn",
+                            "" if fail == 0 else f"{fail} failed")
                 ok_total += ok
                 fail_total += fail
 
@@ -3323,6 +3373,7 @@ def kick_off_sync_siblings(state: State) -> None:
                 t = state.tasks.add(
                     f"  ⊕ {state.task_repo_label(ref.repo)} "
                     f"in {state.task_repo_label(parent)}")
+                ok_this = False
                 try:
                     try:
                         prefix = str(ref.nested_path.relative_to(parent.path))
@@ -3332,12 +3383,18 @@ def kick_off_sync_siblings(state: State) -> None:
                         parent.path, prefix,
                         ref.repo.remote_url_raw or "", ref.repo.branch)
                     state.tasks.update(t, "ok" if ok else "fail", msg)
+                    ok_this = ok
                     if ok:
                         ok_total += 1
                     else:
                         fail_total += 1
                 finally:
                     refresh_repo(parent)
+                    sent = sentinel_by_subtree.get(id(ref))
+                    if sent is not None:
+                        state.tasks.update(
+                            sent, "ok" if ok_this else "warn",
+                            "" if ok_this else "subtree sync failed")
         finally:
             # Final full refresh + sibling-link rebuild BEFORE we
             # clear `refreshing` flags or mark the header task
@@ -3389,6 +3446,19 @@ def kick_off_sync_siblings(state: State) -> None:
                 _smart_sync_set_canonical_tree_refreshing(canonical, False)
             for _parent, ref in subtree_items:
                 ref.refreshing = False
+
+            # Defensive sweep: an earlier exception (failed
+            # _align_canonical, cascade error) could leave a sentinel in
+            # `running` status, which would keep `repo_has_active_job`
+            # returning True forever and block all subsequent refreshes
+            # of that canonical. Mark any still-running sentinel as
+            # warn so the active-job check clears.
+            for sent in list(sentinel_by_canonical.values()):
+                if sent.status not in ("ok", "fail", "warn"):
+                    state.tasks.update(sent, "warn", "smart-sync aborted")
+            for sent in list(sentinel_by_subtree.values()):
+                if sent.status not in ("ok", "fail", "warn"):
+                    state.tasks.update(sent, "warn", "smart-sync aborted")
 
             total = ok_total + fail_total
             if total == 0:
@@ -3462,9 +3532,19 @@ def kick_off_inline_refresh(state: State) -> None:
     # Ctrl+R during an in-flight auto-refresh would race the auto-
     # refresh on the same Repo's `staged`/`unstaged`/etc. lists and
     # leave the row briefly flickering between half-populated states.
+    #
+    # `repo_has_active_job` is the explicit "running job" check — it
+    # catches workers whose lock isn't held (smart-sync's lockless
+    # `refreshing=True` setter on a canonical mid-align) so we never
+    # refresh on top of in-flight work. Lock check + job check are
+    # belt-and-braces: either reason to bail is enough.
     repos_snapshot = list(state.repos)
     acquired: List[Repo] = []
+    skipped_active: List[Repo] = []
     for r in repos_snapshot:
+        if state.tasks.repo_has_active_job(r):
+            skipped_active.append(r)
+            continue
         if r.try_acquire_refresh():
             acquired.append(r)
 
@@ -3500,8 +3580,15 @@ def kick_off_inline_refresh(state: State) -> None:
             # don't depend on Repo equality (the dataclass `__eq__`
             # compares many fields and could surprise us).
             acquired_paths = {a.path for a in acquired}
+            skipped_active_paths = {r.path for r in skipped_active}
             for r in next_repos:
                 if r.path in acquired_paths:
+                    continue
+                if r.path in skipped_active_paths:
+                    continue
+                if state.tasks.repo_has_active_job(r):
+                    skipped_active.append(r)
+                    skipped_active_paths.add(r.path)
                     continue
                 if r.try_acquire_refresh():
                     acquired.append(r)
@@ -3531,7 +3618,15 @@ def kick_off_inline_refresh(state: State) -> None:
                     continue
                 t = state.tasks.add(
                     f"{state.task_repo_label(r)}: refresh skipped")
-                state.tasks.update(t, "warn", "locked by another worker")
+                # Distinguish "active job" (a worker is mutating this
+                # repo's working tree right now) from "locked" (refresh
+                # lock held — most often by a sibling refresh or
+                # fs_watcher fire) so the user sees WHY their Ctrl+R
+                # was a no-op on this row.
+                if r.path in skipped_active_paths:
+                    state.tasks.update(t, "warn", "task in progress")
+                else:
+                    state.tasks.update(t, "warn", "locked by another worker")
 
             # `fetch_on_manual_refresh` (default off) makes Ctrl+R do
             # a `git fetch --all` per repo BEFORE the local state
@@ -3631,12 +3726,20 @@ def kick_off_pull_all(state: State) -> None:
     parent_task = state.tasks.add("pull all")
 
     acquired: List[Repo] = []
+    n_skipped_active = 0
     for r in state.repos:
+        # `repo_has_active_job` skips repos that have a live commit /
+        # push / smart-sync worker tagged against them so pull-all
+        # doesn't compete with mid-flight work. Treated the same as
+        # the lock-held case for the summary count below.
+        if state.tasks.repo_has_active_job(r):
+            n_skipped_active += 1
+            continue
         if r.try_acquire_refresh():
             acquired.append(r)
 
     n_total = len(state.repos)
-    n_skipped_locked = n_total - len(acquired)
+    n_skipped_locked = n_total - len(acquired) - n_skipped_active
     # Track outcomes from worker threads — use a lock since
     # ThreadPoolExecutor runs `pull_one` concurrently. ints, but
     # we wrap reads/writes in a tiny critical section so the final
@@ -3715,12 +3818,15 @@ def kick_off_pull_all(state: State) -> None:
                     f"{n_skipped_no_upstream[0]} no upstream")
             if n_skipped_locked:
                 parts.append(f"{n_skipped_locked} locked")
+            if n_skipped_active:
+                parts.append(f"{n_skipped_active} busy")
             if n_failed[0]:
                 parts.append(f"{n_failed[0]} failed")
             summary = ", ".join(parts) if parts else "no repos"
             if n_failed[0]:
                 status = "fail"
-            elif n_skipped_locked or n_skipped_no_upstream[0]:
+            elif (n_skipped_locked or n_skipped_active
+                    or n_skipped_no_upstream[0]):
                 status = "warn"
             else:
                 status = "ok"

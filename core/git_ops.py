@@ -511,13 +511,28 @@ def _link_siblings_locked(repos: List[Repo],
     # Dedup at this stage too (paranoia + belt-and-braces): if a stale
     # `.gitmodules` somehow has the same submodule listed twice (same
     # URL + same path), only one ChildRef is produced.
+    #
+    # Two side-tables snapshotted from the pre-rebuild children:
+    #   prev_submodule_msg — per-child commit message buffer; carried
+    #     forward so the review screen doesn't lose what the user typed.
+    #   busy_old_ref — the actual OLD ChildRef instance for any
+    #     submodule whose `refreshing` flag is True (a
+    #     commit_worker_for_child or smart-sync cascade holds the
+    #     `refresh_lock` on it). Rebuilding would mint a fresh
+    #     ChildRef with `refreshing=False` and a brand-new lock,
+    #     which (a) drops the row's spinner mid-push and (b) splits
+    #     the lock identity so the worker holding the OLD lock can't
+    #     interlock with anything that consults the NEW one.
     prev_submodule_msg: Dict[Tuple[int, str], str] = {}
+    busy_old_ref: Dict[Tuple[int, str], ChildRef] = {}
     for parent in repos:
         for old in parent.children:
-            if old.kind == "submodule":
-                prev_submodule_msg[
-                    (id(parent), str(old.nested_path.resolve()))
-                ] = old.message
+            if old.kind != "submodule":
+                continue
+            nk = (id(parent), str(old.nested_path.resolve()))
+            prev_submodule_msg[nk] = old.message
+            if old.refreshing:
+                busy_old_ref[nk] = old
 
     submodule_refs: List[ChildRef] = []
     for parent in repos:
@@ -542,6 +557,17 @@ def _link_siblings_locked(repos: List[Repo],
                 continue
             new_siblings[id(target)].append((parent, sub_path))
             nk = (id(parent), str(sub_path.resolve()))
+            busy = busy_old_ref.get(nk)
+            if busy is not None:
+                # Reuse the in-flight ref so the lock + refreshing flag
+                # persist across the rebuild. Skip `_populate` for this
+                # ref — the worker that holds its lock owns mutations
+                # to head/branch/dirty/etc. while it runs; a parallel
+                # read from `_populate` would race the worker's
+                # subprocess output. The next link_siblings call after
+                # the worker releases will re-populate fresh.
+                new_children[id(parent)].append(busy)
+                continue
             prev_msg = prev_submodule_msg.get(nk, "")
             ref = ChildRef(
                 repo=target, nested_path=sub_path, kind="submodule",

@@ -380,6 +380,21 @@ class TaskMetadata:
     # cancel takes effect promptly. Optional because plain bookkeeping
     # rows that aren't cancellable don't need one.
     cancel_event: Optional["threading.Event"] = None
+    # Explicit "this task is mutating this repo's working tree" tag.
+    # Set by commit_worker / kick_off_action / smart-sync workers so
+    # `kick_off_inline_refresh` and `kick_off_pull_all` can skip any
+    # repo with a live job operating on it, even when the refresh
+    # lock isn't (or can't be) held for the full duration. Different
+    # from `repo` above (which workflow-polling tasks set to identify
+    # WHICH repo's run they're polling, not to claim local-mutation
+    # ownership of it). Cleared implicitly when the task transitions
+    # to a terminal status — readers check `task.status` alongside.
+    holds_repo: Optional[Repo] = None
+    # Companion to `holds_repo` for submodule child rows.
+    # `commit_worker_for_child` sets it to the ChildRef whose nested
+    # checkout it's pushing; refresh paths use `child_has_active_job`
+    # to skip rebuilding that child while the push is in flight.
+    holds_child: Optional["ChildRef"] = None
 
 
 class Tasks:
@@ -434,6 +449,37 @@ class Tasks:
         the task has none (most plain bookkeeping rows)."""
         with self.lock:
             return self._meta.get(task)
+
+    def repo_has_active_job(self, repo: "Repo") -> bool:
+        """True iff any non-terminal task carries `holds_repo == repo`.
+        Refresh paths consult this to skip repos with a live commit /
+        push / sync worker — separate from the per-row `refresh_lock`
+        so we catch in-flight workers whose lock is held elsewhere
+        (e.g. smart-sync's lockless `refreshing=True` setter on a
+        canonical that is currently being aligned)."""
+        with self.lock:
+            for t in self.items:
+                if t.status in _TERMINAL_STATUSES:
+                    continue
+                meta = self._meta.get(t)
+                if meta is not None and meta.holds_repo is repo:
+                    return True
+        return False
+
+    def child_has_active_job(self, child: "ChildRef") -> bool:
+        """Companion to `repo_has_active_job` for submodule child rows.
+        Inline refresh's `link_siblings` pass rebuilds the `ChildRef`
+        instances under each parent; preserving the in-flight ref via
+        this check keeps a mid-push submodule row reading as 'working'
+        instead of reverting to a stale state dot."""
+        with self.lock:
+            for t in self.items:
+                if t.status in _TERMINAL_STATUSES:
+                    continue
+                meta = self._meta.get(t)
+                if meta is not None and meta.holds_child is child:
+                    return True
+        return False
 
     def update(self, task: Task, status: str, message: str = "") -> None:
         fire_finished = False
