@@ -1,4 +1,7 @@
-0.27.0
+0.27.1
+
+### 0.27.1
+- 2026-05-23: demo.tape outputs gif+mp4 (VHS can't produce asciinema `.cast`); README explains how to record one manually.
 
 ### 0.27.0
 - 2026-05-23: add Alt+S / Alt+M as alternates to Shift+Left / Shift+Right (bulk suggest, msg editor) for terminals that drop Shift+arrow.

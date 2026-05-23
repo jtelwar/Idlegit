@@ -48,11 +48,28 @@ Both produced in the repo root:
 
 | File | Use |
 |---|---|
-| `demo.gif` | README hero / social / HN thumbnail. |
-| `demo.cast` | asciinema. Embed in README via [asciinema-player](https://github.com/asciinema/asciinema-player). |
+| `demo.gif` | README hero / inline preview. |
+| `demo.mp4` | Social posts (smaller than GIF, plays everywhere). |
 
-Render times are roughly the demo duration (~90s) plus a few seconds for
-GIF encoding.
+Render times are roughly the demo duration (~90s) plus a few seconds
+for encoding.
+
+### What about an asciinema `.cast`?
+
+VHS only renders to `gif`/`mp4`/`webm`/PNG-frames — there's no
+asciinema output. If you need a `.cast` (for the
+[asciinema-player](https://github.com/asciinema/asciinema-player)
+README embed), record it manually using the same sandbox:
+
+```sh
+scripts/demo/demo-workspace.sh up
+export HOME=/tmp/idlegit-demo/home
+export GIT_CONFIG_GLOBAL="$HOME/.gitconfig"
+export IDLEGIT_CONFIG_DIR="$HOME/.config/idlegit"
+asciinema rec demo.cast -c "python idlegit.py"
+# ...run through the demo arc by hand, then quit idlegit...
+scripts/demo/demo-workspace.sh down
+```
 
 ## Workspaces
 

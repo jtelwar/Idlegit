@@ -7,14 +7,17 @@
 # Run from repo root:
 #   vhs scripts/demo/demo.tape
 #
-# Produces ./demo.gif (for READMEs / social) and ./demo.cast (asciinema).
+# Produces ./demo.gif and ./demo.mp4 — embed the gif in the README, use
+# the mp4 for social (HN / X / Bluesky / etc.). VHS doesn't output
+# asciinema `.cast`; if you want one, re-record manually with
+# `asciinema rec` using the same demo-workspace.sh setup.
 #
 # Timing-sensitive sections are marked with `# TUNE` — re-time these
 # after the first render. The Up-count to reach the workspace row is
 # the most likely thing to need adjustment if you add or remove repos.
 
 Output demo.gif
-Output demo.cast
+Output demo.mp4
 
 Set Width 1400
 Set Height 900
