@@ -37,7 +37,7 @@ from .review import (
     is_toolbar_toggle,
     kick_off_review_files_load,
 )
-from .mouse import normalize_input
+from .mouse import ALT_M, ALT_S, read_key
 from .sidebar import SPINNER_FRAMES
 
 
@@ -238,7 +238,7 @@ def handle_main_key(state: State, key: int) -> Optional[str]:
         open_action_menu(state)
         return None
 
-    if key == curses.KEY_SRIGHT:  # Shift+Right — open the large commit-msg editor
+    if key == curses.KEY_SRIGHT or key == ALT_M:  # Shift+Right / Alt+M — large commit-msg editor
         # Silently ignored when the focused row isn't an editable
         # commit-message holder; same gating logic as the inline field
         # below — opens only on dirty repos / dirty submodule rows.
@@ -271,7 +271,7 @@ def handle_main_key(state: State, key: int) -> Optional[str]:
             return None
         state.field_cursor = max(0, cur - 1)
         return None
-    if key == curses.KEY_SLEFT and not msg:
+    if (key == curses.KEY_SLEFT or key == ALT_S) and not msg:
         kick_off_bulk_suggest(state)
         return None
 
@@ -332,7 +332,7 @@ def confirm_quit(stdscr, state: State) -> bool:
     stdscr.refresh()
     while True:
         try:
-            key = normalize_input(stdscr.getch())
+            key = read_key(stdscr)
         except KeyboardInterrupt:
             return True
         if key == -1:
@@ -437,7 +437,7 @@ def _drive_modal_until_closed(stdscr, state: State, slot: str) -> bool:
         draw_main(stdscr, state)
         stdscr.refresh()
         try:
-            key = normalize_input(stdscr.getch())
+            key = read_key(stdscr)
         except KeyboardInterrupt:
             setattr(state, slot, None)
             return False
@@ -494,7 +494,7 @@ def handle_confirm(stdscr, state: State) -> None:
                 draw_diff_viewer(stdscr, state)
                 stdscr.refresh()
             try:
-                key = normalize_input(stdscr.getch())
+                key = read_key(stdscr)
             except KeyboardInterrupt:
                 return
             if key == -1:

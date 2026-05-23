@@ -1,4 +1,16 @@
-0.26.1
+0.27.0
+
+### 0.27.0
+- 2026-05-23: add Alt+S / Alt+M as alternates to Shift+Left / Shift+Right (bulk suggest, msg editor) for terminals that drop Shift+arrow.
+
+### 0.26.4
+- 2026-05-23: move demo into `scripts/demo/`, rename runner to `demo-workspace.sh`, add README.
+
+### 0.26.3
+- 2026-05-23: `scripts/demo.sh` now builds three workspaces (commit-demo, sync-demo, idlegit) + `scripts/demo.tape` drives a full VHS recording.
+
+### 0.26.2
+- 2026-05-23: add `scripts/demo.sh` — sandboxed demo workspace + git daemon for asciinema recordings.
 
 ### 0.26.1
 - 2026-05-23: refresh + pull-all skip repos with an active commit/push/smart-sync worker; mid-push submodule rows keep their spinner across link_siblings rebuilds.

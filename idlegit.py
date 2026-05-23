@@ -178,7 +178,7 @@ def _run_workspace_creator_subloop(stdscr, cfg, startup_warnings=None):
         state,
         title="Welcome to Idlegit",
         intro=intro)
-    from ui.mouse import enable_mouse, normalize_input
+    from ui.mouse import enable_mouse, read_key
     enable_mouse()
     stdscr.timeout(100)
     while state.workspace_creator is not None:
@@ -196,7 +196,7 @@ def _run_workspace_creator_subloop(stdscr, cfg, startup_warnings=None):
         draw_workspace_creator(stdscr, state, sidebar_x)
         stdscr.refresh()
         try:
-            key = normalize_input(stdscr.getch())
+            key = read_key(stdscr)
         except KeyboardInterrupt:
             return []
         if key == -1:
@@ -330,7 +330,7 @@ def run(stdscr, cfg, workspaces, initial_active_idx: int = 0,
 
 def _run_main_loop(stdscr, state, title):
     from core.fs_watcher import drain_pending_refreshes
-    from ui.mouse import normalize_input
+    from ui.mouse import read_key
     last_title_emitted = title
     last_title_at = time.monotonic()
     # Track tasks.has_running() across iterations so we can detect the
@@ -462,7 +462,7 @@ def _run_main_loop(stdscr, state, title):
         stdscr.timeout(100 if anim_running else 1000)
 
         try:
-            key = normalize_input(stdscr.getch())
+            key = read_key(stdscr)
         except KeyboardInterrupt:
             return
         if key == -1:
