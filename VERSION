@@ -1,7 +1,10 @@
-0.28.0
+0.28.1
+
+### 0.28.1
+- 2026-06-02: review: an action's then-run row now hides when that action is toggled off.
 
 ### 0.28.0
-- 2026-06-02: review screen: push is now a per-commit toggle (Space). Rows read in pipeline order — message, push, then on-push actions indented under the toggle, shown only when push is on. Each action's then-run row shows only while that action is tracked. auto-push sets the default.
+- 2026-06-02: review screen: push is now a per-commit toggle (Space). Rows read in pipeline order — message, push, then on-push actions indented under the toggle, shown only when push is on. auto-push sets the default.
 
 ### 0.27.2
 - 2026-05-23: replace VHS tape with `scripts/demo/record.sh` (tmux send-keys + asciinema rec → real `.cast`).
