@@ -10,32 +10,27 @@
 #   brew install tmux asciinema
 #   gh auth login                       # for the workspace 3 action trigger
 #
-# Run from anywhere:
+# Run from anywhere (the working directory the user is IN matters: iTerm
+# tested-good, plain Terminal.app fine. Cursor / VS Code embedded
+# terminals render asciinema casts oddly — record from a real terminal).
+#
 #   scripts/demo/record.sh              # produces ./demo.cast
 #   CAST=takes/take3.cast scripts/demo/record.sh   # alternate output
 #
 # Live-watch the recording in another terminal:
-#   tmux -L idlegit-demo attach
+#   tmux attach -t idlegit-demo
 
 set -euo pipefail
 
 SESSION=idlegit-demo
-TMUX_SOCKET=idlegit-demo            # isolated -L socket so we don't touch
-                                    # the user's normal tmux server
 CAST="${CAST:-demo.cast}"
-COLS="${COLS:-160}"
-ROWS="${ROWS:-44}"
+COLS="${COLS:-200}"
+ROWS="${ROWS:-50}"
 WORKSPACE_STARTED=0
-TMUX_CONF=""
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 WORKSPACE_SH="$REPO_ROOT/scripts/demo/demo-workspace.sh"
 CAST_PATH="$(cd "$(dirname "$CAST")" 2>/dev/null && pwd)/$(basename "$CAST")"
-
-# Always operate on our isolated socket so a) the user's other tmux
-# sessions aren't disturbed, b) `has-session` and `kill-session` can't
-# collide with whatever they have running.
-T() { tmux -L "$TMUX_SOCKET" "$@"; }
 
 # ---- output helpers --------------------------------------------------------
 say() { printf '\033[1;36m▸\033[0m %s\n' "$*"; }
@@ -47,19 +42,15 @@ die() { printf '\033[1;31m✗\033[0m %s\n' "$*" >&2; exit 1; }
 # BTab, etc.) or a literal string. Multiple args go to one tmux call so
 # the keys queue without any inter-key delay (the only delay is what we
 # explicitly Sleep for).
-send() { T send-keys -t "$SESSION" "$@"; }
+send() { tmux send-keys -t "$SESSION" "$@"; }
 
 # ---- cleanup ---------------------------------------------------------------
 cleanup() {
-  if T has-session -t "$SESSION" 2>/dev/null; then
-    T send-keys -t "$SESSION" C-c 2>/dev/null || true
+  if tmux has-session -t "$SESSION" 2>/dev/null; then
+    tmux send-keys -t "$SESSION" C-c 2>/dev/null || true
     sleep 1
-    T kill-session -t "$SESSION" 2>/dev/null || true
+    tmux kill-session -t "$SESSION" 2>/dev/null || true
   fi
-  # The -L socket has its own server; nuke it too so we leave nothing
-  # behind for the next run.
-  T kill-server 2>/dev/null || true
-  [ -n "$TMUX_CONF" ] && rm -f "$TMUX_CONF"
   if [ "$WORKSPACE_STARTED" = "1" ]; then
     bash "$WORKSPACE_SH" down >/dev/null 2>&1 || true
   fi
@@ -70,21 +61,9 @@ trap cleanup EXIT
 command -v tmux      >/dev/null || die "tmux not on PATH    (brew install tmux)"
 command -v asciinema >/dev/null || die "asciinema not on PATH (brew install asciinema)"
 
-if T has-session -t "$SESSION" 2>/dev/null; then
-  die "tmux session '$SESSION' already exists on the -L $TMUX_SOCKET socket — kill it: tmux -L $TMUX_SOCKET kill-server"
+if tmux has-session -t "$SESSION" 2>/dev/null; then
+  die "tmux session '$SESSION' already exists — kill it first: tmux kill-session -t $SESSION"
 fi
-
-# ---- tmux config: make the pane look like iTerm ----------------------------
-# Default tmux advertises `screen-256color`, which strips truecolor and
-# loses some capabilities idlegit relies on. Force `xterm-256color` and
-# pass RGB/truecolor through so the recorded escape stream matches what
-# iTerm would emit. Also hide tmux's status bar — it's noise in the cast.
-TMUX_CONF="$(mktemp)"
-cat >"$TMUX_CONF" <<'EOF'
-set -g default-terminal "xterm-256color"
-set -ga terminal-overrides ",*256col*:Tc"
-set -g status off
-EOF
 
 # ---- build the sandboxed workspace -----------------------------------------
 say "Setting up sandboxed demo workspaces…"
@@ -95,14 +74,9 @@ ok "Workspaces ready under /tmp/idlegit-demo"
 
 # ---- launch tmux + asciinema + idlegit -------------------------------------
 say "Launching idlegit inside asciinema (cast → $CAST_PATH)"
-say "Live-watch: tmux -L $TMUX_SOCKET attach -t $SESSION"
+say "Tip: open another terminal and run \`tmux attach -t $SESSION\` to watch live."
 
-# Sandbox env vars set inside the pane so they only apply to the demo.
-# COLORTERM=truecolor is what most modern TUIs check before emitting 24-bit
-# color; setting it explicitly avoids depending on tmux propagating it.
 read -r -d '' DEMO_CMD <<EOF || true
-export TERM=xterm-256color
-export COLORTERM=truecolor
 export HOME=/tmp/idlegit-demo/home
 export GIT_CONFIG_GLOBAL=\$HOME/.gitconfig
 export IDLEGIT_CONFIG_DIR=\$HOME/.config/idlegit
@@ -110,8 +84,7 @@ cd $REPO_ROOT
 exec asciinema rec --overwrite --quiet -c 'python idlegit.py' '$CAST_PATH'
 EOF
 
-T -f "$TMUX_CONF" new-session -d -s "$SESSION" -x "$COLS" -y "$ROWS" \
-  "bash -lc \"$DEMO_CMD\""
+tmux new-session -d -s "$SESSION" -x "$COLS" -y "$ROWS" "bash -lc \"$DEMO_CMD\""
 
 # Give asciinema + idlegit time to start drawing.
 sleep 6
