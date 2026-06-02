@@ -476,7 +476,12 @@ def handle_confirm(stdscr, state: State) -> None:
     kick_off_review_files_load(blocks)
 
     focusables = _collect_review_focusables(blocks)
-    focus = 0 if focusables else -1
+    # Land on the first message (suggest) row — the top of each block and
+    # the natural starting point; ↓ steps down through LFS, the push
+    # toggle, and the on-push actions in pipeline order. Falls back to
+    # the first focusable when there's no suggest row (all mid-merge).
+    focus = next((i for i, f in enumerate(focusables) if f[1] == "suggest"),
+                 0 if focusables else -1)
     panel_focus = "left"
     scroll = 0
 
@@ -623,6 +628,22 @@ def handle_confirm(stdscr, state: State) -> None:
                         on = obj.repo.track_workflow.get(
                             obj.workflow_name, False)
                         obj.repo.track_workflow[obj.workflow_name] = not on
+                        # Tracking an action shows its then-run chain;
+                        # untracking hides it — so rebuild the focusables
+                        # list and clamp focus, same as the push toggle.
+                        focusables = _collect_review_focusables(blocks)
+                        if focus >= len(focusables):
+                            focus = max(0, len(focusables) - 1)
+                    elif kind == "push":
+                        # Flip this block's per-commit push. Turning it
+                        # off hides the push-only rows (workflow
+                        # tracking, then-run-after-push), so rebuild the
+                        # focusables list and clamp focus — same dance
+                        # as cycling a then-run target below.
+                        obj.push = not obj.push
+                        focusables = _collect_review_focusables(blocks)
+                        if focus >= len(focusables):
+                            focus = max(0, len(focusables) - 1)
                     # Space on a suggest / then-run row is a no-op
                     # (use ← for suggest, ←/→ for then-run).
                     continue

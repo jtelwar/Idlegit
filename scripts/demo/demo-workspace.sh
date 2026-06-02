@@ -392,8 +392,8 @@ cmd_up() {
   │    export IDLEGIT_CONFIG_DIR=\$HOME/.config/idlegit              │
   │    cd $REPO_ROOT && python -m idlegit
   │                                                                 │
-  │  Scripted (requires \`brew install vhs\`):                        │
-  │    vhs scripts/demo/demo.tape                                   │
+  │  Scripted (requires \`brew install tmux asciinema\`):             │
+  │    scripts/demo/record.sh                                       │
   │                                                                 │
   │  Teardown:  $0 down
   └─────────────────────────────────────────────────────────────────┘

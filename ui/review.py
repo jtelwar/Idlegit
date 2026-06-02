@@ -75,24 +75,23 @@ def _block_for_repo(state: State, repo: Repo) -> ReviewBlock:
         upstream=repo.upstream,
         siblings_summary=", ".join(s[0].display_name for s in repo.siblings),
         auto_stage=state.auto_stage,
-        auto_push=state.auto_push,
+        push=state.auto_push,
         threshold_mb=threshold_mb,
     )
-    if state.auto_push:
-        if repo.upstream:
-            block.push_summary = f"push: yes → {repo.upstream}"
-        else:
-            block.push_summary = (
-                f"push: yes (sets upstream → origin/{repo.branch})")
-    else:
-        block.push_summary = "push: no"
     if not repo.merging:
         warnings = find_lfs_warnings(
             repo, state.auto_stage, state.lfs_warn_bytes)
         for path, size in warnings:
             block.lfs_candidates.append(LFSCandidate(
                 repo=repo, path=path, size_str=size))
-        if (state.auto_push and gh_available() and repo.workflows
+        # Build the workflow-tracking toggles + then-run selectors
+        # whenever this repo *could* run them on push (gh present,
+        # GitHub remote, workflows that fire on push). They're only
+        # *shown / focusable* when the block's push toggle is on — that
+        # gate lives in `_collect_review_focusables` and the left-pane
+        # renderer — so flipping push on per-commit still surfaces them
+        # even when auto-push defaults off.
+        if (gh_available() and repo.workflows
                 and parse_github_slug(repo.remote_url_raw)):
             dispatchable_options = [
                 w.name for w in repo.workflows
@@ -132,19 +131,18 @@ def _block_for_child(state: State,
         message=ref.message.strip(),
         is_child=True,
         auto_stage=state.auto_stage,
-        auto_push=state.auto_push,
+        push=state.auto_push,
         threshold_mb=state.lfs_warn_bytes // (1024 * 1024),
     )
-    if state.auto_push:
-        targets = [ref.repo.display_name + " (top-level)"]
-        for other_parent, other_path in ref.repo.siblings:
-            if other_path != ref.nested_path:
-                targets.append(
-                    f"{ref.repo.display_name} in {other_parent.display_name}")
-        block.siblings_summary = ", ".join(targets)
-        block.push_summary = "push: yes (from nested checkout)"
-    else:
-        block.push_summary = "push: no"
+    # Sibling-sync targets are computed unconditionally; the left pane
+    # only renders the "sync:" line when this block's push toggle is on
+    # (a nested commit fans out to its siblings only when it's pushed).
+    targets = [ref.repo.display_name + " (top-level)"]
+    for other_parent, other_path in ref.repo.siblings:
+        if other_path != ref.nested_path:
+            targets.append(
+                f"{ref.repo.display_name} in {other_parent.display_name}")
+    block.siblings_summary = ", ".join(targets)
     return block
 
 
@@ -468,20 +466,23 @@ def _collect_review_focusables(
     blocks: List[ReviewBlock],
 ) -> List[Tuple[int, str, object]]:
     """Flatten every block's interactive items into one ordered list
-    of `(block_idx, kind, item)`. `kind` is "suggest", "lfs",
+    of `(block_idx, kind, item)`. `kind` is "push", "suggest", "lfs",
     "toggle", "then_run", or "param_input". Up/Down on the left pane
     navigates this list; `block_idx` says which block's files the
     right pane should show.
 
-    Order matches `_block_left_rows`: the per-block "suggest" entry
-    (the message line — Left re-runs commit-message suggest scoped to
-    that block's checked files) goes first; then LFS rows; each
-    workflow toggle is immediately followed by its then-run chain;
-    then-run-after-push chain comes last. Every then-run row is
-    followed by one `param_input` row per parameter the action it
-    points to declares (today only the `__add_tag__` sentinel
-    declares a "tag" param; workflow_dispatch inputs would slot in
-    here too)."""
+    Order matches `_block_left_rows` and follows the pipeline's
+    execution order top-to-bottom: the "suggest" entry (the message
+    line — Left re-runs commit-message suggest scoped to that block's
+    checked files); then LFS rows; then the "push" toggle (Space flips
+    whether this commit is pushed); then everything that only happens
+    on push, indented beneath the toggle — each workflow toggle
+    immediately followed by its then-run chain (only while that action
+    is tracked), and the then-run-after-push chain last. Every then-run
+    row is followed by
+    one `param_input` row per parameter the action it points to
+    declares (today only the `__add_tag__` sentinel declares a "tag"
+    param; workflow_dispatch inputs would slot in here too)."""
     out: List[Tuple[int, str, object]] = []
 
     def emit_chain(block, start_workflow):
@@ -493,22 +494,35 @@ def _collect_review_focusables(
                             (sel, spec.name)))
 
     for block_index, block in enumerate(blocks):
-        # Suggest focusable per block — non-merging blocks only, since
-        # a merge-in-progress block can't accept a fresh commit
-        # message anyway.
+        # Focusables follow the pipeline's execution order top-to-bottom:
+        # the commit message, then any LFS tracking, then the push
+        # toggle, then everything that only happens on push. Merging
+        # blocks are skipped at commit time, so they offer neither a
+        # message row nor a push toggle to land on.
         if not block.merging:
             out.append((block_index, "suggest", block))
         for c in block.lfs_candidates:
             out.append((block_index, "lfs", c))
-        for tog in block.workflow_toggles:
-            out.append((block_index, "toggle", tog))
-            emit_chain(block, tog.workflow_name)
-        # Child (nested-submodule) blocks have no target_repo and no
-        # workflow toggles, so they get no after-push then-run chain
-        # either — skip the walk to avoid creating selectors with a
-        # None repo, which would crash the moment we read their state.
-        if block.target_repo is not None:
-            emit_chain(block, "")
+        if not block.merging:
+            out.append((block_index, "push", block))
+        # Workflow tracking + then-run chains only ever run on push, so
+        # they are focusable only while this block's push toggle is on —
+        # rendered indented beneath the toggle.
+        if block.push:
+            for tog in block.workflow_toggles:
+                out.append((block_index, "toggle", tog))
+                # The "then run after <workflow>" chain only makes sense
+                # while that action is tracked — there's nothing to run
+                # "after" an untracked workflow — so it's focusable only
+                # when the toggle is on.
+                if tog.repo.track_workflow.get(tog.workflow_name, False):
+                    emit_chain(block, tog.workflow_name)
+            # Child (nested-submodule) blocks have no target_repo and no
+            # workflow toggles, so they get no after-push then-run chain
+            # either — skip the walk to avoid creating selectors with a
+            # None repo, which would crash the moment we read their state.
+            if block.target_repo is not None:
+                emit_chain(block, "")
     return out
 
 
@@ -636,22 +650,6 @@ def _block_left_rows(
         # a message or hits Left to generate one.
         rows.append(('  message: ""', suggest_attr | curses.A_DIM,
                      suggest_focused))
-    push_line = f"  {block.push_summary}"
-    arrow = push_line.rfind("→ ")
-    if arrow != -1 and "yes" in push_line:
-        val_attr = curses.color_pair(PAIR_BRANCH) | curses.A_DIM
-        rows.append(([
-            (push_line[:arrow + 2], curses.A_DIM),
-            (push_line[arrow + 2:], val_attr),
-        ], curses.A_DIM, False))
-    else:
-        rows.append((push_line, curses.A_DIM, False))
-    if block.siblings_summary:
-        val_attr = curses.color_pair(PAIR_BRANCH) | curses.A_DIM
-        rows.append(([
-            ("  sync: ", curses.A_DIM),
-            (block.siblings_summary, val_attr),
-        ], curses.A_DIM, False))
 
     if block.lfs_candidates:
         rows.append((
@@ -710,33 +708,70 @@ def _block_left_rows(
                 param_attr = curses.A_DIM
             rows.append((param_text, param_attr, param_focused))
 
-    for tog in block.workflow_toggles:
-        is_focused = (panel_focus == "left" and focus >= 0
-                      and focusables[focus] == (block_idx, "toggle", tog))
-        on = tog.repo.track_workflow.get(tog.workflow_name, False)
-        check = "[x]" if on else "[ ]"
-        text = f"  {check}  track action: {tog.workflow_name}"
-        if on:
-            attr = curses.color_pair(PAIR_OK)
-        else:
-            attr = curses.color_pair(PAIR_HEADER) | curses.A_DIM
-        if is_focused:
-            attr |= curses.A_REVERSE
-        rows.append((text, attr, is_focused))
-        # Walk the chain rooted at this tracked workflow. Base
-        # indent of 8 cols matches the historical "        " prefix
-        # for after-toggle then-runs; each chained step adds 2 cols
-        # so a 4-level chain ends at column 14.
-        for sel, depth in _walk_then_run_chain(block, tog.workflow_name):
-            append_then_run(sel, indent_cols=8 + 2 * depth)
+    # Push toggle — rendered after the commit message + LFS rows so the
+    # left pane reads in pipeline order (commit, then push, then the
+    # on-push actions below). Same styling as the workflow-tracking
+    # toggles (green when on, dim when off). When on, the label spells
+    # out where the push lands: an existing upstream, or the upstream it
+    # will set on first push; child blocks fan out to their siblings.
+    push_focused = (panel_focus == "left" and focus >= 0
+                    and focusables[focus] == (block_idx, "push", block))
+    check = "[x]" if block.push else "[ ]"
+    if not block.push:
+        push_label = "push"
+    elif block.is_child:
+        push_label = "push (from nested checkout)"
+    elif block.upstream:
+        push_label = f"push → {block.upstream}"
+    else:
+        push_label = f"push (sets upstream → origin/{block.branch})"
+    push_attr = (curses.color_pair(PAIR_OK) if block.push
+                 else curses.color_pair(PAIR_HEADER) | curses.A_DIM)
+    if push_focused:
+        push_attr |= curses.A_REVERSE
+    rows.append((f"  {check}  {push_label}", push_attr, push_focused))
 
-    # After-push chain — its root selector renders at column 2
-    # ("then run after push:") and chained continuations step in
-    # by 2 cols each. Child blocks carry no target_repo and aren't
-    # offered a then-run row, matching _collect_review_focusables.
-    if block.target_repo is not None:
-        for sel, depth in _walk_then_run_chain(block, ""):
-            append_then_run(sel, indent_cols=2 + 2 * depth)
+    # Everything below is an on-push action, indented beneath the toggle
+    # and rendered only while push is on — matching the focusables gate
+    # in `_collect_review_focusables`.
+    if block.push:
+        # Sibling-sync line — informational; describes the push's fan-out.
+        if block.siblings_summary:
+            val_attr = curses.color_pair(PAIR_BRANCH) | curses.A_DIM
+            rows.append(([
+                ("    sync: ", curses.A_DIM),
+                (block.siblings_summary, val_attr),
+            ], curses.A_DIM, False))
+        for tog in block.workflow_toggles:
+            is_focused = (panel_focus == "left" and focus >= 0
+                          and focusables[focus] == (block_idx, "toggle", tog))
+            on = tog.repo.track_workflow.get(tog.workflow_name, False)
+            check = "[x]" if on else "[ ]"
+            text = f"    {check}  track action: {tog.workflow_name}"
+            if on:
+                attr = curses.color_pair(PAIR_OK)
+            else:
+                attr = curses.color_pair(PAIR_HEADER) | curses.A_DIM
+            if is_focused:
+                attr |= curses.A_REVERSE
+            rows.append((text, attr, is_focused))
+            # The then-run chain only shows while the action is tracked —
+            # there's nothing to run "after" an untracked workflow. Base
+            # indent of 6 cols nests its then-runs two columns under the
+            # toggle (at column 4); each chained step adds 2 cols.
+            if on:
+                for sel, depth in _walk_then_run_chain(block,
+                                                       tog.workflow_name):
+                    append_then_run(sel, indent_cols=6 + 2 * depth)
+
+        # After-push chain — its root selector renders at column 4
+        # ("then run after push:"), indented under the push toggle, with
+        # chained continuations stepping in by 2 cols each. Child blocks
+        # carry no target_repo and aren't offered a then-run row,
+        # matching _collect_review_focusables.
+        if block.target_repo is not None:
+            for sel, depth in _walk_then_run_chain(block, ""):
+                append_then_run(sel, indent_cols=4 + 2 * depth)
     return rows
 
 
@@ -1046,7 +1081,12 @@ def _review_hints(focusables: List[Tuple[int, str, object]],
         hints.append(Hint(KEY_UP_DOWN, "select"))
         if 0 <= focus < len(focusables):
             _, kind, obj = focusables[focus]
-            if kind == "suggest":
+            if kind == "push":
+                hints.append(Hint(
+                    KEY_SPACE,
+                    "don't push this commit" if obj.push
+                    else "push this commit"))
+            elif kind == "suggest":
                 hints.append(Hint("←", "suggest message (staged)"))
             elif kind == "lfs":
                 hints.append(Hint(

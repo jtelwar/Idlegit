@@ -1336,6 +1336,7 @@ def commit_worker(state: State, repo: Repo, msg: str,
                   track_workflow: Optional["dict[str, bool]"] = None,
                   then_run_after_push: str = "",
                   then_run_params_after_push: Optional["dict[str, str]"] = None,
+                  push: Optional[bool] = None,
                   ) -> None:
     """Run the full stage / commit / push / sync pipeline for one repo,
     publishing each step into the sidebar. After a successful push, kicks
@@ -1359,7 +1360,11 @@ def commit_worker(state: State, repo: Repo, msg: str,
     own fields are cleared there; this worker reads from the snapshot
     so a re-opened review screen sees an empty state immediately,
     regardless of how far along this worker is in the pipeline. None
-    defaults preserve compatibility for any out-of-tree caller."""
+    defaults preserve compatibility for any out-of-tree caller.
+
+    `push` is the per-commit decision from the review screen's push
+    toggle. None falls back to the workspace's `auto_push` setting, so
+    callers that don't pass it behave exactly as before."""
     name = state.task_repo_label(repo)
     # Early-visibility task so the user sees the panel react the
     # moment review is accepted. Without this, the first per-step
@@ -1387,7 +1392,7 @@ def commit_worker(state: State, repo: Repo, msg: str,
     try:
         _commit_worker_inner(state, repo, msg, lfs_cands, staged_paths,
                              amend, track_workflow, then_run_after_push,
-                             then_run_params_after_push,
+                             then_run_params_after_push, push=push,
                              cancel_event=cancel_event)
         if cancel_event.is_set():
             state.tasks.update(pipeline_task, "warn", "cancelled")
@@ -1404,10 +1409,13 @@ def _commit_worker_inner(state: State, repo: Repo, msg: str,
                          track_workflow: Optional["dict[str, bool]"] = None,
                          then_run_after_push: str = "",
                          then_run_params_after_push: Optional["dict[str, str]"] = None,
+                         push: Optional[bool] = None,
                          cancel_event: "Optional[threading.Event]" = None,
                          ) -> None:
     auto_stage = state.auto_stage
-    auto_push = state.auto_push
+    # `push` is the review screen's per-commit toggle; None means "use
+    # the workspace default" for callers that don't set it.
+    auto_push = state.auto_push if push is None else push
     tasks = state.tasks
     name = state.task_repo_label(repo)
 
@@ -1621,6 +1629,7 @@ def commit_worker_for_child(state: State, parent: Repo, ref: ChildRef,
                             track_workflow: Optional["dict[str, bool]"] = None,
                             then_run_after_push: str = "",
                             then_run_params_after_push: Optional["dict[str, str]"] = None,
+                            push: Optional[bool] = None,
                             ) -> None:
     """Run the stage / commit / push pipeline against `ref.nested_path` —
     the working tree of a nested submodule checkout inside `parent`.
@@ -1658,7 +1667,7 @@ def commit_worker_for_child(state: State, parent: Repo, ref: ChildRef,
         _commit_worker_for_child_inner(
             state, parent, ref, msg, staged_paths, amend,
             track_workflow, then_run_after_push, then_run_params_after_push,
-            cancel_event=cancel_event)
+            push=push, cancel_event=cancel_event)
         if cancel_event.is_set():
             state.tasks.update(pipeline_task, "warn", "cancelled")
         else:
@@ -1677,11 +1686,14 @@ def _commit_worker_for_child_inner(state: State, parent: Repo,
                                    then_run_after_push: str = "",
                                    then_run_params_after_push: Optional["dict[str, str]"]
                                    = None,
+                                   push: Optional[bool] = None,
                                    cancel_event: "Optional[threading.Event]"
                                    = None,
                                    ) -> None:
     auto_stage = state.auto_stage
-    auto_push = state.auto_push
+    # `push` is the review screen's per-commit toggle; None means "use
+    # the workspace default" for callers that don't set it.
+    auto_push = state.auto_push if push is None else push
     tasks = state.tasks
     name = (f"{state.task_repo_label(ref.repo)} "
             f"(in {state.task_repo_label(parent)})")
@@ -1909,7 +1921,7 @@ def kick_off_workers(state: State, blocks: List[ReviewBlock]) -> None:
     repo_plans: List[Tuple[Repo, str, List[LFSCandidate],
                            "dict[str, bool]", bool,
                            "dict[str, bool]", str,
-                           "dict[str, str]"]] = []
+                           "dict[str, str]", bool]] = []
     for repo in state.repos:
         msg = repo.message.strip()
         if not msg:
@@ -1926,6 +1938,9 @@ def kick_off_workers(state: State, blocks: List[ReviewBlock]) -> None:
         repo_cands = list(block.lfs_candidates) if block else []
         staged = dict(block.staged_paths) if block else {}
         amend = bool(block.amend) if block else False
+        # Per-commit push decision from the review screen's toggle;
+        # fall back to the workspace default when there's no block.
+        push = bool(block.push) if block else state.auto_push
         # Snapshot + clear the after-push then-run state. After-
         # workflow chains (`then_run_after_workflow`) are read much
         # later by `_poll_run` and so are NOT cleared here — they
@@ -1939,12 +1954,12 @@ def kick_off_workers(state: State, blocks: List[ReviewBlock]) -> None:
         repo.then_run_after_push = ""
         repo.then_run_params_after_push.clear()
         repo_plans.append((repo, msg, repo_cands, staged, amend,
-                           track_wf, then_push, then_push_params))
+                           track_wf, then_push, then_push_params, push))
 
     child_plans: List[Tuple[Repo, ChildRef, str,
                             "dict[str, bool]", bool,
                             "dict[str, bool]", str,
-                            "dict[str, str]"]] = []
+                            "dict[str, str]", bool]] = []
     for parent in state.repos:
         for ref in parent.children:
             if ref.kind != "submodule":
@@ -1958,6 +1973,7 @@ def kick_off_workers(state: State, blocks: List[ReviewBlock]) -> None:
             block = child_blocks.get(id(ref))
             staged = dict(block.staged_paths) if block else {}
             amend = bool(block.amend) if block else False
+            push = bool(block.push) if block else state.auto_push
             # Submodule child's then-run state lives on `ref.repo`
             # (the canonical) — same snapshot + clear pattern as the
             # top-level branch above.
@@ -1968,7 +1984,7 @@ def kick_off_workers(state: State, blocks: List[ReviewBlock]) -> None:
             ref.repo.then_run_after_push = ""
             ref.repo.then_run_params_after_push.clear()
             child_plans.append((parent, ref, msg, staged, amend,
-                                track_wf, then_push, then_push_params))
+                                track_wf, then_push, then_push_params, push))
 
     if not repo_plans and not child_plans:
         return
@@ -2005,22 +2021,22 @@ def kick_off_workers(state: State, blocks: List[ReviewBlock]) -> None:
 
     workers: List[threading.Thread] = []
     for (repo, msg, repo_cands, staged, amend,
-            track_wf, then_push, then_push_params) in repo_plans:
+            track_wf, then_push, then_push_params, push) in repo_plans:
         w = threading.Thread(
             target=commit_worker,
             args=(state, repo, msg, repo_cands, staged, amend,
-                  track_wf, then_push, then_push_params),
+                  track_wf, then_push, then_push_params, push),
             daemon=True,
         )
         w.start()
         workers.append(w)
 
     for (parent, ref, msg, staged, amend,
-            track_wf, then_push, then_push_params) in child_plans:
+            track_wf, then_push, then_push_params, push) in child_plans:
         w = threading.Thread(
             target=commit_worker_for_child,
             args=(state, parent, ref, msg, staged, amend,
-                  track_wf, then_push, then_push_params),
+                  track_wf, then_push, then_push_params, push),
             daemon=True,
         )
         w.start()

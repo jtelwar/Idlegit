@@ -731,9 +731,13 @@ class ReviewBlock:
     has_origin: bool = False
     upstream: Optional[str] = None
     siblings_summary: str = ""
-    push_summary: str = ""    # rendered "push: yes (sets upstream …)" line
     auto_stage: bool = True
-    auto_push: bool = True
+    # Per-commit push toggle on the review screen. Defaults from the
+    # workspace's `auto_push` setting each time the review opens, but
+    # the user can flip it per block (↑ to the toggle, Space). Drives
+    # both the commit pipeline's push step and whether the push-only
+    # rows (workflow tracking, then-run-after-push, sibling sync) show.
+    push: bool = True
     is_child: bool = False    # True for submodule child blocks
     threshold_mb: int = 0     # LFS threshold for the warning header
     lfs_candidates: "list[LFSCandidate]" = field(default_factory=list)
