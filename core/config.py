@@ -215,6 +215,11 @@ DEFAULT_PREVENT_SMART_SYNC_SILENT_MERGE = False
 # extra keystrokes; flip OFF if a workspace wants the parent commit to
 # stay a manual decision.
 DEFAULT_AUTO_PUSH_SUBMODULE_PARENT = True
+# Initial state of the "remove backup stash" checkbox on the safe-merge
+# final-confirm screen. Default False keeps the pre-merge backup stash
+# (`pre-merge-at-<ts>`) around as a recovery snapshot; flip True to have
+# that checkbox pre-ticked so a successful merge tidies the stash away.
+DEFAULT_AUTO_REMOVE_BACKUP_STASH_AFTER_MERGE = False
 # Task logging — when on, every terminal task transition (ok / fail /
 # warn) appends a line to `task_log_path`. Default off so the file
 # isn't created unless the user opts in. Path defaults to the user
@@ -302,6 +307,8 @@ class Config:
         DEFAULT_PREVENT_SMART_SYNC_SILENT_MERGE)
     default_auto_push_submodule_parent: bool = (
         DEFAULT_AUTO_PUSH_SUBMODULE_PARENT)
+    default_auto_remove_backup_stash_after_merge: bool = (
+        DEFAULT_AUTO_REMOVE_BACKUP_STASH_AFTER_MERGE)
     task_log_enabled: bool = DEFAULT_TASK_LOG_ENABLED
     task_log_path: str = DEFAULT_TASK_LOG_PATH
     task_log_max_lines: int = DEFAULT_TASK_LOG_MAX_LINES
@@ -342,6 +349,8 @@ def load_config() -> Config:
         DEFAULT_PREVENT_SMART_SYNC_SILENT_MERGE)
     default_auto_push_submodule_parent = (
         DEFAULT_AUTO_PUSH_SUBMODULE_PARENT)
+    default_auto_remove_backup_stash_after_merge = (
+        DEFAULT_AUTO_REMOVE_BACKUP_STASH_AFTER_MERGE)
     task_log_enabled = DEFAULT_TASK_LOG_ENABLED
     task_log_path = DEFAULT_TASK_LOG_PATH
     task_log_max_lines = DEFAULT_TASK_LOG_MAX_LINES
@@ -419,6 +428,9 @@ def load_config() -> Config:
             default_auto_push_submodule_parent = cp.getboolean(
                 "idlegit", "default_auto_push_submodule_parent",
                 fallback=DEFAULT_AUTO_PUSH_SUBMODULE_PARENT)
+            default_auto_remove_backup_stash_after_merge = cp.getboolean(
+                "idlegit", "default_auto_remove_backup_stash_after_merge",
+                fallback=DEFAULT_AUTO_REMOVE_BACKUP_STASH_AFTER_MERGE)
             task_log_enabled = cp.getboolean(
                 "idlegit", "task_log_enabled",
                 fallback=DEFAULT_TASK_LOG_ENABLED)
@@ -481,6 +493,8 @@ def load_config() -> Config:
             default_prevent_smart_sync_silent_merge),
         default_auto_push_submodule_parent=(
             default_auto_push_submodule_parent),
+        default_auto_remove_backup_stash_after_merge=(
+            default_auto_remove_backup_stash_after_merge),
         task_log_enabled=task_log_enabled,
         task_log_path=task_log_path,
         task_log_max_lines=max(0, task_log_max_lines),
@@ -574,6 +588,7 @@ WORKSPACE_OVERRIDE_TYPES: "dict[str, str]" = {
     "default_prompt_for_branch": "bool",
     "default_prevent_smart_sync_silent_merge": "bool",
     "default_auto_push_submodule_parent": "bool",
+    "default_auto_remove_backup_stash_after_merge": "bool",
     "suggest_added": "int",
     "suggest_updated": "int",
     "suggest_deleted": "int",
@@ -610,6 +625,8 @@ WORKSPACE_OVERRIDE_TARGETS: "dict[str, str]" = {
     "default_prevent_smart_sync_silent_merge": (
         "prevent_smart_sync_silent_merge"),
     "default_auto_push_submodule_parent": "auto_push_submodule_parent",
+    "default_auto_remove_backup_stash_after_merge": (
+        "auto_remove_backup_stash_after_merge"),
     "suggest_added": "suggest_added",
     "suggest_updated": "suggest_updated",
     "suggest_deleted": "suggest_deleted",
@@ -982,6 +999,8 @@ def apply_workspace_overrides(state, cfg: Config, ws: Workspace) -> None:
         cfg.default_prevent_smart_sync_silent_merge)
     state.auto_push_submodule_parent = (
         cfg.default_auto_push_submodule_parent)
+    state.auto_remove_backup_stash_after_merge = (
+        cfg.default_auto_remove_backup_stash_after_merge)
     state.auto_refresh_on_fs_change = cfg.auto_refresh_on_fs_change
     state.auto_refresh_debounce_ms = cfg.auto_refresh_debounce_ms
     state.fetch_on_manual_refresh = cfg.fetch_on_manual_refresh

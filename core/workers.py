@@ -10,20 +10,24 @@ from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
 
 from .models import (
-    AlignHeadsPrompt, ChildRef, DetachedRecoveryPrompt, LFSCandidate,
-    Repo, ReviewBlock, SmartSyncCheckout, State, Task, Tasks,
+    AlignHeadsPrompt, ChildRef, DetachedRecoveryPrompt,
+    LFSCandidate, Repo, ReviewBlock, SafeMergeScreen,
+    SmartSyncCheckout, State, Task, Tasks,
 )
 from .git_ops import (
-    apply_lfs_tracking, discover_repos, dispatch_workflow, first_line,
+    apply_lfs_tracking, begin_safe_merge, complete_safe_merge_commit,
+    create_named_stash, describe_merge_side, discover_repos,
+    dispatch_workflow, drop_named_stash, first_line,
     get_run_view, gh_available, git, git_cancellable,
-    has_only_submodule_pointer_changes,
+    has_only_submodule_pointer_changes, head_short_info,
     link_siblings, list_branches,
-    list_recent_runs, merge_remote_workflow_states, parse_github_slug,
-    refresh_repo, safe_stage_all, signature_mtime,
+    list_recent_runs, merge_head_sha, merge_remote_workflow_states,
+    parse_github_slug, parse_safe_merge_conflicts,
+    refresh_repo, remaining_conflict_paths, safe_stage_all, signature_mtime,
     suggest_commit_message,
     suggest_commit_message_at, suggest_commit_message_for_paths,
     sync_sibling, sync_subtree, is_safe_ref_arg,
-    working_tree_signature,
+    working_tree_signature, write_conflict_resolution,
     MAX_PARALLEL_GIT_JOBS,
 )
 
@@ -4058,3 +4062,405 @@ def kick_off_check_for_updates(menu) -> None:
             menu.update_check = "failed"
 
     threading.Thread(target=worker, daemon=True).start()
+
+
+# ---------- Safe-merge: stash → merge → resolve → commit → push → sync -----
+#
+# The interactive resolution lives in ui/safe_merge.py; these workers do the
+# git work at each phase boundary and publish every step to the task panel.
+# All Cardinal-Rule safe: see core/git_ops.py's safe-merge section. The only
+# data-discarding step (dropping the backup stash) is gated behind an
+# off-by-default user checkbox on the confirm screen.
+
+
+def _safe_merge_build_decisions(screen: SafeMergeScreen) -> None:
+    """(Re)build the flat ↑/↓ decision list from the parsed files: one
+    entry per text hunk and per whole-file binary pick. Manual files
+    contribute none — they can't be resolved inside the dialog."""
+    decisions: List[Tuple[int, int]] = []
+    for fi, cf in enumerate(screen.files):
+        if cf.kind == "text":
+            for hi in range(len(cf.hunks)):
+                decisions.append((fi, hi))
+        elif cf.kind == "binary":
+            decisions.append((fi, -1))
+    screen.decisions = decisions
+    if screen.focus >= len(decisions):
+        screen.focus = max(0, len(decisions) - 1)
+
+
+def _safe_merge_release_locks(screen: SafeMergeScreen) -> None:
+    """Release the refresh slots claimed for the flow. Idempotent so the
+    confirm worker and the abort path can both call it safely."""
+    if screen.repo_locked and screen.target_repo is not None:
+        screen.target_repo.release_refresh()
+        screen.repo_locked = False
+    if screen.child_locked and screen.target_child is not None:
+        screen.target_child.release_refresh()
+        screen.child_locked = False
+
+
+def _safe_merge_refresh_targets(state: State,
+                                screen: SafeMergeScreen) -> None:
+    """Re-query the affected repo (and rebuild sibling links) so the row
+    icons reflect the post-merge state. Per-repo guarded so a single
+    failing refresh can't strand the teardown."""
+    repo = screen.target_repo
+    if repo is not None:
+        try:
+            refresh_repo(repo)
+        except Exception:  # noqa: BLE001
+            pass
+    if screen.target_parent is not None and screen.target_parent is not repo:
+        try:
+            refresh_repo(screen.target_parent)
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        link_siblings(state.repos, state.subtrees)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def safe_merge_abort(state: State, screen: SafeMergeScreen) -> None:
+    """Tear down after the user dismisses the dialog. Cardinal-Rule safe:
+    we NEVER run `git merge --abort` (it resets the working tree). An
+    in-progress merge is simply left in place — its conflicts stay in the
+    tree and the backup stash is preserved, so the user can finish by hand
+    or re-open safe-merge (which adopts the existing conflicts)."""
+    screen.cancel_event.set()
+    header = screen.header_task
+    if header is not None and header.status not in ("ok", "fail", "warn"):
+        if screen.phase == "confirm":
+            # The merge commit exists; only push/sync was skipped.
+            state.tasks.update(
+                header, "warn", "merge committed — push skipped")
+        elif merge_head_sha(screen.target_path):
+            state.tasks.update(
+                header, "warn",
+                "merge left in progress — re-open safe-merge to finish")
+        else:
+            state.tasks.update(header, "warn", "cancelled")
+    _safe_merge_refresh_targets(state, screen)
+    _safe_merge_release_locks(screen)
+
+
+def kick_off_safe_merge(state: State, *, target_label: str,
+                        target_path: Path,
+                        target_repo: Optional[Repo],
+                        target_parent: Optional[Repo],
+                        target_child: Optional[ChildRef] = None,
+                        merge_ref: str = "",
+                        branch_label: str = "") -> bool:
+    """Open the safe-merge dialog for `target_path`. `merge_ref` is the ref
+    to merge in; pass "" to ADOPT an already in-progress merge (resolve its
+    existing conflicts). Claims the target's refresh slot for the whole
+    flow, builds the screen, and spawns the begin worker. Returns True when
+    the dialog opened (False if the target was busy)."""
+    if target_child is None:
+        target_child = _find_child_at(target_parent, target_path)
+    repo_locked = False
+    child_locked = False
+    if target_repo is not None:
+        repo_locked = target_repo.try_acquire_refresh()
+        if not repo_locked:
+            t = state.tasks.add(f"safe-merge {target_label}: skipped")
+            state.tasks.update(t, "warn", "refresh in progress — try again")
+            return False
+    if target_child is not None:
+        child_locked = target_child.try_acquire_refresh()
+        if not child_locked:
+            if repo_locked and target_repo is not None:
+                target_repo.release_refresh()
+            t = state.tasks.add(f"safe-merge {target_label}: skipped")
+            state.tasks.update(t, "warn", "refresh in progress — try again")
+            return False
+
+    header = state.tasks.add(
+        f"safe-merge {target_label}"
+        + (f": merge {merge_ref}" if merge_ref else ": resolve conflicts"))
+    screen = SafeMergeScreen(
+        target_label=target_label,
+        target_path=target_path,
+        target_repo=target_repo,
+        target_parent=target_parent,
+        target_child=target_child,
+        merge_ref=merge_ref,
+        is_tracked_submodule=(
+            target_child is not None
+            or bool(target_repo is not None and target_repo.siblings)),
+        confirm_remove_stash=state.auto_remove_backup_stash_after_merge,
+        header_task=header,
+        repo_locked=repo_locked,
+        child_locked=child_locked,
+        phase="preparing",
+    )
+    state.tasks.set_meta(
+        header, holds_repo=target_repo, holds_child=target_child)
+    state.safe_merge = screen
+    threading.Thread(
+        target=_safe_merge_begin_worker, args=(state, screen),
+        daemon=True).start()
+    return True
+
+
+def _safe_merge_begin_worker(state: State, screen: SafeMergeScreen) -> None:
+    """Phase 1: (optionally) stash a backup, start the merge, parse the
+    conflicts. For a clean (conflict-free) merge, commit straight away and
+    jump to the confirm screen."""
+    tasks = state.tasks
+    header = screen.header_task
+    path = screen.target_path
+    try:
+        adopting = not screen.merge_ref
+        if not adopting:
+            # Backup stash of the pre-merge working tree. "if possible" —
+            # a clean tree yields nothing to stash and that's fine.
+            stash_name = time.strftime("pre-merge-at-%Y-%m-%d-%H:%M")
+            t = tasks.add("  ↳ backup stash", parent=header)
+            status, detail = create_named_stash(path, stash_name)
+            if status == "created":
+                screen.backup_stash_name = stash_name
+                tasks.update(t, "ok", stash_name)
+            elif status == "empty":
+                tasks.update(t, "ok", "clean tree — nothing to back up")
+            else:
+                tasks.update(t, "fail", detail)
+                screen.error = f"backup stash failed: {detail}"
+                screen.phase = "error"
+                return
+
+            t = tasks.add(f"  ↳ merge {screen.merge_ref}", parent=header)
+            rc, _out, err = begin_safe_merge(path, screen.merge_ref)
+            # rc != 0 is the EXPECTED conflict path; only a hard failure
+            # with no merge actually started is a real error.
+            if rc != 0 and merge_head_sha(path) is None:
+                low = (err or "").lower()
+                if "already up to date" in low:
+                    tasks.update(t, "ok", "already up to date")
+                    screen.error = "already up to date — nothing to merge"
+                else:
+                    tasks.update(t, "fail", first_line(err))
+                    screen.error = f"merge could not start: {first_line(err)}"
+                screen.phase = "error"
+                return
+            tasks.update(
+                t, "ok",
+                "conflicts to resolve" if rc != 0 else "clean merge")
+
+        if screen.cancel_event.is_set():
+            return
+
+        # Describe both sides richly for the version labels.
+        screen.ours = describe_merge_side(path, "HEAD", "ours")
+        screen.theirs = describe_merge_side(
+            path, "MERGE_HEAD", "theirs", branch_label=screen.merge_ref)
+
+        screen.files = parse_safe_merge_conflicts(path)
+        _safe_merge_build_decisions(screen)
+
+        if not screen.files:
+            # Conflict-free merge that's staged and ready — or an adopted
+            # repo that's actually clean. If a merge is in progress, commit
+            # it; otherwise there's nothing to do.
+            if merge_head_sha(path) is not None:
+                _safe_merge_do_commit(state, screen)
+            else:
+                screen.error = "no conflicts and no merge in progress"
+                screen.phase = "error"
+            return
+
+        screen.phase = "resolve"
+    except Exception as e:  # noqa: BLE001
+        screen.error = f"safe-merge failed: {e}"
+        screen.phase = "error"
+        if header is not None:
+            tasks.update(header, "fail", first_line(str(e)))
+
+
+def _safe_merge_do_commit(state: State, screen: SafeMergeScreen) -> None:
+    """Write every chosen resolution, stage it, and create the merge
+    commit. On success, advance to the confirm screen; on a remaining
+    (manual) conflict, drop back to resolve with a clear note."""
+    tasks = state.tasks
+    header = screen.header_task
+    path = screen.target_path
+
+    written = 0
+    for cf in screen.files:
+        if cf.kind == "manual":
+            continue
+        t = tasks.add(f"  ↳ resolve {cf.path}", parent=header)
+        ok, detail = write_conflict_resolution(path, cf)
+        tasks.update(t, "ok" if ok else "fail", detail)
+        if ok:
+            written += 1
+        else:
+            screen.status_note = f"could not write {cf.path}: {detail}"
+            screen.phase = "resolve"
+            return
+
+    remaining = remaining_conflict_paths(path)
+    if remaining:
+        manual = ", ".join(remaining[:3]) + (
+            " …" if len(remaining) > 3 else "")
+        screen.status_note = (
+            f"{len(remaining)} file(s) need manual resolution outside "
+            f"idlegit: {manual}")
+        screen.phase = "resolve"
+        return
+
+    t = tasks.add("  ↳ merge commit", parent=header)
+    rc, _out, err = complete_safe_merge_commit(path)
+    if rc != 0:
+        tasks.update(t, "fail", first_line(err))
+        screen.status_note = f"commit failed: {first_line(err)}"
+        # With no decisions to return to (a conflict-free merge that the
+        # commit step still rejected, e.g. a pre-commit hook) the resolve
+        # view would be empty and confusing — show the dismissable error
+        # screen instead.
+        if not screen.decisions:
+            screen.error = f"merge commit failed: {first_line(err)}"
+            screen.phase = "error"
+        else:
+            screen.phase = "resolve"
+        return
+    sha, subject = head_short_info(path)
+    tasks.update(t, "ok", sha)
+    screen.commit_sha = sha
+    screen.commit_subject = subject
+    screen.confirm_focus = 0
+    screen.phase = "confirm"
+
+
+def kick_off_safe_merge_finalize(state: State,
+                                 screen: SafeMergeScreen) -> None:
+    """Called from the dialog when the user finishes picking sides. Spawns
+    the commit worker (phase → committing → confirm)."""
+    screen.phase = "committing"
+
+    def worker() -> None:
+        try:
+            _safe_merge_do_commit(state, screen)
+        except Exception as e:  # noqa: BLE001
+            screen.status_note = f"commit failed: {e}"
+            screen.phase = "resolve"
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def kick_off_safe_merge_confirm(state: State,
+                                screen: SafeMergeScreen) -> None:
+    """Called from the confirm screen. Pushes the merge commit (if chosen),
+    syncs sibling submodule checkouts + bumps parent pointers (when the
+    target is a tracked submodule), and drops the backup stash (only when
+    the user ticked the box). phase → confirming → done."""
+    screen.phase = "confirming"
+
+    def worker() -> None:
+        tasks = state.tasks
+        header = screen.header_task
+        path = screen.target_path
+        try:
+            pushed = False
+            if screen.confirm_push:
+                pushed = _safe_merge_push(state, screen)
+            if pushed and screen.is_tracked_submodule:
+                _safe_merge_sync_submodule(state, screen)
+            if screen.confirm_remove_stash and screen.backup_stash_name:
+                t = tasks.add("  ↳ drop backup stash", parent=header)
+                ok, detail = drop_named_stash(path, screen.backup_stash_name)
+                tasks.update(t, "ok" if ok else "warn", detail)
+            if header is not None:
+                msg = screen.commit_sha
+                if screen.confirm_push and not pushed:
+                    state.tasks.update(header, "warn", "push failed")
+                else:
+                    state.tasks.update(header, "ok", msg)
+        except Exception as e:  # noqa: BLE001
+            if header is not None:
+                state.tasks.update(header, "fail", first_line(str(e)))
+        finally:
+            _safe_merge_refresh_targets(state, screen)
+            _safe_merge_release_locks(screen)
+            screen.phase = "done"
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def _safe_merge_push(state: State, screen: SafeMergeScreen) -> bool:
+    """Push the merge commit. Plain `git push` (with `--set-upstream`
+    fallback) — never forced. Returns True on success."""
+    tasks = state.tasks
+    header = screen.header_task
+    path = screen.target_path
+    t = tasks.add("  ↳ push", parent=header)
+    rc_b, b_out, _ = git(path, ["branch", "--show-current"])
+    cur_branch = b_out.strip() if rc_b == 0 else ""
+    rc_u, u_out, _ = git(path, [
+        "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
+    has_upstream = rc_u == 0 and bool(u_out.strip())
+    if has_upstream:
+        rc, _, err = git(path, ["push"])
+    elif cur_branch and is_safe_ref_arg(cur_branch):
+        rc, _, err = git(path, ["push", "--set-upstream", "origin", cur_branch])
+    else:
+        tasks.update(t, "fail", "no current branch to push")
+        return False
+    if rc != 0:
+        tasks.update(t, "fail", first_line(err))
+        return False
+    tasks.update(t, "ok")
+    return True
+
+
+def _safe_merge_sync_submodule(state: State,
+                               screen: SafeMergeScreen) -> None:
+    """After a submodule-checkout merge lands and is pushed, fan the new
+    commit out to sibling checkouts and bump the parent gitlink(s) — the
+    same `sync_sibling` + `_cascade_propagate_to_parents` plumbing the
+    commit pipeline uses."""
+    tasks = state.tasks
+    header = screen.header_task
+    child = screen.target_child
+    if child is None:
+        return
+    canonical = child.repo
+    branch = child.branch or canonical.branch
+    if not branch or branch == "(detached)" or not is_safe_ref_arg(branch):
+        t = tasks.add("  ↳ sync siblings (skipped)", parent=header)
+        tasks.update(
+            t, "warn",
+            "submodule on detached HEAD — sync siblings manually")
+        return
+    ref_label = state.task_repo_label(canonical)
+    targets: List[Tuple[str, Path, Optional[Tuple[Repo, Path]]]] = []
+    if not canonical.synthetic:
+        targets.append((f"top-level {ref_label}", canonical.path, None))
+    for other_parent, other_path in canonical.siblings:
+        if other_path == child.nested_path:
+            continue
+        targets.append(
+            (f"{ref_label} in {state.task_repo_label(other_parent)}",
+             other_path, (other_parent, other_path)))
+    for label, target_path, child_pair in targets:
+        t = tasks.add(f"  ↳ sync {label}", parent=header)
+        if child_pair is None:
+            canonical.refreshing = True
+        else:
+            _set_child_ref_refreshing(child_pair[0], child_pair[1], True)
+        try:
+            ok, sync_msg = sync_sibling(target_path, branch)
+        finally:
+            if child_pair is None:
+                canonical.refreshing = False
+            else:
+                _set_child_ref_refreshing(child_pair[0], child_pair[1], False)
+        tasks.update(t, "ok" if ok else "fail", sync_msg)
+
+    if state.auto_push_submodule_parent and canonical.siblings:
+        try:
+            _cascade_propagate_to_parents(state, [canonical])
+        except Exception as e:  # noqa: BLE001
+            t = tasks.add("  ↳ propagate to parents", parent=header)
+            tasks.update(t, "fail", first_line(str(e)))

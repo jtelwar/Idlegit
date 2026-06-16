@@ -46,6 +46,7 @@ from ui import (
     handle_commit_msg_editor_key,
     handle_commit_view_modal_key,
     handle_confirm,
+    handle_safe_merge,
     handle_detached_recovery_prompt_key,
     handle_help_screen_key,
     handle_ssh_keygen_modal_key,
@@ -355,6 +356,24 @@ def _run_main_loop(stdscr, state, title):
                 _set_terminal_title(title)
                 last_title_emitted = title
             last_title_at = now
+
+        # Safe-merge sub-loop: a worker (the branch-picker merge route or
+        # the action menu's "Safe merge…" entry) sets state.safe_merge to
+        # hand the keyboard to the full-screen conflict resolver. Hold
+        # in_safe_merge for its duration so the fs-watcher queues events
+        # instead of refreshing the repo the user is mid-resolving — the
+        # same contract as in_review around the review screen.
+        if state.safe_merge is not None and not state.in_safe_merge:
+            state.in_safe_merge = True
+            try:
+                handle_safe_merge(stdscr, state)
+            finally:
+                state.in_safe_merge = False
+                state.safe_merge = None
+                stdscr.timeout(100)
+                drain_pending_refreshes()
+            continue
+
         draw_main(stdscr, state)
         # Tick the spinner whenever any background work is in flight so
         # animations (sidebar tasks, in-field suggest, in-row refresh) play.
@@ -449,7 +468,8 @@ def _run_main_loop(stdscr, state, title):
         # itself. `drain_pending_refreshes` is a no-op when nothing
         # was queued.
         cur_tasks_running = state.tasks.has_running()
-        if prev_tasks_running and not cur_tasks_running:
+        tasks_just_drained = prev_tasks_running and not cur_tasks_running
+        if tasks_just_drained:
             drain_pending_refreshes()
         prev_tasks_running = cur_tasks_running
 
@@ -459,7 +479,20 @@ def _run_main_loop(stdscr, state, title):
         # time tags ("2m ago") and to re-assert the terminal title; any
         # background worker that adds a task will set anim_running on
         # the next iteration, snapping us back to 10 Hz automatically.
-        stdscr.timeout(100 if anim_running else 1000)
+        #
+        # `tasks_just_drained` forces one extra snappy tick on the
+        # running→idle edge: a worker (smart-sync especially) lands its
+        # final `refresh_repo` + `link_siblings` and only THEN clears its
+        # spinner flags / marks the header task terminal, so on this very
+        # iteration `anim_running` can already be False. Without the
+        # nudge the loop would commit to the 1s timeout and the
+        # freshly-refreshed repo icons wouldn't repaint until the next
+        # idle tick (or a keypress) — the "I have to refresh to see the
+        # true state after a sync" symptom. The commit path dodged this
+        # because its working-tree writes trigger an fs-watcher refresh
+        # that keeps the loop awake; an align-only sync touches no
+        # watched file, so it needs this explicit edge.
+        stdscr.timeout(100 if (anim_running or tasks_just_drained) else 1000)
 
         try:
             key = read_key(stdscr)

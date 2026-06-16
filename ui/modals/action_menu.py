@@ -213,7 +213,16 @@ def _build_main_items(branch_meta,
     has_origin = branch_meta["has_origin"]
     upstream = branch_meta["upstream"]
     merging = branch_meta["merging"]
-    return [
+    items: List[ActionMenuItem] = []
+    # When a merge is already in progress the branch submenu is locked,
+    # so surface the safe-merge resolver at the top level — this is the
+    # discoverable way to step through and finish an existing conflicted
+    # merge (whether idlegit or a bare `git merge` started it).
+    if merging:
+        items.append(ActionMenuItem(
+            id="safe_merge", label="resolve merge conflicts…",
+            enabled=True))
+    items += [
         ActionMenuItem(
             id="fetch", label="fetch (all branches)",
             enabled=has_origin,
@@ -245,6 +254,7 @@ def _build_main_items(branch_meta,
             label=f"remotes ({remote_count})",
             enabled=True, has_submenu=True),
     ]
+    return items
 
 
 def _back_item() -> ActionMenuItem:
@@ -292,6 +302,16 @@ def _build_branch_items(branch_meta) -> List[ActionMenuItem]:
             enabled=(not detached) and (not merging),
             reason=("merging" if merging
                     else ("detached HEAD" if detached else ""))),
+        # Safe-merge: step through conflicts block-by-block, pick a side
+        # per conflict, then commit + (for submodules) sync. Enabled while
+        # merging too — that's when it ADOPTS the in-progress merge and
+        # resolves it ("resolve merge conflicts…").
+        ActionMenuItem(
+            id="safe_merge",
+            label=("resolve merge conflicts…" if merging
+                   else "safe-merge in branch…"),
+            enabled=merging or (not detached),
+            reason=("" if (merging or not detached) else "detached HEAD")),
         ActionMenuItem(
             id="rename_branch", label="rename branch…",
             enabled=(not detached) and (not merging),
@@ -1844,6 +1864,25 @@ def _dispatch_action(state: State, menu: ActionMenu,
     if item.id == "merge_branch":
         from .branch_picker import open_branch_picker
         open_branch_picker(state, mode="merge")
+        return
+    if item.id == "safe_merge":
+        # If a merge is already in progress, adopt it (resolve the existing
+        # conflicts); otherwise let the user pick a branch to safe-merge.
+        from core.git_ops import merge_head_sha
+        if merge_head_sha(menu.target_path) is not None:
+            from core.workers import kick_off_safe_merge
+            kick_off_safe_merge(
+                state,
+                target_label=menu.target_label,
+                target_path=menu.target_path,
+                target_repo=menu.target_repo,
+                target_parent=menu.target_parent,
+                merge_ref="")
+            menu.cancel_event.set()
+            state.action_menu = None
+        else:
+            from .branch_picker import open_branch_picker
+            open_branch_picker(state, mode="safe_merge")
         return
     if item.id == "set_upstream":
         from .branch_picker import open_branch_picker

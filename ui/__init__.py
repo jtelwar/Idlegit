@@ -96,5 +96,6 @@ from .main_loop import (  # noqa: F401  (re-exported public API)
     ensure_cursor_visible,
     handle_confirm,
     handle_main_key,
+    handle_safe_merge,
     handle_task_panel_key,
 )

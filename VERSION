@@ -1,4 +1,12 @@
-0.28.1
+0.29.0
+
+### 0.29.0
+- 2026-06-15: add safe-merge: full-screen conflict resolver — ↑/↓ between conflicts, ←/→ pick ours/theirs (b: both) with rich repo/branch/commit labels, then merge commit + confirm screen (push toggle, off-by-default remove-backup-stash box) and submodule sync. Backs up the working tree to a `pre-merge-at-…` stash first; never runs destructive git ops.
+- 2026-06-15: branch picker "merge" routes divergent merges into safe-merge (clean fast-forwards still use ff_merge); new "safe-merge in branch…" / "resolve merge conflicts…" action-menu entries (the latter adopts an existing conflicted merge).
+- 2026-06-15: config: `default_auto_remove_backup_stash_after_merge` (default false) pre-ticks the safe-merge remove-stash box.
+
+### 0.28.2
+- 2026-06-14: smart-sync: repo icons repaint automatically on completion (extra snappy tick on the tasks-drained edge) instead of waiting for a manual refresh.
 
 ### 0.28.1
 - 2026-06-02: review: an action's then-run row now hides when that action is toggled off.

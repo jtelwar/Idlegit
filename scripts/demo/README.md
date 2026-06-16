@@ -25,9 +25,14 @@ gh auth login                    # for the workspace 3 action trigger
 ### Scripted recording (recommended)
 
 ```sh
-scripts/demo/record.sh                       # writes ./demo.cast
-CAST=takes/take2.cast scripts/demo/record.sh # alternate output path
+scripts/demo/record.sh                       # writes ./idlegit_<VERSION>_demo.cast
+CAST=takes/take2.cast scripts/demo/record.sh # alternate output, no auto-cleanup
 ```
+
+`record.sh` deletes any stale `idlegit_*_demo.cast` in the repo root
+before recording the new one, so only the current version's take ever
+lives at the top level. Override `CAST=...` and the cleanup is skipped —
+useful for keeping comparison takes during iteration.
 
 While it's running, watch live from another terminal:
 

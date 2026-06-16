@@ -13,8 +13,8 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from .models import (
-    ChildRef, CommitEntry, FileChange, FileEntry, LFSCandidate, Repo,
-    SubtreeSpec, TargetState,
+    ChildRef, CommitEntry, ConflictFile, ConflictHunk, FileChange, FileEntry,
+    LFSCandidate, MergeSide, Repo, SubtreeSpec, TargetState,
 )
 
 
@@ -2281,3 +2281,391 @@ def find_lfs_warnings(repo: Repo, auto_stage: bool,
         if not is_lfs:
             warnings.append((path, format_size(size)))
     return warnings
+
+
+# ---------- Safe-merge: conflict-by-conflict resolution -------------------
+#
+# Everything here is Cardinal-Rule safe. We resolve a merge the way a human
+# would by hand: write the *chosen* content into the working-tree file and
+# `git add` it, then `git commit` once the index is clean. We never run
+# `reset --hard`, `checkout --`, `clean`, `rebase`, or force-push, and we
+# never delete a file on the user's behalf (modify/delete conflicts are
+# surfaced as "manual" rather than auto-resolved). The only place safe-merge
+# can discard anything is dropping the *backup stash it created itself*, and
+# only when the user explicitly opts in on the confirm screen.
+
+# Conflict marker prefixes git writes into a conflicted working-tree file.
+_CONFLICT_OURS = "<<<<<<<"
+_CONFLICT_BASE = "|||||||"
+_CONFLICT_SEP = "======="
+_CONFLICT_THEIRS = ">>>>>>>"
+
+
+def merge_head_sha(path: Path) -> Optional[str]:
+    """Short SHA of MERGE_HEAD when a merge is in progress, else None.
+    Lets callers tell an in-progress merge (adopt its conflicts) from a
+    clean tree (start a fresh merge)."""
+    rc, out, _ = git(path, ["rev-parse", "-q", "--verify", "MERGE_HEAD"])
+    if rc == 0 and out.strip():
+        return out.strip()[:12]
+    return None
+
+
+def describe_merge_side(path: Path, ref: str, role: str,
+                        branch_label: str = "") -> MergeSide:
+    """Build a rich label for one side of a merge: branch/ref, short SHA,
+    commit subject, and the origin remote (so conflict versions read as
+    `origin · feature-x @ a1b2c3d` rather than bare ours/theirs)."""
+    side = MergeSide(role=role)
+    if ref and is_safe_ref_arg(ref):
+        rc, out, _ = git(path, ["log", "-1", "--format=%h%x09%s", ref])
+        if rc == 0 and out.strip():
+            bits = out.strip().split("\t", 1)
+            side.short_sha = bits[0].strip()
+            side.subject = (bits[1] if len(bits) > 1 else "").strip()
+    if branch_label:
+        side.branch = branch_label
+    elif role == "ours":
+        rc, out, _ = git(path, ["branch", "--show-current"])
+        side.branch = out.strip() or "(detached)"
+    else:
+        side.branch = ref or "MERGE_HEAD"
+    rc, out, _ = git(path, ["remote", "get-url", "origin"])
+    if rc == 0 and out.strip():
+        side.remote = canonicalize_url(out.strip())
+    return side
+
+
+def head_short_info(path: Path) -> Tuple[str, str]:
+    """(short_sha, subject) of the current HEAD — used to describe the
+    merge commit on the confirm screen after it lands."""
+    rc, out, _ = git(path, ["log", "-1", "--format=%h%x09%s"])
+    if rc == 0 and out.strip():
+        bits = out.strip().split("\t", 1)
+        return bits[0].strip(), (bits[1] if len(bits) > 1 else "").strip()
+    return "", ""
+
+
+def create_named_stash(path: Path, name: str) -> Tuple[str, str]:
+    """Snapshot the working tree (tracked + untracked) into a named stash
+    as a pre-merge backup. Returns `(status, detail)` where status is
+    "created" (a stash was made), "empty" (nothing to stash — clean tree),
+    or "error". Cardinal-Rule safe: a stash preserves both index and
+    worktree state and is fully recoverable via `git stash list`."""
+    if not name or name.startswith("-"):
+        return "error", "unsafe stash name"
+    rc, out, err = git(path, ["stash", "push", "--include-untracked",
+                              "-m", name])
+    if rc != 0:
+        return "error", first_line(err)
+    if "no local changes" in (out + " " + err).lower():
+        return "empty", "nothing to stash"
+    return "created", first_line(out) or name
+
+
+def drop_named_stash(path: Path, name: str) -> Tuple[bool, str]:
+    """Drop the backup stash whose message contains `name`. This is the
+    one data-discarding operation in safe-merge — it is ONLY ever called
+    when the user explicitly ticks the off-by-default "remove backup
+    stash" box on the confirm screen, against a stash safe-merge created
+    itself moments earlier. Returns `(ok, detail-or-ref)`."""
+    for ref, msg in list_stashes(path):
+        if name in msg and not ref.startswith("-"):
+            rc, _, err = git(path, ["stash", "drop", ref])
+            if rc != 0:
+                return False, first_line(err)
+            return True, ref
+    return False, "backup stash not found"
+
+
+def is_fast_forward_merge(path: Path, ref: str) -> bool:
+    """True when merging `ref` into the current branch would fast-forward
+    (HEAD is an ancestor of `ref`). The branch picker uses this to route
+    clean fast-forwards through the simple `ff_merge` action and divergent
+    merges into the safe-merge resolver."""
+    if not is_safe_ref_arg(ref):
+        return False
+    rc, _, _ = git(path, ["merge-base", "--is-ancestor", "HEAD", ref])
+    return rc == 0
+
+
+def begin_safe_merge(path: Path, ref: str) -> Tuple[int, str, str]:
+    """Start a merge of `ref` into the current branch, stopping before the
+    commit so safe-merge controls conflict resolution and the final commit.
+
+    `--no-ff` guarantees a real merge commit (the whole point of the
+    dialog), and `--no-commit` hands control back to us. `diff3` conflict
+    style records the merge-base inside the markers so the UI can show the
+    common ancestor. Returns git's `(rc, out, err)` — rc != 0 on conflicts
+    (expected), 0 for a clean-but-uncommitted merge."""
+    if not is_safe_ref_arg(ref):
+        return 1, "", "unsafe merge ref"
+    return git(path, [
+        "-c", "merge.conflictStyle=diff3",
+        "merge", "--no-ff", "--no-commit", ref,
+    ])
+
+
+def _conflict_stages(repo_path: Path, rel: str) -> "set[int]":
+    """Set of index stages present for a conflicted path (1=base, 2=ours,
+    3=theirs). Distinguishes both-modified (2 & 3) from modify/delete
+    (only one of 2/3)."""
+    stages: "set[int]" = set()
+    rc, out, _ = git(repo_path, ["ls-files", "-u", "-z", "--", rel])
+    if rc != 0:
+        return stages
+    for entry in out.split("\x00"):
+        if "\t" not in entry:
+            continue
+        meta = entry.split("\t", 1)[0].split()
+        if len(meta) >= 3:
+            try:
+                stages.add(int(meta[2]))
+            except ValueError:
+                pass
+    return stages
+
+
+def _read_index_stage_bytes(repo_path: Path, stage: int,
+                            rel: str) -> Optional[bytes]:
+    """Raw bytes of a conflicted path at an index stage (2=ours, 3=theirs).
+    Used to resolve binary/whole-file conflicts by writing the chosen
+    side's exact content — never `checkout --ours/--theirs`, which the
+    Cardinal Rule forbids."""
+    try:
+        p = subprocess.run(
+            ["git", "show", f":{stage}:{rel}"],
+            cwd=str(repo_path), capture_output=True,
+            timeout=DEFAULT_GIT_TIMEOUT_SECONDS, env=_git_env())
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if p.returncode != 0:
+        return None
+    return p.stdout
+
+
+def _is_marker(line: str, prefix: str) -> bool:
+    """True when `line` (line-ending stripped) is a git conflict marker of
+    the given 7-char kind. Git emits the marker as exactly 7 characters
+    (the bare `=======` separator) or 7 characters + a space + a label
+    (`<<<<<<< HEAD`, `>>>>>>> branch`, `||||||| base`). Requiring that 8th
+    char to be a space (or nothing) keeps a content line of all-`=` longer
+    than 7 (e.g. a Markdown H1 underline) from being misread as a
+    separator."""
+    bare = line.rstrip("\r\n")
+    if not bare.startswith(prefix):
+        return False
+    return len(bare) == len(prefix) or bare[len(prefix)] == " "
+
+
+def _parse_conflict_markers(text: str):
+    """Split a conflicted file's text into an ordered rebuild plan.
+
+    Returns `(parts, hunks)` or None when there are no parseable markers
+    (or they're malformed — in which case the caller treats the file as
+    needing manual/binary handling rather than guessing). Lines keep their
+    endings so a resolved file rebuilds byte-for-byte; marker lines are
+    dropped."""
+    lines = text.splitlines(keepends=True)
+    parts: List[Tuple[str, object]] = []
+    hunks: List[ConflictHunk] = []
+    ctx: List[str] = []
+    found = False
+    i = 0
+    n = len(lines)
+
+    while i < n:
+        if _is_marker(lines[i], _CONFLICT_OURS):
+            found = True
+            if ctx:
+                parts.append(("ctx", ctx))
+                ctx = []
+            ours: List[str] = []
+            base: List[str] = []
+            theirs: List[str] = []
+            i += 1
+            while i < n and not (_is_marker(lines[i], _CONFLICT_BASE)
+                                 or _is_marker(lines[i], _CONFLICT_SEP)):
+                ours.append(lines[i])
+                i += 1
+            if i < n and _is_marker(lines[i], _CONFLICT_BASE):
+                i += 1
+                while i < n and not _is_marker(lines[i], _CONFLICT_SEP):
+                    base.append(lines[i])
+                    i += 1
+            if i >= n or not _is_marker(lines[i], _CONFLICT_SEP):
+                return None  # malformed — no separator
+            i += 1  # skip =======
+            while i < n and not _is_marker(lines[i], _CONFLICT_THEIRS):
+                theirs.append(lines[i])
+                i += 1
+            if i >= n or not _is_marker(lines[i], _CONFLICT_THEIRS):
+                return None  # malformed — no closing marker
+            i += 1  # skip >>>>>>>
+            hunks.append(ConflictHunk(ours=ours, theirs=theirs, base=base))
+            parts.append(("hunk", len(hunks) - 1))
+        else:
+            ctx.append(lines[i])
+            i += 1
+    if ctx:
+        parts.append(("ctx", ctx))
+    if not found:
+        return None
+    # Sanity gate: a well-formed conflict has exactly one opening, one
+    # separator, and one closing marker per hunk. If a line of file
+    # *content* legitimately starts with a marker (a doc about git, a diff
+    # fixture), the prefix scan above mis-splits and these counts won't
+    # line up — reject so the caller falls back to a safe whole-file pick
+    # instead of presenting a corrupted hunk view.
+    n_open = sum(1 for ln in lines if _is_marker(ln, _CONFLICT_OURS))
+    n_sep = sum(1 for ln in lines if _is_marker(ln, _CONFLICT_SEP))
+    n_close = sum(1 for ln in lines if _is_marker(ln, _CONFLICT_THEIRS))
+    if not (n_open == n_sep == n_close == len(hunks)):
+        return None
+    return parts, hunks
+
+
+def _classify_conflict(repo_path: Path, rel: str) -> ConflictFile:
+    """Inspect one conflicted path and build its ConflictFile (kind +
+    rebuild plan). Modify/delete and undecodable files are marked
+    "manual" — safe-merge never deletes or force-overwrites them."""
+    cf = ConflictFile(path=rel)
+    stages = _conflict_stages(repo_path, rel)
+    cf.ours_present = 2 in stages
+    cf.theirs_present = 3 in stages
+    if not (cf.ours_present and cf.theirs_present):
+        cf.kind = "manual"
+        if cf.theirs_present and not cf.ours_present:
+            cf.note = "deleted by us, modified by them"
+        elif cf.ours_present and not cf.theirs_present:
+            cf.note = "modified by us, deleted by them"
+        else:
+            cf.note = "rename/special conflict"
+        return cf
+    full = repo_path / rel
+    try:
+        data = full.read_bytes()
+    except OSError as e:
+        cf.kind = "manual"
+        cf.note = f"unreadable: {e}"
+        return cf
+    if b"\x00" in data:
+        cf.kind = "binary"
+        cf.note = "binary file"
+        return cf
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        cf.kind = "binary"
+        cf.note = "non-UTF-8 file"
+        return cf
+    parsed = _parse_conflict_markers(text)
+    if parsed is None:
+        # Both stages exist but no clean markers — treat as a whole-file
+        # pick so the user can still resolve it without us guessing.
+        cf.kind = "binary"
+        cf.note = "no conflict markers"
+        return cf
+    cf.kind = "text"
+    cf.parts, cf.hunks = parsed
+    return cf
+
+
+def parse_safe_merge_conflicts(path: Path) -> List[ConflictFile]:
+    """Enumerate every unmerged path in `path` and classify each into a
+    ConflictFile. Order follows `git status` (stable, alphabetical-ish)."""
+    files: List[ConflictFile] = []
+    rc, out, _ = git(path, ["status", "--porcelain=v1", "-z"])
+    if rc != 0:
+        return files
+    seen: "set[str]" = set()
+    for xy, rel in _iter_porcelain_z_entries(out):
+        if xy in CONFLICT_CODES and rel not in seen:
+            seen.add(rel)
+            files.append(_classify_conflict(path, rel))
+    return files
+
+
+def rebuild_resolved_text(cf: ConflictFile) -> Optional[str]:
+    """Reassemble a text ConflictFile from its parts, substituting each
+    hunk's chosen side. Returns None if any hunk is still undecided."""
+    out: List[str] = []
+    for kind, val in cf.parts:
+        if kind == "ctx":
+            out.extend(val)  # type: ignore[arg-type]
+            continue
+        hunk = cf.hunks[val]  # type: ignore[index]
+        if hunk.choice == "ours":
+            out.extend(hunk.ours)
+        elif hunk.choice == "theirs":
+            out.extend(hunk.theirs)
+        elif hunk.choice == "both":
+            out.extend(hunk.ours)
+            out.extend(hunk.theirs)
+        else:
+            return None
+    return "".join(out)
+
+
+def write_conflict_resolution(repo_path: Path,
+                              cf: ConflictFile) -> Tuple[bool, str]:
+    """Write the user's chosen resolution for one file into the working
+    tree and stage it. Text files rebuild from hunk choices; binary/
+    whole-file picks write the chosen index stage's bytes. Returns
+    `(ok, detail)`. Never touches a "manual" file."""
+    full = repo_path / cf.path
+    if cf.kind == "text":
+        content = rebuild_resolved_text(cf)
+        if content is None:
+            return False, "undecided hunk"
+        try:
+            with full.open("w", encoding="utf-8", newline="") as fh:
+                fh.write(content)
+        except OSError as e:
+            return False, str(e)
+    elif cf.kind == "binary":
+        stage = {"ours": 2, "theirs": 3}.get(cf.whole_choice, 0)
+        if stage == 0:
+            return False, "undecided file"
+        data = _read_index_stage_bytes(repo_path, stage, cf.path)
+        if data is None:
+            return False, "could not read chosen version"
+        try:
+            full.write_bytes(data)
+        except OSError as e:
+            return False, str(e)
+    else:
+        return False, "manual conflict — resolve outside idlegit"
+    rc, _, err = git(repo_path, ["add", "--", cf.path])
+    if rc != 0:
+        return False, first_line(err)
+    return True, ""
+
+
+def remaining_conflict_paths(path: Path) -> List[str]:
+    """Paths still unmerged in the index (stage > 0). Empty when every
+    conflict is resolved — the gate before completing the merge commit."""
+    rc, out, _ = git(path, ["ls-files", "-u", "-z"])
+    if rc != 0:
+        return []
+    seen: List[str] = []
+    for entry in out.split("\x00"):
+        if "\t" not in entry:
+            continue
+        rel = entry.split("\t", 1)[1]
+        if rel and rel not in seen:
+            seen.append(rel)
+    return seen
+
+
+def complete_safe_merge_commit(path: Path,
+                               message: str = "") -> Tuple[int, str, str]:
+    """Finalize the in-progress merge with a commit. Uses git's prepared
+    MERGE_MSG (`--no-edit`) unless an explicit message is given. Refuses
+    if any path is still unmerged. Plain `git commit` — no amend, no
+    history rewrite."""
+    if remaining_conflict_paths(path):
+        return 1, "", "unresolved conflicts remain"
+    if message:
+        return git(path, ["commit", "-m", message])
+    return git(path, ["commit", "--no-edit"])

@@ -9,9 +9,12 @@ from core.workers import (
     _build_recovery_prompt,
     execute_detached_recovery,
     kick_off_bulk_suggest,
+    kick_off_safe_merge_confirm,
+    kick_off_safe_merge_finalize,
     kick_off_suggest_for,
     kick_off_workers,
     refresh_repo_with_remote_state,
+    safe_merge_abort,
 )
 from .colors import PAIR_WARN
 from .geometry import safe_addstr
@@ -36,6 +39,14 @@ from .review import (
     fire_toolbar_action,
     is_toolbar_toggle,
     kick_off_review_files_load,
+)
+from .safe_merge import (
+    all_decided,
+    draw_safe_merge,
+    focus_move,
+    focus_next_undecided,
+    has_manual,
+    set_choice,
 )
 from .mouse import ALT_M, ALT_S, read_key
 from .sidebar import SPINNER_FRAMES
@@ -727,3 +738,114 @@ def handle_confirm(stdscr, state: State) -> None:
     finally:
         for b in blocks:
             b.cancel_event.set()
+
+
+def handle_safe_merge(stdscr, state: State) -> None:
+    """Full-screen safe-merge sub-loop. Drives the conflict resolver
+    (`ui/safe_merge.py`) through its phases:
+
+      preparing → resolve → committing → confirm → confirming → done
+
+    Worker phases animate a spinner and ignore input (a daemon worker owns
+    the git work); the idle phases (resolve / confirm / error) take blocking
+    input. Esc never runs `git merge --abort` — it leaves the merge in
+    place (Cardinal Rule), preserving the backup stash and any conflicts so
+    the user can finish by hand or re-open."""
+    screen = state.safe_merge
+    if screen is None:
+        return
+    worker_phases = ("preparing", "committing", "confirming")
+    while True:
+        if screen.phase == "done":
+            return
+        anim = screen.phase in worker_phases
+        stdscr.timeout(100 if anim else -1)
+        draw_safe_merge(stdscr, state)
+        try:
+            key = read_key(stdscr)
+        except KeyboardInterrupt:
+            safe_merge_abort(state, screen)
+            return
+        if key == -1:
+            if anim:
+                state.spinner_frame = (
+                    state.spinner_frame + 1) % len(SPINNER_FRAMES)
+            continue
+        if key == curses.KEY_RESIZE:
+            continue
+
+        phase = screen.phase
+        if phase in worker_phases:
+            continue  # worker owns the git work — swallow input
+
+        if phase == "error":
+            if key in (27, 10, 13, curses.KEY_ENTER):
+                safe_merge_abort(state, screen)
+                return
+            continue
+
+        if phase == "resolve":
+            if key == 27:  # Esc — leave the merge in progress
+                safe_merge_abort(state, screen)
+                return
+            if key == curses.KEY_UP:
+                focus_move(screen, -1)
+            elif key == curses.KEY_DOWN:
+                focus_move(screen, 1)
+            elif key == curses.KEY_PPAGE:
+                focus_move(screen, -5)
+            elif key == curses.KEY_NPAGE:
+                focus_move(screen, 5)
+            elif key == curses.KEY_LEFT:
+                set_choice(screen, "ours")
+            elif key == curses.KEY_RIGHT:
+                set_choice(screen, "theirs")
+            elif key in (ord("b"), ord("B")):
+                set_choice(screen, "both")
+            elif key == ord(" "):
+                # Cycle the focused pick ours → theirs → ours.
+                if screen.decisions:
+                    fi, hi = screen.decisions[screen.focus]
+                    cur = (screen.files[fi].whole_choice if hi < 0
+                           else screen.files[fi].hunks[hi].choice)
+                    set_choice(screen,
+                               "theirs" if cur == "ours" else "ours")
+            elif key in (10, 13, curses.KEY_ENTER):
+                if not screen.decisions:
+                    screen.status_note = (
+                        "nothing to resolve here — Esc to leave the merge")
+                elif not all_decided(screen):
+                    focus_next_undecided(screen)
+                    screen.status_note = "every conflict needs a choice first"
+                elif has_manual(screen):
+                    screen.status_note = (
+                        "manual conflict(s) remain — resolve them outside "
+                        "idlegit, then re-open safe-merge")
+                else:
+                    kick_off_safe_merge_finalize(state, screen)
+            continue
+
+        if phase == "confirm":
+            if key == 27:  # Esc — keep the merge commit, skip push/sync
+                safe_merge_abort(state, screen)
+                return
+            if key == curses.KEY_UP:
+                screen.confirm_focus = max(0, screen.confirm_focus - 1)
+            elif key == curses.KEY_DOWN:
+                screen.confirm_focus = min(2, screen.confirm_focus + 1)
+            elif key == ord(" "):
+                _safe_merge_toggle_confirm(screen)
+            elif key in (10, 13, curses.KEY_ENTER):
+                if screen.confirm_focus == 2:
+                    kick_off_safe_merge_confirm(state, screen)
+                else:
+                    _safe_merge_toggle_confirm(screen)
+            continue
+
+
+def _safe_merge_toggle_confirm(screen) -> None:
+    """Flip the checkbox the confirm screen's cursor is on."""
+    if screen.confirm_focus == 0:
+        screen.confirm_push = not screen.confirm_push
+    elif screen.confirm_focus == 1 and screen.backup_stash_name:
+        screen.confirm_remove_stash = not screen.confirm_remove_stash

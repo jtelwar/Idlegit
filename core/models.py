@@ -784,6 +784,103 @@ class ReviewBlock:
     cancel_event: threading.Event = field(default_factory=threading.Event)
 
 
+# ---------- Safe-merge conflict resolution --------------------------------
+
+
+@dataclass
+class MergeSide:
+    """Rich description of one side of a merge so conflict versions can be
+    labelled by repo/branch/commit instead of bare ours/theirs. `ours` is
+    the current HEAD; `theirs` is the merged ref (MERGE_HEAD)."""
+    role: str = "ours"        # "ours" | "theirs"
+    branch: str = ""          # branch / ref label (feature-x, origin/main, …)
+    short_sha: str = ""       # abbreviated commit
+    subject: str = ""         # commit subject, single line
+    remote: str = ""          # host/owner/repo display ("" when no remote)
+
+
+@dataclass
+class ConflictHunk:
+    """One `<<<<<<< ======= >>>>>>>` region inside a conflicted text file.
+    Line lists keep their line endings so a resolved file rebuilds
+    byte-for-byte. `choice` stays "" until the user decides — the
+    safe-merge screen refuses to complete while any hunk is undecided."""
+    ours: List[str] = field(default_factory=list)
+    theirs: List[str] = field(default_factory=list)
+    base: List[str] = field(default_factory=list)   # diff3 base; may be empty
+    choice: str = ""          # "" | "ours" | "theirs" | "both"
+
+
+@dataclass
+class ConflictFile:
+    """A single conflicted path plus the plan for rebuilding it.
+
+    `kind`:
+      "text"   — markers parsed; resolve hunk-by-hunk via `hunks`.
+      "binary" — no usable markers but both stages exist; whole-file pick.
+      "manual" — modify/delete, undecodable, or otherwise not auto-resolvable
+                 here. idlegit never deletes or force-overwrites these; the
+                 user resolves them outside and the merge completes once the
+                 index is clean.
+
+    `parts` is the ordered rebuild plan for text files: each element is
+    either `("ctx", [lines])` (verbatim shared lines) or `("hunk", idx)`
+    (index into `hunks`)."""
+    path: str = ""            # repo-relative, forward slashes
+    kind: str = "text"
+    parts: List[Tuple[str, object]] = field(default_factory=list)
+    hunks: List[ConflictHunk] = field(default_factory=list)
+    whole_choice: str = ""    # binary files: "" | "ours" | "theirs"
+    ours_present: bool = True  # index stage 2 (ours) exists
+    theirs_present: bool = True  # index stage 3 (theirs) exists
+    note: str = ""            # human note for manual/binary rows
+
+
+@dataclass
+class SafeMergeScreen:
+    """State for the full-screen safe-merge conflict resolver. Built by the
+    begin-merge worker; consumed by `ui/safe_merge.py`. Mirrors the review
+    screen's shape (a long list the user steps through with ↑/↓)."""
+    target_label: str = ""
+    target_path: Path = field(default_factory=Path)
+    target_repo: Optional[Repo] = None
+    target_parent: Optional[Repo] = None
+    target_child: Optional["ChildRef"] = None
+    merge_ref: str = ""       # ref merged in ("" when adopting an existing merge)
+    ours: MergeSide = field(default_factory=MergeSide)
+    theirs: MergeSide = field(default_factory=MergeSide)
+    files: List[ConflictFile] = field(default_factory=list)
+    # Flat list of decision points: (file_index, hunk_index); hunk_index is
+    # -1 for a whole-file binary pick. Manual files contribute none. ↑/↓
+    # step `focus` through this list.
+    decisions: List[Tuple[int, int]] = field(default_factory=list)
+    focus: int = 0
+    scroll: int = 0
+    backup_stash_name: str = ""   # "" when nothing was stashed
+    # "preparing" while the begin worker runs; "resolve" while picking
+    # sides; "confirm" once the merge commit exists; "done" after the
+    # confirm screen dispatches the completion worker.
+    phase: str = "preparing"
+    status_note: str = ""     # transient line shown under the header
+    error: str = ""
+    # Confirm-screen state (filled once the merge commit is created).
+    commit_sha: str = ""
+    commit_subject: str = ""
+    is_tracked_submodule: bool = False
+    confirm_push: bool = True
+    confirm_remove_stash: bool = False
+    confirm_focus: int = 0    # 0=push 1=remove-stash 2=finish
+    # The sidebar header task this flow's step rows hang under, plus
+    # whether we hold each target's refresh slot (claimed once for the
+    # whole flow, released on completion or abort).
+    header_task: Optional["Task"] = None
+    repo_locked: bool = False
+    child_locked: bool = False
+    # Set when the user dismisses the screen so the begin worker drops its
+    # result instead of mutating a screen that's gone.
+    cancel_event: threading.Event = field(default_factory=threading.Event)
+
+
 # ---------- Action menu + sub-modals --------------------------------------
 
 
@@ -1630,6 +1727,11 @@ class State:
     # submodule gitlink that just got bumped, cascading upward through
     # any grandparents that also become only-submodule-dirty.
     auto_push_submodule_parent: bool = True
+    # Initial state of the "remove backup stash" checkbox on the
+    # safe-merge final-confirm screen. False (default) keeps the
+    # pre-merge `pre-merge-at-<ts>` backup stash as a recovery snapshot;
+    # True pre-ticks the box so a successful merge drops it.
+    auto_remove_backup_stash_after_merge: bool = False
     # Task logging — global (not workspace-scoped). When enabled, every
     # transition of a task to a terminal status (ok/fail/warn) appends a
     # line to `task_log_path`. `task_log_max_lines <= 0` disables the
@@ -1663,6 +1765,12 @@ class State:
     # change-detection).
     fs_watch_ignore: List[str] = field(default_factory=list)
     in_review: bool = False
+    # Held high for the duration of the safe-merge sub-loop, mirroring
+    # `in_review`: the fs-watcher queues events rather than refreshing
+    # rows under a merge the user is mid-resolving. `safe_merge` carries
+    # the screen state while the sub-loop runs (None when not active).
+    in_safe_merge: bool = False
+    safe_merge: Optional["SafeMergeScreen"] = None
     tasks: Tasks = field(default_factory=Tasks)
     spinner_frame: int = 0
     field_cursor: int = 0

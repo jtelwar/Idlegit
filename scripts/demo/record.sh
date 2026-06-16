@@ -14,8 +14,8 @@
 # tested-good, plain Terminal.app fine. Cursor / VS Code embedded
 # terminals render asciinema casts oddly — record from a real terminal).
 #
-#   scripts/demo/record.sh              # produces ./demo.cast
-#   CAST=takes/take3.cast scripts/demo/record.sh   # alternate output
+#   scripts/demo/record.sh                         # ./idlegit_<VERSION>_demo.cast
+#   CAST=takes/take3.cast scripts/demo/record.sh   # override; no auto-cleanup
 #
 # Live-watch the recording in another terminal:
 #   tmux attach -t idlegit-demo
@@ -23,13 +23,29 @@
 set -euo pipefail
 
 SESSION=idlegit-demo
-CAST="${CAST:-demo.cast}"
 COLS="${COLS:-200}"
 ROWS="${ROWS:-50}"
 WORKSPACE_STARTED=0
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 WORKSPACE_SH="$REPO_ROOT/scripts/demo/demo-workspace.sh"
+
+# Default cast filename: idlegit_<version>_demo.cast in the repo root,
+# where <version> is line 1 of ./VERSION. Any stale versioned casts in
+# the repo root are deleted before recording so the directory only ever
+# holds the current version's take. Override with CAST=path/to/foo.cast
+# — your filename wins and the auto-cleanup is skipped.
+DEFAULT_CAST=true
+if [ -n "${CAST:-}" ]; then
+  DEFAULT_CAST=false
+else
+  CAST_VERSION="$(head -n1 "$REPO_ROOT/VERSION" 2>/dev/null | tr -d '[:space:]')"
+  if [ -n "$CAST_VERSION" ]; then
+    CAST="$REPO_ROOT/idlegit_${CAST_VERSION}_demo.cast"
+  else
+    CAST="$REPO_ROOT/demo.cast"
+  fi
+fi
 CAST_PATH="$(cd "$(dirname "$CAST")" 2>/dev/null && pwd)/$(basename "$CAST")"
 
 # ---- output helpers --------------------------------------------------------
@@ -63,6 +79,14 @@ command -v asciinema >/dev/null || die "asciinema not on PATH (brew install asci
 
 if tmux has-session -t "$SESSION" 2>/dev/null; then
   die "tmux session '$SESSION' already exists — kill it first: tmux kill-session -t $SESSION"
+fi
+
+# Clear any stale versioned casts (keep the current one — we'll overwrite
+# it via --overwrite). Anything not matching the exact pattern is left
+# alone (e.g. hand-named takes in subdirs).
+if [ "$DEFAULT_CAST" = "true" ]; then
+  find "$REPO_ROOT" -maxdepth 1 -name 'idlegit_*_demo.cast' \
+    ! -name "$(basename "$CAST")" -delete 2>/dev/null || true
 fi
 
 # ---- build the sandboxed workspace -----------------------------------------

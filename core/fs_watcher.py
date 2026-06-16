@@ -297,9 +297,9 @@ class RepoWatcher:
         logic synchronously without standing up a real debounce thread.
         Called once per debounce settle in production.
 
-        Two queue-not-fire gates here: in_review (drained after the
-        confirm sub-loop exits) and tasks.has_running (drained on the
-        has-running → idle transition in the main loop). Either one
+        Two queue-not-fire gates here: in_review / in_safe_merge (each
+        drained after its sub-loop exits) and tasks.has_running (drained
+        on the has-running → idle transition in the main loop). Either one
         latches the repo into `_pending` so a single refresh fires
         once the blocker clears.
 
@@ -308,7 +308,7 @@ class RepoWatcher:
         `refreshing=True`) doesn't drop the event — its task running
         signal routes the event to the queue and the post-task drain
         catches it."""
-        if self.state.in_review:
+        if self.state.in_review or self.state.in_safe_merge:
             self._manager.mark_pending(self.repo.path)
             return
         if self.state.tasks.has_running():

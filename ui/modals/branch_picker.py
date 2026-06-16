@@ -5,9 +5,10 @@ import curses
 
 from core.models import BranchPicker, State
 from core.git_ops import (
-    is_safe_ref_arg, list_branches, list_remote_tracking_refs,
+    is_fast_forward_merge, is_safe_ref_arg, list_branches,
+    list_remote_tracking_refs,
 )
-from core.workers import kick_off_action
+from core.workers import kick_off_action, kick_off_safe_merge
 
 from ..colors import PAIR_DLG_CYAN, PAIR_DLG_FG
 from ..geometry import (
@@ -68,13 +69,18 @@ def _hints(picker: BranchPicker) -> list:
         return [Hint(KEY_ESC, "back")]
     hints = [Hint(KEY_UP_DOWN, "select")]
     selected_branch = picker.branches[picker.selected]
-    if picker.mode == "merge":
+    if picker.mode in ("merge", "safe_merge"):
         if selected_branch == picker.current:
             hints.append(Hint(KEY_ENTER, "can't merge a branch into itself"))
+        elif picker.mode == "safe_merge":
+            hints.append(Hint(
+                KEY_ENTER,
+                f"safe-merge {selected_branch} into {picker.current}"))
         else:
             hints.append(Hint(
                 KEY_ENTER,
-                f"merge --ff-only {selected_branch} into {picker.current}"))
+                f"merge {selected_branch} into {picker.current} "
+                "(safe-merge if it conflicts)"))
     elif picker.mode == "set_upstream":
         target = picker.current or "current branch"
         hints.append(Hint(
@@ -116,7 +122,7 @@ def open_branch_picker(state: State, mode: str = "switch") -> None:
     else:
         branches, current = list_branches(menu.target_path)
         initial = 0
-        if mode == "merge":
+        if mode in ("merge", "safe_merge"):
             # Default the cursor to the first branch that ISN'T the
             # current one — Enter on a no-op row would just bounce, so
             # picking a useful initial saves a keystroke.
@@ -147,7 +153,9 @@ def _title_lines(picker: BranchPicker, inner_w: int) -> "list[str]":
     (no `task_repo_label` truncation) — long names get their own
     indented line via wrap_label_value, end-truncated only when even
     that doesn't fit."""
-    if picker.mode == "merge":
+    if picker.mode == "safe_merge":
+        label = "Safe-merge in branch"
+    elif picker.mode == "merge":
         label = "Merge in branch"
     elif picker.mode == "set_upstream":
         label = "Set upstream"
@@ -347,11 +355,30 @@ def handle_branch_picker_key(state: State, key: int) -> None:
         return
     if key in (10, 13, curses.KEY_ENTER):
         branch = picker.branches[picker.selected]
-        if picker.mode == "merge":
+        if picker.mode in ("merge", "safe_merge"):
             # Self-merge is a no-op git would refuse anyway — silently
             # consume the keystroke so a stray Enter on the current row
             # doesn't dismiss the modal without doing anything visible.
             if branch == picker.current:
+                return
+            # A clean fast-forward in plain "merge" mode keeps using the
+            # simple ff_merge action; everything else (divergent merge, or
+            # explicit safe-merge mode) goes through the conflict resolver,
+            # which stashes a backup, drives the merge, and lets the user
+            # pick a side per conflict.
+            ff = (picker.mode == "merge"
+                  and is_fast_forward_merge(picker.target_path, branch))
+            if not ff:
+                kick_off_safe_merge(
+                    state,
+                    target_label=picker.target_label,
+                    target_path=picker.target_path,
+                    target_repo=picker.target_repo,
+                    target_parent=picker.target_parent,
+                    target_child=picker.target_child,
+                    merge_ref=branch)
+                state.branch_picker = None
+                state.action_menu = None
                 return
             action_id = "ff_merge"
         elif picker.mode == "set_upstream":
