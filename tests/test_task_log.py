@@ -26,7 +26,7 @@ for _p in (str(_HERE.parent), str(_HERE)):
         sys.path.insert(0, _p)
 
 from core import config, task_log  # noqa: E402
-from core.models import Task, Tasks  # noqa: E402
+from core.runtime.tasks import Task, Tasks  # noqa: E402
 from core.task_log import (  # noqa: E402
     clear_task_log,
     default_task_log_path,
@@ -257,7 +257,7 @@ class TestWireUnwireHelpers(_ResetLoggerCache):
             str(self.tmp), ignore_errors=True))
 
     def _state_with_path(self, enabled: bool = True):
-        from core.models import State
+        from core.state.app import State
         s = State(repos=[], workspace_name="ws")
         s.task_log_enabled = enabled
         s.task_log_path = self.path

@@ -5,17 +5,23 @@ synchronously at startup) and never touch the screen."""
 from __future__ import annotations
 
 import os
+import re
+import signal
 import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
-from .models import (
-    ChildRef, CommitEntry, ConflictFile, ConflictHunk, FileChange, FileEntry,
-    LFSCandidate, MergeSide, Repo, SubtreeSpec, TargetState,
-)
+from core.state.action_target import TargetState
+from .state.action_menu import CommitEntry, FileEntry
+from .state.review import FileChange, LFSCandidate
+from .state.repos import ChildRef, Repo, WorkflowInfo, WorkflowInput
+from .state.safe_merge import ConflictFile, ConflictHunk, MergeSide
+from .state.store import ChildStatusSnapshot, RepoStatusSnapshot
+from .state.workspaces import SubtreeSpec
 
 
 def _find_embedded_gitlinks(base: Path,
@@ -75,6 +81,101 @@ def _iter_porcelain_z_entries(out: str):
                 i += 1
         yield xy, path
 
+
+def _status_xy_from_v2(raw: str) -> str:
+    return raw.replace(".", " ")
+
+
+def _parse_porcelain_v2_z(repo: Repo, out: str) -> None:
+    """Populate branch/upstream/ahead/behind/status fields from v2 status."""
+    parts = out.split("\x00")
+    i = 0
+    while i < len(parts):
+        entry = parts[i]
+        i += 1
+        if not entry:
+            continue
+        if entry.startswith("# "):
+            tokens = entry.split()
+            if len(tokens) >= 3 and tokens[1] == "branch.oid":
+                repo.head = "" if tokens[2] == "(initial)" else tokens[2]
+            elif len(tokens) >= 3 and tokens[1] == "branch.head":
+                repo.branch = tokens[2] or "(detached)"
+            elif len(tokens) >= 3 and tokens[1] == "branch.upstream":
+                repo.upstream = tokens[2]
+            elif len(tokens) >= 4 and tokens[1] == "branch.ab":
+                try:
+                    repo.ahead = int(tokens[2].lstrip("+"))
+                    repo.behind = int(tokens[3].lstrip("-"))
+                except ValueError:
+                    pass
+            continue
+        kind = entry[0]
+        if kind == "?":
+            path = entry[2:] if len(entry) > 2 else ""
+            if path:
+                repo.untracked.append(path)
+            continue
+        if kind == "!":
+            continue
+        if kind == "1":
+            fields = entry.split(" ", 8)
+        elif kind == "2":
+            fields = entry.split(" ", 9)
+        elif kind == "u":
+            fields = entry.split(" ", 10)
+        else:
+            fields = entry.split()
+        if len(fields) < 2:
+            continue
+        xy = _status_xy_from_v2(fields[1])
+        path = fields[-1]
+        if kind == "2" and i < len(parts):
+            # Renames/copies carry an extra original-path token under -z.
+            i += 1
+        if xy in CONFLICT_CODES or kind == "u":
+            repo.merging = True
+            repo.conflict_paths.append(path)
+            continue
+        x, y = xy[0], xy[1]
+        if x != " ":
+            repo.staged.append((x, path))
+        if y != " ":
+            repo.unstaged.append((y, path))
+
+
+def _read_gitmodules_submodules(repo_path: Path) -> List[Tuple[str, Path]]:
+    if not (repo_path / ".gitmodules").exists():
+        return []
+    rc, out, _ = git(repo_path, [
+        "config", "-f", ".gitmodules",
+        "--get-regexp", r"submodule\..+\.(path|url)",
+    ])
+    if rc != 0:
+        return []
+    by_name: Dict[str, Dict[str, str]] = {}
+    for line in out.strip().splitlines():
+        parts = line.split(maxsplit=1)
+        if len(parts) != 2:
+            continue
+        key, value = parts
+        if not key.startswith("submodule."):
+            continue
+        if key.endswith(".path"):
+            name = key[len("submodule."):-len(".path")]
+            by_name.setdefault(name, {})["path"] = value.strip()
+        elif key.endswith(".url"):
+            name = key[len("submodule."):-len(".url")]
+            by_name.setdefault(name, {})["url"] = value.strip()
+    nested: List[Tuple[str, Path]] = []
+    for item in by_name.values():
+        path_str = item.get("path", "")
+        url = item.get("url", "")
+        if not path_str or not url:
+            continue
+        nested.append((canonicalize_url(url), (repo_path / path_str).resolve()))
+    return nested
+
 # .git/<marker> files/dirs that mean a merge-like operation is in progress.
 MERGE_MARKER_FILES = ("MERGE_HEAD", "REBASE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD")
 MERGE_MARKER_DIRS = ("rebase-merge", "rebase-apply")
@@ -120,6 +221,27 @@ def git(path: Path, args: List[str],
     return p.returncode, p.stdout, p.stderr
 
 
+def _signal_process_group(proc: subprocess.Popen, sig: int) -> bool:
+    if hasattr(os, "killpg"):
+        try:
+            os.killpg(proc.pid, sig)
+            return True
+        except OSError:
+            return False
+    return False
+
+
+def _terminate_cancellable_process(proc: subprocess.Popen) -> None:
+    if not _signal_process_group(proc, signal.SIGTERM):
+        proc.terminate()
+
+
+def _kill_cancellable_process(proc: subprocess.Popen) -> None:
+    kill_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
+    if not _signal_process_group(proc, kill_signal):
+        proc.kill()
+
+
 def git_cancellable(
         path: Path, args: List[str],
         cancel_event: "Optional[object]" = None,
@@ -144,37 +266,38 @@ def git_cancellable(
             stderr=subprocess.PIPE,
             text=True,
             env=_git_env(),
+            start_new_session=True,
         )
     except OSError as e:
         return 1, "", str(e)
     deadline = time.monotonic() + timeout
     while True:
         try:
-            rc = proc.wait(timeout=poll_interval)
-            break
+            stdout, stderr = proc.communicate(timeout=poll_interval)
+            return proc.returncode, stdout, stderr
         except subprocess.TimeoutExpired:
             pass
         if cancel_event.is_set():
             # Terminate first (SIGTERM), then kill if it doesn't yield.
-            # Either way, drain pipes via communicate() so the buffers
-            # don't deadlock.
+            err = ""
             try:
-                proc.terminate()
+                _terminate_cancellable_process(proc)
+                _, err = proc.communicate(timeout=2.0)
+            except subprocess.TimeoutExpired:
                 try:
-                    proc.wait(timeout=2.0)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait(timeout=2.0)
+                    _kill_cancellable_process(proc)
+                except OSError:
+                    pass
+                try:
+                    _, err = proc.communicate(timeout=2.0)
+                except (subprocess.TimeoutExpired, OSError):
+                    pass
             except OSError:
                 pass
-            try:
-                _, err = proc.communicate(timeout=1.0)
-            except (subprocess.TimeoutExpired, OSError):
-                err = ""
             return 130, "", err or "cancelled"
         if time.monotonic() > deadline:
             try:
-                proc.kill()
+                _kill_cancellable_process(proc)
             except OSError:
                 pass
             try:
@@ -182,12 +305,6 @@ def git_cancellable(
             except (subprocess.TimeoutExpired, OSError):
                 err = ""
             return 124, "", err or f"git timed out after {timeout:g}s"
-    try:
-        stdout = proc.stdout.read() if proc.stdout is not None else ""
-        stderr = proc.stderr.read() if proc.stderr is not None else ""
-    except OSError:
-        stdout, stderr = "", ""
-    return rc, stdout, stderr
 
 
 def git_bounded_output(path: Path, args: List[str],
@@ -267,132 +384,274 @@ def canonicalize_url(url: str) -> str:
 # ---------- Repo refresh (populates a Repo from git state) -----------------
 
 
-def refresh_repo(repo: Repo) -> None:
-    """Re-query every cached field on a Repo from its working tree."""
-    repo.branch = ""
-    repo.head = ""
-    repo.upstream = None
-    repo.remote_url = None
-    repo.remote_url_raw = None
-    repo.ahead = 0
-    repo.behind = 0
-    repo.staged = []
-    repo.unstaged = []
-    repo.untracked = []
-    # Do NOT clear nested_subs here — link_siblings reads it to build
-    # children rows. A concurrent refresh (fs_watcher while Ctrl+R skips
-    # a locked repo) used to leave nested_subs empty mid-flight and
-    # link_siblings would drop every submodule under that parent.
-    # siblings + children are filled by link_siblings() after refresh.
-    repo.error = ""
-    repo.merging = False
-    repo.conflict_paths = []
-    # GitHub Actions workflows discovered locally — populated near the end
-    # so it's reset even on error paths above.
-    repo.workflows = discover_workflows_local(repo.path)
+@dataclass(frozen=True)
+class RepoRefreshSnapshot:
+    """Typed repo refresh result before temporary projection fields are updated."""
 
-    rc, out, err = git(repo.path, ["rev-parse", "--is-inside-work-tree"])
+    branch: str = ""
+    head: str = ""
+    upstream: Optional[str] = None
+    remote_url: Optional[str] = None
+    remote_url_raw: Optional[str] = None
+    ahead: int = 0
+    behind: int = 0
+    staged: List[Tuple[str, str]] = field(default_factory=list)
+    unstaged: List[Tuple[str, str]] = field(default_factory=list)
+    untracked: List[str] = field(default_factory=list)
+    nested_subs: List[Tuple[str, Path]] = field(default_factory=list)
+    error: str = ""
+    merging: bool = False
+    conflict_paths: List[str] = field(default_factory=list)
+    workflows: List[WorkflowInfo] = field(default_factory=list)
+    workflow_states_hydrated: bool = False
+    message: str = ""
+
+    @property
+    def dirty(self) -> bool:
+        return bool(self.staged or self.unstaged or self.untracked)
+
+    def status_snapshot(self) -> RepoStatusSnapshot:
+        """Return the store-owned status subset for this refresh."""
+        return RepoStatusSnapshot(
+            branch=self.branch,
+            head=self.head,
+            upstream=self.upstream,
+            ahead=self.ahead,
+            behind=self.behind,
+            dirty=self.dirty,
+            message=self.message,
+            error=self.error,
+            merging=self.merging,
+        )
+
+
+@dataclass(frozen=True)
+class ChildRefreshSnapshot:
+    """Typed nested-row refresh result before projection fields are updated."""
+
+    kind: str = ""
+    branch: str = ""
+    head: str = ""
+    upstream: Optional[str] = None
+    ahead: int = 0
+    behind: int = 0
+    dirty: bool = False
+    message: str = ""
+    error: str = ""
+    merging: bool = False
+    in_sync: bool = True
+
+    def status_snapshot(self) -> ChildStatusSnapshot:
+        """Return the store-owned status subset for this refresh."""
+        return ChildStatusSnapshot(
+            kind=self.kind,
+            branch=self.branch,
+            head=self.head,
+            upstream=self.upstream,
+            ahead=self.ahead,
+            behind=self.behind,
+            dirty=self.dirty,
+            message=self.message,
+            error=self.error,
+            merging=self.merging,
+            in_sync=self.in_sync,
+        )
+
+
+def read_repo_refresh_snapshot(repo: Repo, message: str = "") -> RepoRefreshSnapshot:
+    """Query one repo and return a typed refresh snapshot.
+
+    This intentionally mutates only a temporary projection object. The caller
+    publishes ``status_snapshot()`` to the store, then applies the full snapshot
+    to the live ``Repo`` only while projection fields still exist.
+    """
+    previous_workflow_state = {
+        wf.path: wf.state for wf in repo.workflows if wf.state
+    }
+    previous_workflow_paths = {wf.path for wf in repo.workflows}
+    previous_workflow_states_hydrated = repo.workflow_states_hydrated
+    probe = Repo(rel=repo.rel, path=repo.path, message=message)
+    probe.workflows = discover_workflows_local(repo.path)
+    current_workflow_paths = {wf.path for wf in probe.workflows}
+    for wf in probe.workflows:
+        wf.state = previous_workflow_state.get(wf.path, "")
+    probe.workflow_states_hydrated = (
+        previous_workflow_states_hydrated
+        and current_workflow_paths == previous_workflow_paths
+    )
+
+    rc, out, err = git(repo.path, [
+        "status", "--porcelain=v2", "--branch", "-z",
+    ])
     if rc != 0:
-        repo.error = "not a git work tree"
-        return
-
-    rc, out, _ = git(repo.path, ["branch", "--show-current"])
-    repo.branch = out.strip() or "(detached)"
-
-    rc, out, _ = git(repo.path, ["rev-parse", "HEAD"])
-    if rc == 0:
-        repo.head = out.strip()
-
-    rc, out, _ = git(repo.path, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
-    repo.upstream = out.strip() if rc == 0 and out.strip() else None
+        probe.error = (err or "git status failed").strip().splitlines()[0]
+        return _repo_refresh_snapshot_from_probe(probe)
+    _parse_porcelain_v2_z(probe, out)
 
     rc, out, _ = git(repo.path, ["remote", "get-url", "origin"])
     if rc == 0 and out.strip():
-        repo.remote_url_raw = out.strip()
-        repo.remote_url = canonicalize_url(out.strip())
+        probe.remote_url_raw = out.strip()
+        probe.remote_url = canonicalize_url(out.strip())
 
-    if repo.upstream:
-        rc, out, _ = git(repo.path, [
-            "rev-list", "--count", "--left-right",
-            f"{repo.upstream}...HEAD",
-        ])
-        if rc == 0:
-            parts = out.split()
-            if len(parts) == 2:
-                try:
-                    repo.behind = int(parts[0])
-                    repo.ahead = int(parts[1])
-                except ValueError:
-                    pass
-
-    rc, out, err = git(repo.path, ["status", "--porcelain=v1", "-z"])
-    if rc != 0:
-        repo.error = (err or "git status failed").strip().splitlines()[0]
-        return
-    for xy, p in _iter_porcelain_z_entries(out):
-        if xy == "??":
-            repo.untracked.append(p)
-            continue
-        if xy in CONFLICT_CODES:
-            repo.merging = True
-            repo.conflict_paths.append(p)
-            continue
-        x, y = xy[0], xy[1]
-        if x != " ":
-            repo.staged.append((x, p))
-        if y != " ":
-            repo.unstaged.append((y, p))
-
-    # Detect mid-merge / mid-rebase / mid-cherry-pick / mid-revert via .git markers.
     rc, out, _ = git(repo.path, ["rev-parse", "--git-dir"])
     if rc == 0 and out.strip():
         git_dir = Path(out.strip())
         if not git_dir.is_absolute():
             git_dir = (repo.path / git_dir).resolve()
-        if not repo.merging:
+        if not probe.merging:
             for marker in MERGE_MARKER_FILES:
                 if (git_dir / marker).exists():
-                    repo.merging = True
+                    probe.merging = True
                     break
-        if not repo.merging:
+        if not probe.merging:
             for marker in MERGE_MARKER_DIRS:
                 if (git_dir / marker).is_dir():
-                    repo.merging = True
+                    probe.merging = True
                     break
 
-    new_nested_subs: List[Tuple[str, Path]] = []
-    if (repo.path / ".gitmodules").exists():
-        rc, out, _ = git(repo.path, [
-            "config", "-f", ".gitmodules",
-            "--get-regexp", r"submodule\..+\.path",
+    probe.nested_subs = _read_gitmodules_submodules(repo.path)
+
+    if not probe.error and not probe.is_dirty and not probe.merging:
+        probe.message = ""
+    return _repo_refresh_snapshot_from_probe(probe)
+
+
+def apply_repo_refresh_snapshot(repo: Repo, snapshot: RepoRefreshSnapshot) -> None:
+    """Apply a refresh snapshot to the temporary repo projection object."""
+    repo.branch = snapshot.branch
+    repo.head = snapshot.head
+    repo.upstream = snapshot.upstream
+    repo.remote_url = snapshot.remote_url
+    repo.remote_url_raw = snapshot.remote_url_raw
+    repo.ahead = snapshot.ahead
+    repo.behind = snapshot.behind
+    repo.staged = list(snapshot.staged)
+    repo.unstaged = list(snapshot.unstaged)
+    repo.untracked = list(snapshot.untracked)
+    repo.nested_subs = list(snapshot.nested_subs)
+    repo.error = snapshot.error
+    repo.merging = snapshot.merging
+    repo.conflict_paths = list(snapshot.conflict_paths)
+    repo.workflows = list(snapshot.workflows)
+    repo.workflow_states_hydrated = snapshot.workflow_states_hydrated
+
+
+def read_child_refresh_snapshot(
+        ref: ChildRef,
+        message: str = "",
+) -> ChildRefreshSnapshot:
+    """Query one nested checkout and return a typed child refresh snapshot."""
+    head = ""
+    in_sync = True
+    rc, out, _ = git(ref.nested_path, ["rev-parse", "HEAD"])
+    if rc == 0:
+        head = out.strip()
+        if ref.repo.head:
+            in_sync = head == ref.repo.head
+    else:
+        in_sync = False
+
+    rc, out, _ = git(ref.nested_path, ["branch", "--show-current"])
+    branch = (out.strip() or "(detached)") if rc == 0 else ""
+
+    rc, out, _ = git(ref.nested_path, ["status", "--porcelain=v1"])
+    dirty = rc == 0 and bool(out.strip())
+
+    rc, out, _ = git(ref.nested_path, [
+        "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
+    upstream = out.strip() if rc == 0 and out.strip() else None
+    ahead = 0
+    behind = 0
+    if upstream:
+        rc, out, _ = git(ref.nested_path, [
+            "rev-list", "--count", "--left-right",
+            f"{upstream}...HEAD",
         ])
         if rc == 0:
-            for line in out.strip().splitlines():
-                parts = line.split(maxsplit=1)
-                if len(parts) != 2:
-                    continue
-                key, path_str = parts
-                if not key.startswith("submodule.") or not key.endswith(".path"):
-                    continue
-                name = key[len("submodule."):-len(".path")]
-                rc2, url_out, _ = git(repo.path, [
-                    "config", "-f", ".gitmodules",
-                    f"submodule.{name}.url",
-                ])
-                if rc2 != 0 or not url_out.strip():
-                    continue
-                sub_path = (repo.path / path_str.strip()).resolve()
-                new_nested_subs.append(
-                    (canonicalize_url(url_out.strip()), sub_path))
-    repo.nested_subs = new_nested_subs
+            parts = out.split()
+            if len(parts) == 2:
+                try:
+                    behind = int(parts[0])
+                    ahead = int(parts[1])
+                except ValueError:
+                    pass
 
-    # Nothing staged/untracked to commit — drop any queued message so the
-    # UI doesn't keep showing an orphaned draft after refresh (Ctrl+R,
-    # post-commit refresh, etc.). Skip while merge machinery is active —
-    # the tree can look oddly quiet mid-merge without losing the need for
-    # a eventual commit message.
-    if not repo.error and not repo.is_dirty and not repo.merging:
-        repo.message = ""
+    merging = False
+    rc, out, _ = git(ref.nested_path, ["rev-parse", "--git-dir"])
+    if rc == 0 and out.strip():
+        git_dir = Path(out.strip())
+        if not git_dir.is_absolute():
+            git_dir = (ref.nested_path / git_dir).resolve()
+        for marker in MERGE_MARKER_FILES:
+            if (git_dir / marker).exists():
+                merging = True
+                break
+        if not merging:
+            for marker in MERGE_MARKER_DIRS:
+                if (git_dir / marker).is_dir():
+                    merging = True
+                    break
+
+    return ChildRefreshSnapshot(
+        kind=ref.kind,
+        branch=branch,
+        head=head,
+        upstream=upstream,
+        ahead=ahead,
+        behind=behind,
+        dirty=dirty,
+        message=message if dirty or merging else "",
+        error="",
+        merging=merging,
+        in_sync=in_sync,
+    )
+
+
+def apply_child_refresh_snapshot(
+        ref: ChildRef,
+        snapshot: ChildRefreshSnapshot,
+) -> None:
+    """Apply a refresh snapshot to the temporary child projection object."""
+    ref.kind = snapshot.kind
+    ref.branch = snapshot.branch
+    ref.head = snapshot.head
+    ref.upstream = snapshot.upstream
+    ref.ahead = snapshot.ahead
+    ref.behind = snapshot.behind
+    ref.dirty = snapshot.dirty
+    ref.error = snapshot.error
+    ref.merging = snapshot.merging
+    ref.in_sync = snapshot.in_sync
+
+
+def _repo_refresh_snapshot_from_probe(repo: Repo) -> RepoRefreshSnapshot:
+    return RepoRefreshSnapshot(
+        branch=repo.branch,
+        head=repo.head,
+        upstream=repo.upstream,
+        remote_url=repo.remote_url,
+        remote_url_raw=repo.remote_url_raw,
+        ahead=repo.ahead,
+        behind=repo.behind,
+        staged=list(repo.staged),
+        unstaged=list(repo.unstaged),
+        untracked=list(repo.untracked),
+        nested_subs=list(repo.nested_subs),
+        error=repo.error,
+        merging=repo.merging,
+        conflict_paths=list(repo.conflict_paths),
+        workflows=list(repo.workflows),
+        workflow_states_hydrated=repo.workflow_states_hydrated,
+        message=repo.message,
+    )
+
+
+def refresh_repo(repo: Repo) -> None:
+    """Re-query every cached field on a Repo from its working tree."""
+    apply_repo_refresh_snapshot(
+        repo,
+        read_repo_refresh_snapshot(repo, message=repo.message),
+    )
 
 
 # ---------- Discovery + linkage --------------------------------------------
@@ -444,8 +703,39 @@ def discover_repos(workspace: Path) -> List[Repo]:
 _link_siblings_lock = threading.Lock()
 
 
-def link_siblings(repos: List[Repo],
-                  subtrees: Optional[List[SubtreeSpec]] = None) -> None:
+@dataclass(frozen=True)
+class LinkSiblingsSnapshot:
+    """Store-ready sibling/child topology produced by relink."""
+
+    repos: Tuple[Repo, ...]
+    children_by_parent: Dict[int, Tuple[ChildRef, ...]]
+    siblings_by_repo: Dict[int, Tuple[Tuple[Repo, Path], ...]]
+    synthetic_by_url: Dict[str, Repo]
+
+    def children_for(self, parent: Repo) -> List[ChildRef]:
+        """Return the child rows for one parent repo."""
+        return list(self.children_by_parent.get(id(parent), ()))
+
+    def siblings_for(self, repo: Repo) -> List[Tuple[Repo, Path]]:
+        """Return the sibling rows for one repo."""
+        return list(self.siblings_by_repo.get(id(repo), ()))
+
+    def parent_child_pairs(self) -> List[Tuple[Repo, ChildRef]]:
+        """Return every explicit parent/child topology edge."""
+        pairs: List[Tuple[Repo, ChildRef]] = []
+        for parent in self.repos:
+            for child in self.children_by_parent.get(id(parent), ()):
+                pairs.append((parent, child))
+        return pairs
+
+
+def link_siblings(
+        repos: List[Repo],
+        subtrees: Optional[List[SubtreeSpec]] = None,
+        *,
+        busy_child_predicate: Optional[Callable[[ChildRef], bool]] = None,
+        child_message_lookup: Optional[Callable[[ChildRef], str]] = None,
+) -> None:
     """For each tracked repo X, find every other tracked repo Y that
     contains X — either as a nested submodule (auto-detected from
     .gitmodules) or as a subtree (declared in idlegit.conf). Records:
@@ -455,19 +745,107 @@ def link_siblings(repos: List[Repo],
     The workspace root is skipped for submodule auto-discovery (its
     submodules are already top-level rows); subtrees are honored regardless.
 
-    Concurrency: the function takes `_link_siblings_lock` so calls from
-    different supervisor threads serialize. It also builds `children`
-    and `siblings` in local dicts and atomically assigns them at the
-    very end — the older "reset r.children = [], then append" pattern
-    was race-prone (a second caller mid-flight could clear what the
-    first had just appended, then both would interleave-append the same
-    refs, producing duplicates)."""
+    Concurrency: link structure is snapshotted and finally swapped under
+    `_link_siblings_lock`, while the expensive child git probes run
+    outside it. If refresh_repo changes the structure while probes are
+    running, the draft is discarded and rebuilt against the newer
+    structure."""
+    snapshot = read_link_siblings_snapshot(
+        repos,
+        subtrees,
+        busy_child_predicate=busy_child_predicate,
+        child_message_lookup=child_message_lookup,
+    )
+    apply_link_siblings_snapshot(snapshot)
+
+
+def read_link_siblings_snapshot(
+        repos: List[Repo],
+        subtrees: Optional[List[SubtreeSpec]] = None,
+        *,
+        busy_child_predicate: Optional[Callable[[ChildRef], bool]] = None,
+        child_message_lookup: Optional[Callable[[ChildRef], str]] = None,
+) -> LinkSiblingsSnapshot:
+    """Build a complete relink topology without mutating repo projections."""
+    for _ in range(5):
+        with _link_siblings_lock:
+            signature = _link_structure_signature(repos, subtrees)
+            draft = _build_link_siblings_draft(
+                repos,
+                subtrees,
+                busy_child_predicate=busy_child_predicate,
+                child_message_lookup=child_message_lookup,
+            )
+        _populate_child_refs(draft[3])
+        with _link_siblings_lock:
+            if signature != _link_structure_signature(repos, subtrees):
+                continue
+            return _finalized_link_siblings_snapshot(
+                repos,
+                draft,
+                busy_child_predicate=busy_child_predicate,
+                child_message_lookup=child_message_lookup,
+            )
+
+    # Pathological churn fallback: keep the old fully-serialized behavior
+    # for one pass rather than spinning forever.
     with _link_siblings_lock:
-        _link_siblings_locked(repos, subtrees)
+        draft = _build_link_siblings_draft(
+            repos,
+            subtrees,
+            busy_child_predicate=busy_child_predicate,
+            child_message_lookup=child_message_lookup,
+        )
+        _populate_child_refs(draft[3])
+        return _finalized_link_siblings_snapshot(
+            repos,
+            draft,
+            busy_child_predicate=busy_child_predicate,
+            child_message_lookup=child_message_lookup,
+        )
 
 
-def _link_siblings_locked(repos: List[Repo],
-                          subtrees: Optional[List[SubtreeSpec]]) -> None:
+def apply_link_siblings_snapshot(snapshot: LinkSiblingsSnapshot) -> None:
+    """Apply a relink snapshot to temporary row projection fields."""
+    for repo in snapshot.repos:
+        repo.children = snapshot.children_for(repo)
+        repo.siblings = snapshot.siblings_for(repo)
+    for synthetic in snapshot.synthetic_by_url.values():
+        synthetic.siblings = snapshot.siblings_for(synthetic)
+
+
+def _link_structure_signature(
+        repos: List[Repo],
+        subtrees: Optional[List[SubtreeSpec]],
+) -> Tuple[Tuple[object, ...], Tuple[Tuple[str, str, str, str], ...]]:
+    repo_sig = tuple(
+        (
+            id(r),
+            r.remote_url,
+            r.rel,
+            tuple((url, str(path.resolve())) for url, path in r.nested_subs),
+        )
+        for r in repos
+    )
+    subtree_sig = tuple(
+        (spec.name, spec.parent, spec.source, spec.prefix)
+        for spec in (subtrees or [])
+    )
+    return repo_sig, subtree_sig
+
+
+def _build_link_siblings_draft(
+        repos: List[Repo],
+        subtrees: Optional[List[SubtreeSpec]],
+        *,
+        busy_child_predicate: Optional[Callable[[ChildRef], bool]] = None,
+        child_message_lookup: Optional[Callable[[ChildRef], str]] = None,
+) -> Tuple[
+        Dict[int, List[ChildRef]],
+        Dict[int, List[Tuple[Repo, Path]]],
+        Dict[str, Repo],
+        List[ChildRef],
+]:
     url_to_repo = {r.remote_url: r for r in repos if r.remote_url}
     rel_to_repo = {r.rel: r for r in repos}
 
@@ -515,14 +893,12 @@ def _link_siblings_locked(repos: List[Repo],
     # Two side-tables snapshotted from the pre-rebuild children:
     #   prev_submodule_msg — per-child commit message buffer; carried
     #     forward so the review screen doesn't lose what the user typed.
-    #   busy_old_ref — the actual OLD ChildRef instance for any
-    #     submodule whose `refreshing` flag is True (a
-    #     commit_worker_for_child or smart-sync cascade holds the
-    #     `refresh_lock` on it). Rebuilding would mint a fresh
-    #     ChildRef with `refreshing=False` and a brand-new lock,
-    #     which (a) drops the row's spinner mid-push and (b) splits
-    #     the lock identity so the worker holding the OLD lock can't
-    #     interlock with anything that consults the NEW one.
+    #   busy_old_ref — the actual OLD ChildRef instance for any submodule
+    #     the state-aware caller reports as row-busy. Rebuilding would mint
+    #     a fresh ChildRef with no ownership state and a brand-new lock,
+    #     which (a) drops the row's spinner mid-push and (b) splits the lock
+    #     identity so the worker holding the OLD lock can't interlock with
+    #     anything that consults the NEW one.
     prev_submodule_msg: Dict[Tuple[int, str], str] = {}
     busy_old_ref: Dict[Tuple[int, str], ChildRef] = {}
     for parent in repos:
@@ -530,8 +906,9 @@ def _link_siblings_locked(repos: List[Repo],
             if old.kind != "submodule":
                 continue
             nk = (id(parent), str(old.nested_path.resolve()))
-            prev_submodule_msg[nk] = old.message
-            if old.refreshing:
+            prev_submodule_msg[nk] = _child_message(
+                old, child_message_lookup)
+            if busy_child_predicate is not None and busy_child_predicate(old):
                 busy_old_ref[nk] = old
 
     submodule_refs: List[ChildRef] = []
@@ -575,73 +952,87 @@ def _link_siblings_locked(repos: List[Repo],
             new_children[id(parent)].append(ref)
             submodule_refs.append(ref)
 
-    # Populate per-child state (HEAD, branch, dirty + the same
-    # ahead/behind/upstream/merging fields a top-level Repo carries) in
-    # parallel. The result is enough state for `child_state_color` to
-    # paint the row's main dot with the same precedence as a top-level
-    # Repo (dirty / diverged / behind / ahead / no-upstream / clean).
-    def _populate(ref: ChildRef) -> None:
-        rc, out, _ = git(ref.nested_path, ["rev-parse", "HEAD"])
-        if rc == 0:
-            ref.head = out.strip()
-            if ref.repo.head:
-                ref.in_sync = ref.head == ref.repo.head
+    # Subtree references — declared in idlegit.conf.
+    for spec in subtrees or []:
+        parent = rel_to_repo.get(spec.parent)
+        source = rel_to_repo.get(spec.source)
+        if parent is None or source is None or parent is source:
+            continue
+        nested_path = (parent.path / spec.prefix).resolve()
+        ref = ChildRef(repo=source, nested_path=nested_path, kind="subtree")
+        # No cheap drift signal for subtrees; leave in_sync at default True.
+        new_children[id(parent)].append(ref)
+
+    return new_children, new_siblings, synthetic_by_url, submodule_refs
+
+
+def _populate_child_ref(ref: ChildRef) -> None:
+    apply_child_refresh_snapshot(
+        ref,
+        read_child_refresh_snapshot(ref, message=ref.message),
+    )
+
+
+def _populate_child_refs(submodule_refs: List[ChildRef]) -> None:
+    if not submodule_refs:
+        return
+    max_workers = min(len(submodule_refs), MAX_PARALLEL_GIT_JOBS)
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        list(ex.map(_populate_child_ref, submodule_refs))
+
+
+def _child_message(
+        child: ChildRef,
+        child_message_lookup: Optional[Callable[[ChildRef], str]],
+) -> str:
+    if child_message_lookup is None:
+        return child.message
+    return child_message_lookup(child)
+
+
+def _finalized_link_siblings_snapshot(
+        repos: List[Repo],
+        draft: Tuple[
+            Dict[int, List[ChildRef]],
+            Dict[int, List[Tuple[Repo, Path]]],
+            Dict[str, Repo],
+            List[ChildRef],
+        ],
+        *,
+        busy_child_predicate: Optional[Callable[[ChildRef], bool]] = None,
+        child_message_lookup: Optional[Callable[[ChildRef], str]] = None,
+) -> LinkSiblingsSnapshot:
+    new_children, new_siblings, synthetic_by_url, _ = draft
+
+    prev_submodule_msg: Dict[Tuple[int, str], str] = {}
+    busy_old_ref: Dict[Tuple[int, str], ChildRef] = {}
+    for parent in repos:
+        for old in parent.children:
+            if old.kind != "submodule":
+                continue
+            nk = (id(parent), str(old.nested_path.resolve()))
+            prev_submodule_msg[nk] = _child_message(
+                old, child_message_lookup)
+            if busy_child_predicate is not None and busy_child_predicate(old):
+                busy_old_ref[nk] = old
+
+    for parent in repos:
+        reconciled: List[ChildRef] = []
+        for ref in new_children[id(parent)]:
+            if ref.kind != "submodule":
+                reconciled.append(ref)
+                continue
+            nk = (id(parent), str(ref.nested_path.resolve()))
+            busy = busy_old_ref.get(nk)
+            if busy is not None:
+                reconciled.append(busy)
+                continue
+            if ref.dirty or ref.merging:
+                ref.message = prev_submodule_msg.get(nk, ref.message)
             else:
-                # Synthetic canonical — drift gets reconciled in the
-                # post-pass below; default to in-sync until we know
-                # there are 2+ checkouts to compare.
-                ref.in_sync = True
-        else:
-            ref.in_sync = False
-        rc, out, _ = git(ref.nested_path, ["branch", "--show-current"])
-        ref.branch = (out.strip() or "(detached)") if rc == 0 else ""
-        rc, out, _ = git(ref.nested_path, ["status", "--porcelain=v1"])
-        ref.dirty = rc == 0 and bool(out.strip())
-
-        rc, out, _ = git(ref.nested_path, [
-            "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
-        ref.upstream = out.strip() if rc == 0 and out.strip() else None
-        ref.ahead = 0
-        ref.behind = 0
-        if ref.upstream:
-            rc, out, _ = git(ref.nested_path, [
-                "rev-list", "--count", "--left-right",
-                f"{ref.upstream}...HEAD",
-            ])
-            if rc == 0:
-                parts = out.split()
-                if len(parts) == 2:
-                    try:
-                        ref.behind = int(parts[0])
-                        ref.ahead = int(parts[1])
-                    except ValueError:
-                        pass
-
-        # mid-merge / mid-rebase markers in the nested checkout's .git
-        ref.merging = False
-        rc, out, _ = git(ref.nested_path, ["rev-parse", "--git-dir"])
-        if rc == 0 and out.strip():
-            git_dir = Path(out.strip())
-            if not git_dir.is_absolute():
-                git_dir = (ref.nested_path / git_dir).resolve()
-            for marker in MERGE_MARKER_FILES:
-                if (git_dir / marker).exists():
-                    ref.merging = True
-                    break
-            if not ref.merging:
-                for marker in MERGE_MARKER_DIRS:
-                    if (git_dir / marker).is_dir():
-                        ref.merging = True
-                        break
-
-    if submodule_refs:
-        max_workers = min(len(submodule_refs), MAX_PARALLEL_GIT_JOBS)
-        with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            list(ex.map(_populate, submodule_refs))
-
-    for ref in submodule_refs:
-        if not ref.dirty and not ref.merging:
-            ref.message = ""
+                ref.message = ""
+            reconciled.append(ref)
+        new_children[id(parent)] = reconciled
 
     # Drift detection for shared synthetic canonicals: when multiple
     # parents reference the same untracked submodule URL, treat the
@@ -666,31 +1057,22 @@ def _link_siblings_locked(repos: List[Repo],
         for r in sib_refs:
             r.in_sync = bool(r.head) and r.head == chosen
 
-    # Subtree references — declared in idlegit.conf.
-    for spec in subtrees or []:
-        parent = rel_to_repo.get(spec.parent)
-        source = rel_to_repo.get(spec.source)
-        if parent is None or source is None or parent is source:
-            continue
-        nested_path = (parent.path / spec.prefix).resolve()
-        ref = ChildRef(repo=source, nested_path=nested_path, kind="subtree")
-        # No cheap drift signal for subtrees; leave in_sync at default True.
-        new_children[id(parent)].append(ref)
-
     for child_list in new_children.values():
         child_list.sort(
             key=lambda c: (c.kind, c.repo.display_name.lower()))
 
-    # Atomic swap. After this point any reader of `r.children` /
-    # `r.siblings` sees the new snapshot in full. Synthetic Repos
-    # have entries in the dicts too but aren't in `repos`, so they
-    # only get touched if some caller has a direct reference.
-    for r in repos:
-        r.children = new_children[id(r)]
-        r.siblings = new_siblings[id(r)]
-    for synth in synthetic_by_url.values():
-        synth.siblings = new_siblings[id(synth)]
-        # children stays empty for a synthetic — they're leaf nodes.
+    return LinkSiblingsSnapshot(
+        repos=tuple(repos),
+        children_by_parent={
+            parent_id: tuple(children)
+            for parent_id, children in new_children.items()
+        },
+        siblings_by_repo={
+            repo_identity: tuple(siblings)
+            for repo_identity, siblings in new_siblings.items()
+        },
+        synthetic_by_url=dict(synthetic_by_url),
+    )
 
 
 # ---------- Sync helpers ---------------------------------------------------
@@ -752,7 +1134,43 @@ def signature_mtime(repo_path: Path,
     return latest
 
 
-def sync_sibling(sibling_path: Path, branch: str) -> Tuple[bool, str]:
+def _sync_submodule_origin_from_parent(
+        parent_path: Path,
+        sibling_path: Path) -> Tuple[bool, str]:
+    sibling_resolved = sibling_path.resolve()
+    expected_url = ""
+    for url, sub_path in _read_gitmodules_submodules(parent_path):
+        if sub_path == sibling_resolved:
+            expected_url = url
+            break
+    if not expected_url:
+        return True, ""
+
+    rc, out, err = git(sibling_path, ["remote", "get-url", "origin"])
+    if rc != 0:
+        return False, f"origin lookup failed: {first_line(err)}"
+    if canonicalize_url(out.strip()) == expected_url:
+        return True, ""
+
+    try:
+        rel_path = sibling_resolved.relative_to(parent_path.resolve()).as_posix()
+    except ValueError:
+        return False, "submodule path is outside parent"
+    rc, _, err = git(parent_path, ["submodule", "sync", "--", rel_path])
+    if rc != 0:
+        return False, f"submodule sync failed: {first_line(err)}"
+    rc, out, err = git(sibling_path, ["remote", "get-url", "origin"])
+    if rc != 0:
+        return False, f"origin lookup failed after sync: {first_line(err)}"
+    if canonicalize_url(out.strip()) != expected_url:
+        return False, "submodule origin still differs from .gitmodules"
+    return True, "origin synced; "
+
+
+def sync_sibling(
+        sibling_path: Path,
+        branch: str,
+        parent_path: Optional[Path] = None) -> Tuple[bool, str]:
     """Fetch + checkout origin/<branch> in a sibling's nested submodule
     checkout so it lines up with what we just pushed.
 
@@ -765,6 +1183,12 @@ def sync_sibling(sibling_path: Path, branch: str) -> Tuple[bool, str]:
     HEAD before re-running the sync)."""
     if not is_safe_ref_arg(branch):
         return False, f"unsafe branch name: {branch or '(empty)'}"
+    prefix = ""
+    if parent_path is not None:
+        ok, prefix = _sync_submodule_origin_from_parent(
+            parent_path, sibling_path)
+        if not ok:
+            return False, prefix
     rc, _, err = git(sibling_path, ["fetch", "origin"])
     if rc != 0:
         return False, f"fetch failed: {first_line(err)}"
@@ -779,7 +1203,7 @@ def sync_sibling(sibling_path: Path, branch: str) -> Tuple[bool, str]:
     rc, _, err = git(sibling_path, ["checkout", target_ref])
     if rc != 0:
         return False, f"checkout failed: {first_line(err)}"
-    return True, "synced"
+    return True, f"{prefix}synced"
 
 
 # ---------- Safe staging (replacement for `git add -A`) -------------------
@@ -806,26 +1230,32 @@ def list_registered_submodule_paths(repo_path: Path) -> "set[str]":
     return paths
 
 
-def has_only_submodule_pointer_changes(repo_path: Path) -> bool:
-    """True iff every change in `repo_path`'s working tree is a
-    modification to a registered submodule's gitlink. False when the
-    tree is clean (nothing to propagate), when any non-submodule path is
-    dirty, or when any submodule path shows up as a deletion / addition
-    / untracked entry (those need human attention — staging them would
-    rewrite or destroy the gitlink).
+def submodule_pointer_change_paths(repo_path: Path) -> List[str]:
+    """Return registered submodule paths that are pure gitlink changes.
 
-    Smart-sync uses this as a precondition before auto-bumping a
-    parent's submodule pointer after the canonical sync: if the parent
-    has unrelated work in progress, propagation backs off and leaves
-    the user to commit on their own."""
+    Empty means either the tree is clean or propagation is unsafe because
+    unrelated dirt / non-modification submodule state is present."""
     submodule_paths = list_registered_submodule_paths(repo_path)
     if not submodule_paths:
-        return False
-    rc, out, _ = git(repo_path, ["status", "--porcelain=v1", "-z"])
+        return []
+
+    # A submodule checkout with local dirt and a submodule checkout whose
+    # HEAD moved can both appear as ` M path` in porcelain status. Parent
+    # propagation must only touch the parent when nested checkouts are
+    # clean, otherwise a visibly-dirty parent can slip through to commit
+    # and push.
+    rc, out, _ = git(repo_path, [
+        "submodule", "foreach", "--quiet",
+        "git status --porcelain=v1"])
+    if rc != 0 or out.strip():
+        return []
+
+    rc, out, _ = git(repo_path, [
+        "status", "--porcelain=v1", "-z", "--ignore-submodules=dirty"])
     if rc != 0:
-        return False
+        return []
     parts = out.split("\x00")
-    saw_pointer_change = False
+    changed_paths: List[str] = []
     i = 0
     while i < len(parts):
         entry = parts[i]
@@ -841,9 +1271,9 @@ def has_only_submodule_pointer_changes(repo_path: Path) -> bool:
         if xy == "??":
             # Any untracked path means there's non-submodule dirt to
             # worry about; bail without claiming propagation.
-            return False
+            return []
         if path_str not in submodule_paths:
-            return False
+            return []
         # The submodule path must be a pure modification ("M" only —
         # not addition / deletion / typechange / conflict / etc.).
         # Anything else should be human-resolved; auto-committing
@@ -851,11 +1281,63 @@ def has_only_submodule_pointer_changes(repo_path: Path) -> bool:
         # or land mid-merge state.
         x, y = xy[0], xy[1]
         if x not in (" ", "M") or y not in (" ", "M"):
-            return False
+            return []
         if x == " " and y == " ":
-            return False
-        saw_pointer_change = True
-    return saw_pointer_change
+            return []
+        changed_paths.append(path_str)
+
+    if not changed_paths:
+        return []
+
+    raw_changed: List[str] = []
+    for diff_args in (["diff", "--raw", "-z"],
+                      ["diff", "--cached", "--raw", "-z"]):
+        rc, raw, _ = git(repo_path, diff_args)
+        if rc != 0:
+            return []
+        raw_parts = raw.split("\x00")
+        i = 0
+        while i < len(raw_parts):
+            meta = raw_parts[i]
+            i += 1
+            if not meta:
+                continue
+            if i >= len(raw_parts):
+                return []
+            path_str = raw_parts[i]
+            i += 1
+            fields = meta.split()
+            if len(fields) < 5:
+                return []
+            old_mode = fields[0][1:]
+            new_mode = fields[1]
+            status = fields[4]
+            if status.startswith(("R", "C")):
+                i += 1
+                return []
+            if (old_mode != "160000" or new_mode != "160000"
+                    or status != "M" or path_str not in submodule_paths):
+                return []
+            raw_changed.append(path_str)
+
+    if sorted(set(raw_changed)) != sorted(set(changed_paths)):
+        return []
+    return changed_paths
+
+
+def has_only_submodule_pointer_changes(repo_path: Path) -> bool:
+    """True iff every change in `repo_path`'s working tree is a
+    modification to a registered submodule's gitlink. False when the
+    tree is clean (nothing to propagate), when any non-submodule path is
+    dirty, or when any submodule path shows up as a deletion / addition
+    / untracked entry (those need human attention — staging them would
+    rewrite or destroy the gitlink).
+
+    Smart-sync uses this as a precondition before auto-bumping a
+    parent's submodule pointer after the canonical sync: if the parent
+    has unrelated work in progress, propagation backs off and leaves
+    the user to commit on their own."""
+    return bool(submodule_pointer_change_paths(repo_path))
 
 
 def safe_stage_all(repo_path: Path) -> Tuple[bool, str]:
@@ -984,10 +1466,7 @@ def sync_subtree(parent_path: Path, prefix: str,
 
 import fnmatch  # noqa: E402
 import json  # noqa: E402 — section-local convenience
-import re  # noqa: E402
 import shutil  # noqa: E402
-
-from .models import WorkflowInfo, WorkflowInput  # noqa: E402
 
 
 _GH_PATH: Optional[str] = shutil.which("gh")
@@ -2133,9 +2612,9 @@ def _format_suggestion(changes: List[FileChange],
     parts: List[str] = []
     for kind in ("added", "modified", "deleted"):
         cap = caps[kind]
-        if cap <= 0:
+        if cap == 0:
             continue
-        picks = by_kind[kind][:cap]
+        picks = by_kind[kind] if cap < 0 else by_kind[kind][:cap]
         if not picks:
             continue
         names = [Path(c.path).name for c in picks]

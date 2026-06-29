@@ -8,7 +8,8 @@ from __future__ import annotations
 import curses
 from typing import List, Tuple
 
-from core.models import AlignHeadsPrompt, State
+from core.state.app import State
+from core.state.prompts import AlignHeadsPrompt
 
 from ..colors import PAIR_DLG_CYAN, PAIR_DLG_FG
 from ..geometry import (

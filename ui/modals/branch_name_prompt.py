@@ -6,9 +6,11 @@ from __future__ import annotations
 
 import curses
 
-from core.models import BranchNamePrompt, State
-from core.git_ops import git
-from core.workers import kick_off_action
+from core.state.app import State
+from core.state.prompts import BranchNamePrompt
+from features.branch_name_prompt.actions import (
+    handle_branch_name_prompt_key as _handle_branch_name_prompt_key,
+)
 
 from ..colors import PAIR_DLG_CYAN, PAIR_DLG_FG
 from ..geometry import (
@@ -30,12 +32,6 @@ _MODAL_W = 70
 # is likely to want for ergonomic names like "wip/foo-1"). Anything
 # the user types that doesn't match drops on the floor; pasted invalid
 # chars get filtered out.
-_VALID_NAME_CHARS = frozenset(
-    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
-    "0123456789-_./"
-)
-
-
 def _hints(prompt: BranchNamePrompt) -> list:
     name = prompt.typed or prompt.default_name
     if not name or name.startswith("-"):
@@ -52,53 +48,6 @@ def _hints(prompt: BranchNamePrompt) -> list:
         Hint(KEY_ENTER, action),
         Hint(KEY_ESC, "back"),
     ]
-
-
-def open_branch_name_prompt(state: State, mode: str = "save_head") -> None:
-    """Install the prompt onto state.
-
-    `mode == "save_head"` (default): default branch name is
-    `idlegit/wip-<sha8>` so even a panicked Enter is recoverable —
-    every detached-HEAD save lands on a predictable namespace the
-    user can grep / clean up later (`git branch -D idlegit/wip-*`).
-
-    `mode == "rename"`: pre-fills the typed buffer with the current
-    branch name so the user starts from the existing value and
-    edits, rather than retyping from scratch."""
-    menu = state.action_menu
-    if menu is None:
-        return
-    rc, head_out, _ = git(menu.target_path, ["rev-parse", "HEAD"])
-    sha = head_out.strip() if rc == 0 else ""
-    sha8 = sha[:8] if sha else "head"
-    rc, branch_out, _ = git(menu.target_path,
-                            ["branch", "--show-current"])
-    current = branch_out.strip() if rc == 0 else ""
-    if mode == "rename":
-        state.branch_name_prompt = BranchNamePrompt(
-            target_label=menu.target_label,
-            target_path=menu.target_path,
-            target_repo=menu.target_repo,
-            target_parent=menu.target_parent,
-            target_child=menu.target_child,
-            typed=current,
-            default_name=current,
-            head_sha=sha,
-            mode="rename",
-            current_branch=current,
-        )
-    else:
-        state.branch_name_prompt = BranchNamePrompt(
-            target_label=menu.target_label,
-            target_path=menu.target_path,
-            target_repo=menu.target_repo,
-            target_parent=menu.target_parent,
-            target_child=menu.target_child,
-            default_name=f"wip-{sha8}",
-            head_sha=sha,
-            mode="save_head",
-            current_branch=current,
-        )
 
 
 def _title_lines(prompt: BranchNamePrompt, inner_w: int) -> "list[str]":
@@ -178,45 +127,4 @@ def draw_branch_name_prompt(stdscr, state: State, sidebar_x: int) -> None:
 
 
 def handle_branch_name_prompt_key(state: State, key: int) -> None:
-    prompt = state.branch_name_prompt
-    if prompt is None:
-        return
-    if key == 27:  # Esc
-        state.branch_name_prompt = None
-        return
-    if key in (10, 13, curses.KEY_ENTER):
-        name = prompt.typed.strip() or prompt.default_name
-        if not name or name.startswith("-"):
-            return
-        if prompt.mode == "rename":
-            # Rename of the current branch is a no-op when the new
-            # name matches what we already have — silently swallow it
-            # rather than emitting a sidebar fail line.
-            if name == prompt.current_branch:
-                state.branch_name_prompt = None
-                state.action_menu = None
-                return
-            action_id = "rename_branch"
-        else:
-            action_id = "branch_from_head"
-        kick_off_action(
-            state, action_id,
-            target_label=prompt.target_label,
-            target_path=prompt.target_path,
-            target_repo=prompt.target_repo,
-            target_parent=prompt.target_parent,
-            branch_arg=name,
-        )
-        state.branch_name_prompt = None
-        state.action_menu = None
-        return
-    if key in (curses.KEY_BACKSPACE, 127, 8):
-        prompt.typed = prompt.typed[:-1]
-        return
-    # Printable char in the allowlist gets appended.
-    if 32 <= key < 127:
-        ch = chr(key)
-        if not prompt.typed and ch == "-":
-            return
-        if ch in _VALID_NAME_CHARS:
-            prompt.typed += ch
+    _handle_branch_name_prompt_key(state, key)

@@ -19,11 +19,32 @@ import os
 import shutil
 import sys
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional
 
 from core.config import APP_DISPLAY_NAME, VERSION
-from core.models import AppMenu, AppMenuRow, State
-from core.workers import kick_off_check_for_updates
+from core.state.app import State
+from features.app_menu.actions import (
+    AppMenuEffect,
+    handle_app_menu_key as handle_app_menu_key_action,
+)
+from features.app_menu.projection import (
+    ACTION_ADJUST_PERIODIC_REFRESH,
+    ACTION_CLEAR_TASK_LOG,
+    ACTION_CREATE_SSH_KEY,
+    ACTION_CYCLE_AUTO_REMOVE_COMPLETED,
+    ACTION_CYCLE_DEBOUNCE,
+    ACTION_OPEN_HELP,
+    ACTION_OPEN_TASK_LOG,
+    ACTION_SSH_ADD_KEYS,
+    ACTION_TOGGLE_AUTO_REFRESH,
+    ACTION_TOGGLE_SSH_AGENT,
+    ACTION_TOGGLE_TASK_LOG,
+    ACTION_UPDATE_NOW,
+)
+from features.app_menu.session import (
+    open_app_menu_session,
+    tick_app_menu_update_check,  # noqa: F401
+)
 
 from ..colors import (
     PAIR_DLG_CYAN, PAIR_DLG_MAGENTA, PAIR_DLG_OK, PAIR_DLG_FG, PAIR_DLG_FG_HINT_TEXT,
@@ -33,31 +54,9 @@ from ..geometry import (
     safe_addstr, truncate,
 )
 from ..hints import (
-    KEY_ENTER, KEY_ESC, KEY_UP_DOWN, Hint, render_hints,
+    KEY_ENTER, KEY_ESC, KEY_LEFT_RIGHT, KEY_UP_DOWN, Hint, render_hints,
 )
 from ..sidebar import SPINNER_FRAMES
-
-
-# Action ids carried in `attr_name` on app_action rows. Centralised
-# so build / dispatch / hint sites stay aligned via constants rather
-# than free-form strings.
-_ACTION_CHECK_FOR_UPDATES = "check_for_updates"
-_ACTION_UPDATE_NOW = "update_now"
-_ACTION_OPEN_TASK_LOG = "open_task_log"
-_ACTION_CLEAR_TASK_LOG = "clear_task_log"
-_ACTION_TOGGLE_TASK_LOG = "toggle_task_log"
-_ACTION_TOGGLE_AUTO_REFRESH = "toggle_auto_refresh"
-_ACTION_CYCLE_DEBOUNCE = "cycle_auto_refresh_debounce"
-_ACTION_OPEN_HELP = "open_help"
-_ACTION_TOGGLE_SSH_AGENT = "toggle_ssh_agent"
-_ACTION_CREATE_SSH_KEY = "create_ssh_key"
-_ACTION_SSH_ADD_KEYS = "ssh_add_keys"
-
-# Preset debounce values the menu cycles through. The default config
-# value (400 ms) sits in the middle; jumping to a longer setting helps
-# on noisy trees with heavy build artifact churn, jumping shorter buys
-# snappier feedback on quiet repos.
-_DEBOUNCE_PRESETS_MS = (200, 400, 800, 1500)
 
 
 # Modal sizing.
@@ -68,284 +67,8 @@ _PAD_BOTTOM = 1
 _PAD_X = 2
 
 
-# ---------- Version comparison + helpers --------------------------------
-
-
-def _parse_version_tuple(text: str) -> Tuple[int, ...]:
-    """Best-effort `vX.Y.Z[.…]` → tuple of ints. Strips a leading `v`
-    and stops at the first non-version char so `1.2.3-rc1` reads as
-    (1, 2, 3). Empty on failure — caller treats that as "can't tell"
-    and skips the offer-to-update branch."""
-    s = text.strip().lstrip("vV")
-    head: list = []
-    for ch in s:
-        if ch.isdigit() or ch == ".":
-            head.append(ch)
-        else:
-            break
-    parts = "".join(head).split(".")
-    return tuple(int(p) for p in parts if p)
-
-
-def _is_update_available(installed: str, latest: str) -> bool:
-    """True iff `latest` strictly outranks `installed` after parsing."""
-    a = _parse_version_tuple(installed)
-    b = _parse_version_tuple(latest)
-    if not a or not b:
-        return False
-    return a < b
-
-
 def _spinner_glyph(state: State) -> str:
     return SPINNER_FRAMES[state.spinner_frame % len(SPINNER_FRAMES)]
-
-
-# ---------- Row building -------------------------------------------------
-
-
-def _app_section_rows(menu: AppMenu) -> "list[AppMenuRow]":
-    """Build the update-check rows for the top of the menu. The app
-    name + version live in the modal title (rendered separately by
-    `draw_app_menu`), so this section only emits the action /
-    info rows tied to the GitHub release fetch:
-      - idle:        [Check for updates]
-      - checking:    "Checking for updates…" (info)
-      - no_releases: "No releases published yet" / [Check again]
-      - failed:      error info / [Try again]
-      - done:        latest-info /
-                     [Update now] when behind, [Check again]
-                     otherwise.
-    Row count flexes deliberately — the rebuild logic re-anchors
-    the cursor by (kind, attr_name) so the focused row stays sane."""
-    rows: "list[AppMenuRow]" = []
-    if menu.update_check == "idle":
-        rows.append(AppMenuRow(
-            label="Check for updates",
-            attr_name=_ACTION_CHECK_FOR_UPDATES, kind="app_action"))
-    elif menu.update_check == "checking":
-        rows.append(AppMenuRow(
-            label="Checking for updates…",
-            attr_name="", kind="app_info"))
-    elif menu.update_check == "no_releases":
-        # GitHub returns 404 from /releases/latest when the repo
-        # has no published releases yet. Surface this softly —
-        # there's nothing wrong with the user's setup, the upstream
-        # just hasn't cut a release.
-        rows.append(AppMenuRow(
-            label="No releases published yet",
-            attr_name="", kind="app_info"))
-        rows.append(AppMenuRow(
-            label="Check again",
-            attr_name=_ACTION_CHECK_FOR_UPDATES, kind="app_action"))
-    elif menu.update_check == "failed":
-        err = (menu.update_check_error or "unknown error").strip()
-        rows.append(AppMenuRow(
-            label=f"Check failed: {err}",
-            attr_name="", kind="app_info"))
-        rows.append(AppMenuRow(
-            label="Try again",
-            attr_name=_ACTION_CHECK_FOR_UPDATES, kind="app_action"))
-    elif menu.update_check == "done":
-        latest = menu.latest_version or "?"
-        if _is_update_available(VERSION, latest):
-            rows.append(AppMenuRow(
-                label=f"Update available: {latest}",
-                attr_name="", kind="app_info"))
-            rows.append(AppMenuRow(
-                label="Update now",
-                attr_name=_ACTION_UPDATE_NOW, kind="app_action"))
-        else:
-            rows.append(AppMenuRow(
-                label=f"Up to date (latest: {latest})",
-                attr_name="", kind="app_info"))
-            rows.append(AppMenuRow(
-                label="Check again",
-                attr_name=_ACTION_CHECK_FOR_UPDATES, kind="app_action"))
-    # "Help" sits at the bottom of the APPLICATION section regardless
-    # of the update-check state — it's always available, and grouping
-    # it here keeps the related "application-level" rows together
-    # before the spacer + WORKSPACES section.
-    rows.append(AppMenuRow(
-        label="Help",
-        attr_name=_ACTION_OPEN_HELP, kind="app_action"))
-    return rows
-
-
-def _auto_refresh_section_rows(state: State) -> "list[AppMenuRow]":
-    """AUTO REFRESH section: toggle row for the fs-watch feature plus a
-    debounce-cycle row when the feature is on. The debounce row hides
-    when the feature is off so the user isn't tweaking a parameter that
-    doesn't apply — re-enabling brings it back."""
-    on = state.auto_refresh_on_fs_change
-    toggle_label = (
-        "Disable filesystem auto-refresh" if on
-        else "Enable filesystem auto-refresh")
-    rows: "list[AppMenuRow]" = [
-        AppMenuRow(label="AUTO REFRESH", attr_name="", kind="header"),
-        AppMenuRow(label=toggle_label,
-                   attr_name=_ACTION_TOGGLE_AUTO_REFRESH, kind="app_action"),
-    ]
-    if on:
-        rows.append(AppMenuRow(
-            label=f"Debounce: {state.auto_refresh_debounce_ms} ms",
-            attr_name=_ACTION_CYCLE_DEBOUNCE, kind="app_action"))
-    return rows
-
-
-def _ssh_section_rows(state: State) -> "list[AppMenuRow]":
-    from core.ssh import agent_status_label, keys_loaded_label, ssh_tools_status
-
-    tools = ssh_tools_status()
-    on = state.auto_start_ssh_agent
-    toggle_label = (
-        "Disable auto-start ssh-agent" if on
-        else "Enable auto-start ssh-agent")
-    rows: "list[AppMenuRow]" = [
-        AppMenuRow(label="SSH", attr_name="", kind="header"),
-    ]
-    if tools.missing_tools:
-        rows.append(AppMenuRow(
-            label=f"Missing on PATH: {', '.join(tools.missing_tools)}",
-            attr_name="", kind="app_info"))
-    rows.extend([
-        AppMenuRow(
-            label=f"Agent: {agent_status_label()}",
-            attr_name="", kind="app_info"),
-        AppMenuRow(
-            label=f"Keys: {keys_loaded_label()}",
-            attr_name="", kind="app_info"),
-        AppMenuRow(label=toggle_label,
-                   attr_name=_ACTION_TOGGLE_SSH_AGENT, kind="app_action"),
-        AppMenuRow(
-            label="Create GitHub SSH keypair…",
-            attr_name=_ACTION_CREATE_SSH_KEY, kind="app_action"),
-        AppMenuRow(
-            label="Load default keys into agent",
-            attr_name=_ACTION_SSH_ADD_KEYS, kind="app_action"),
-    ])
-    return rows
-
-
-def _task_logging_section_rows(state: State) -> "list[AppMenuRow]":
-    """TASK LOGGING section: read-only status / path / size rows plus
-    Open + Clear actions. Path editing is intentionally not surfaced
-    here — the user edits `task_log_path` in idlegit.conf and restarts
-    (the loader path is one-shot at startup, mirroring the rest of the
-    global config). Size is computed on each build_rows so the value
-    stays current as workers write more lines."""
-    from core.task_log import (
-        format_size, task_log_line_count, task_log_size_bytes,
-    )
-
-    path_text = str(state.task_log_path)
-    size_bytes = task_log_size_bytes(state.task_log_path)
-    if size_bytes <= 0:
-        size_text = "0 B (empty)"
-    else:
-        lines = task_log_line_count(state.task_log_path)
-        size_text = f"{format_size(size_bytes)} ({lines:,} lines)"
-    cap = state.task_log_max_lines
-    cap_text = "unlimited" if cap <= 0 else f"{cap:,} lines"
-    # The toggle row is the section's primary action — the label
-    # describes the next state the action lands in ("Enable…" when
-    # off, "Disable…" when on), so a dedicated "Enabled: yes/no"
-    # info row would just duplicate the same signal.
-    toggle_label = (
-        "Disable task logging" if state.task_log_enabled
-        else "Enable task logging")
-    rows: "list[AppMenuRow]" = [
-        AppMenuRow(label="TASK LOGGING", attr_name="", kind="header"),
-        AppMenuRow(label=toggle_label,
-                   attr_name=_ACTION_TOGGLE_TASK_LOG, kind="app_action"),
-        AppMenuRow(label=f"Path: {path_text}",
-                   attr_name="", kind="app_info"),
-        AppMenuRow(label=f"Size: {size_text}",
-                   attr_name="", kind="app_info"),
-        AppMenuRow(label=f"Max lines: {cap_text}",
-                   attr_name="", kind="app_info"),
-        AppMenuRow(label="Open log file",
-                   attr_name=_ACTION_OPEN_TASK_LOG, kind="app_action"),
-        AppMenuRow(label="Clear log contents",
-                   attr_name=_ACTION_CLEAR_TASK_LOG, kind="app_action"),
-    ]
-    return rows
-
-
-def _workspaces_section_rows(state: State) -> "list[AppMenuRow]":
-    """WORKSPACES section: header, one workspace row per configured
-    workspace (the workspace's index lives in attr_name as a string
-    so the dispatcher can switch by index), and a trailing
-    "+ Create new workspace…" sentinel that opens the creator."""
-    rows: "list[AppMenuRow]" = [
-        AppMenuRow(label="WORKSPACES", attr_name="", kind="header"),
-    ]
-    for i, ws in enumerate(state.workspaces):
-        rows.append(AppMenuRow(
-            label=ws.display_name, attr_name=str(i), kind="workspace"))
-    rows.append(AppMenuRow(
-        label="+ Create new workspace…",
-        attr_name="", kind="create_workspace"))
-    return rows
-
-
-def _build_rows(state: State, menu: AppMenu) -> "list[AppMenuRow]":
-    """Compose the full row list — update-check rows at the top, then
-    WORKSPACES (the main use-case for opening this menu), then
-    TASK LOGGING at the bottom (occasional diagnostic surface). Each
-    section is rebuilt fresh on every call so changes (update-check
-    transitions, workspace add/remove, log size growth) surface
-    without side-effecting state mutations elsewhere."""
-    rows = _app_section_rows(menu)
-    if rows:
-        rows.append(AppMenuRow(label="", attr_name="", kind="spacer"))
-    rows.extend(_workspaces_section_rows(state))
-    rows.append(AppMenuRow(label="", attr_name="", kind="spacer"))
-    rows.extend(_auto_refresh_section_rows(state))
-    rows.append(AppMenuRow(label="", attr_name="", kind="spacer"))
-    rows.extend(_ssh_section_rows(state))
-    rows.append(AppMenuRow(label="", attr_name="", kind="spacer"))
-    rows.extend(_task_logging_section_rows(state))
-    return rows
-
-
-def _is_focusable(row: AppMenuRow) -> bool:
-    """Headers, spacer rows, and app_info rows are read-only chrome;
-    the cursor skips over them so navigation lands on something
-    interactive."""
-    return row.kind not in ("header", "spacer", "app_info")
-
-
-def _first_focusable(rows: "list[AppMenuRow]") -> int:
-    for i, row in enumerate(rows):
-        if _is_focusable(row):
-            return i
-    return 0
-
-
-def _rebuild_rows(state: State) -> None:
-    """Re-derive the row list and keep the cursor on a sensible row.
-    Tries to land on a row matching the previous (kind, attr_name)
-    pair so the focused workspace stays focused after an update-
-    check transition rebuilds the APPLICATION section above it.
-    Falls back to the first focusable row when no match exists
-    (e.g. a workspace was deleted between rebuilds)."""
-    menu = state.app_menu
-    if menu is None:
-        return
-    old_kind = ""
-    old_attr = ""
-    if 0 <= menu.selected < len(menu.rows):
-        old_kind = menu.rows[menu.selected].kind
-        old_attr = menu.rows[menu.selected].attr_name
-    menu.rows = _build_rows(state, menu)
-    new_idx = -1
-    for i, row in enumerate(menu.rows):
-        if row.kind == old_kind and row.attr_name == old_attr:
-            new_idx = i
-            break
-    if new_idx == -1:
-        new_idx = _first_focusable(menu.rows)
-    menu.selected = new_idx
 
 
 # ---------- Open ----------------------------------------------------------
@@ -356,26 +79,12 @@ def open_app_menu(state: State) -> None:
     workspace row so Enter is "stay" by default — the most common
     action (just glance at the menu and Esc) requires zero key
     movement."""
-    if not state.workspaces:
-        # Without any workspaces there's nothing to land on — defer
-        # to the creator wizard directly.
-        from .workspace_creator import open_workspace_creator
+    result = open_app_menu_session(state)
+    if result.open_workspace_creator:
+        from features.workspace_creator.session import open_workspace_creator
         open_workspace_creator(
             state, title="Add workspace",
             intro="Add folder paths to scan for git repos.")
-        return
-    menu = AppMenu()
-    menu.rows = _build_rows(state, menu)
-    # Default selection: the active workspace's row in the
-    # WORKSPACES section so Enter is a no-op "stay".
-    target_attr = str(state.active_workspace_index)
-    selected = _first_focusable(menu.rows)
-    for i, row in enumerate(menu.rows):
-        if row.kind == "workspace" and row.attr_name == target_attr:
-            selected = i
-            break
-    menu.selected = selected
-    state.app_menu = menu
 
 
 # ---------- Hints --------------------------------------------------------
@@ -390,34 +99,39 @@ def _hints(state) -> list:
     if 0 <= menu.selected < len(menu.rows):
         row = menu.rows[menu.selected]
         if row.kind == "app_action":
-            if row.attr_name == _ACTION_UPDATE_NOW:
+            if row.attr_name == ACTION_UPDATE_NOW:
                 hints.append(Hint(KEY_ENTER, "exit + run idlegit-update"))
-            elif row.attr_name == _ACTION_OPEN_TASK_LOG:
+            elif row.attr_name == ACTION_OPEN_TASK_LOG:
                 hints.append(Hint(KEY_ENTER, "open in default app"))
-            elif row.attr_name == _ACTION_CLEAR_TASK_LOG:
+            elif row.attr_name == ACTION_CLEAR_TASK_LOG:
                 hints.append(Hint(KEY_ENTER, "truncate log file"))
-            elif row.attr_name == _ACTION_OPEN_HELP:
+            elif row.attr_name == ACTION_OPEN_HELP:
                 hints.append(Hint(KEY_ENTER, "open help"))
-            elif row.attr_name == _ACTION_TOGGLE_TASK_LOG:
+            elif row.attr_name == ACTION_TOGGLE_TASK_LOG:
                 hints.append(Hint(
                     KEY_ENTER,
                     "disable + save" if state.task_log_enabled
                     else "enable + save"))
-            elif row.attr_name == _ACTION_TOGGLE_AUTO_REFRESH:
+            elif row.attr_name == ACTION_TOGGLE_AUTO_REFRESH:
                 hints.append(Hint(
                     KEY_ENTER,
                     "disable + save" if state.auto_refresh_on_fs_change
                     else "enable + save"))
-            elif row.attr_name == _ACTION_CYCLE_DEBOUNCE:
+            elif row.attr_name == ACTION_CYCLE_DEBOUNCE:
                 hints.append(Hint(KEY_ENTER, "cycle preset + save"))
-            elif row.attr_name == _ACTION_TOGGLE_SSH_AGENT:
+            elif row.attr_name == ACTION_ADJUST_PERIODIC_REFRESH:
+                hints.append(Hint(KEY_LEFT_RIGHT, "adjust seconds"))
+                hints.append(Hint(KEY_ENTER, "toggle off/default"))
+            elif row.attr_name == ACTION_CYCLE_AUTO_REMOVE_COMPLETED:
+                hints.append(Hint(KEY_ENTER, "cycle interval + save"))
+            elif row.attr_name == ACTION_TOGGLE_SSH_AGENT:
                 hints.append(Hint(
                     KEY_ENTER,
                     "disable + save" if state.auto_start_ssh_agent
                     else "enable + save"))
-            elif row.attr_name == _ACTION_CREATE_SSH_KEY:
+            elif row.attr_name == ACTION_CREATE_SSH_KEY:
                 hints.append(Hint(KEY_ENTER, "create keypair"))
-            elif row.attr_name == _ACTION_SSH_ADD_KEYS:
+            elif row.attr_name == ACTION_SSH_ADD_KEYS:
                 hints.append(Hint(KEY_ENTER, "ssh-add default keys"))
             else:
                 hints.append(Hint(KEY_ENTER, "check for updates"))
@@ -435,275 +149,6 @@ def _hints(state) -> list:
             hints.append(Hint(KEY_ENTER, "create new workspace…"))
     hints.append(Hint(KEY_ESC, "close"))
     return hints
-
-
-# ---------- Update check tick + action dispatch -------------------------
-
-
-def tick_app_menu_update_check(state: State) -> bool:
-    """Sync the menu's row list with the latest update-check state.
-    The fetch worker writes back onto the AppMenu directly; this
-    tick rebuilds rows whenever `update_check` drifts from the
-    value last baked in (`update_check_rendered`), so a
-    `checking → done` transition surfaces immediately. Returns
-    True iff the worker is still in flight, so the main loop keeps
-    the spinner ticking."""
-    menu = state.app_menu
-    if menu is None:
-        return False
-    if menu.update_check != menu.update_check_rendered:
-        menu.update_check_rendered = menu.update_check
-        _rebuild_rows(state)
-    return menu.update_check == "checking"
-
-
-def _fire_app_action(state: State, action_id: str) -> None:
-    """Dispatch on the focused `app_action` row's id. Centralised so
-    the build / dispatch layers stay aligned via the `_ACTION_*`
-    constants — adding a new action is one branch here plus a row
-    in `_app_section_rows`."""
-    menu = state.app_menu
-    if menu is None:
-        return
-    if action_id == _ACTION_CHECK_FOR_UPDATES:
-        kick_off_check_for_updates(menu)
-        _rebuild_rows(state)
-        return
-    if action_id == _ACTION_UPDATE_NOW:
-        _exec_idlegit_update()
-        return
-    if action_id == _ACTION_OPEN_TASK_LOG:
-        _fire_open_task_log(state)
-        return
-    if action_id == _ACTION_CLEAR_TASK_LOG:
-        _fire_clear_task_log(state)
-        return
-    if action_id == _ACTION_TOGGLE_TASK_LOG:
-        _fire_toggle_task_log(state)
-        return
-    if action_id == _ACTION_TOGGLE_AUTO_REFRESH:
-        _fire_toggle_auto_refresh(state)
-        return
-    if action_id == _ACTION_CYCLE_DEBOUNCE:
-        _fire_cycle_debounce(state)
-        return
-    if action_id == _ACTION_TOGGLE_SSH_AGENT:
-        _fire_toggle_ssh_agent(state)
-        return
-    if action_id == _ACTION_CREATE_SSH_KEY:
-        _fire_create_ssh_key(state)
-        return
-    if action_id == _ACTION_SSH_ADD_KEYS:
-        _fire_ssh_add_keys(state)
-        return
-    if action_id == _ACTION_OPEN_HELP:
-        # Close the app menu first so the help screen owns the modal
-        # stack — opening it on top of the menu would leave the
-        # menu's row chrome bleeding through underneath the help
-        # panes on tight terminal geometries.
-        from .help import open_help_screen
-        state.app_menu = None
-        open_help_screen(state)
-        return
-
-
-def _fire_toggle_task_log(state: State) -> None:
-    """Flip `state.task_log_enabled` and persist the change to
-    idlegit.conf so it survives a restart. Wires / unwires the sink on
-    `state.tasks.on_finished` to match — enabling also touches the log
-    file so the very next "Open log file" lands on something real,
-    rather than reporting "does not exist yet" until the first task
-    finishes."""
-    from core.config import set_conf_value
-    from core.task_log import unwire_task_log, wire_task_log
-
-    new_enabled = not state.task_log_enabled
-    state.task_log_enabled = new_enabled
-    if new_enabled:
-        wire_task_log(state)
-    else:
-        unwire_task_log(state)
-
-    t = state.tasks.add(
-        "enable task logging" if new_enabled else "disable task logging")
-    if set_conf_value("task_log_enabled",
-                       "true" if new_enabled else "false"):
-        state.tasks.update(
-            t, "ok",
-            "logging on" if new_enabled else "logging off")
-    else:
-        state.tasks.update(
-            t, "warn",
-            "applied but conf write failed — won't persist across restart")
-    _rebuild_rows(state)
-
-
-def _fire_create_ssh_key(state: State) -> None:
-    from core.ssh import ssh_tools_status
-    from .ssh_keygen import open_ssh_keygen_modal
-
-    if not ssh_tools_status().has_ssh_keygen:
-        t = state.tasks.add("create SSH key")
-        state.tasks.update(t, "fail", "ssh-keygen not on PATH — install OpenSSH")
-        return
-    open_ssh_keygen_modal(state)
-
-
-def _fire_toggle_ssh_agent(state: State) -> None:
-    from core.config import set_conf_value
-
-    new_enabled = not state.auto_start_ssh_agent
-    state.auto_start_ssh_agent = new_enabled
-
-    t = state.tasks.add(
-        "enable ssh-agent autostart" if new_enabled
-        else "disable ssh-agent autostart")
-    if set_conf_value("auto_start_ssh_agent",
-                      "true" if new_enabled else "false"):
-        state.tasks.update(
-            t, "ok",
-            "will start agent on launch" if new_enabled
-            else "agent autostart off")
-    else:
-        state.tasks.update(
-            t, "warn",
-            "applied but conf write failed — won't persist across restart")
-    _rebuild_rows(state)
-
-
-def _fire_ssh_add_keys(state: State) -> None:
-    import threading
-    from core.ssh import add_default_keys_to_agent, ensure_ssh_agent, ssh_tools_status
-
-    tools = ssh_tools_status()
-    if not tools.has_ssh_add:
-        t = state.tasks.add("ssh-add default keys")
-        state.tasks.update(t, "fail", "ssh-add not on PATH — install OpenSSH")
-        return
-
-    def worker() -> None:
-        if state.auto_start_ssh_agent:
-            ensure_ssh_agent(True)
-        t = state.tasks.add("ssh-add default keys")
-        added, errors = add_default_keys_to_agent()
-        if added and not errors:
-            state.tasks.update(t, "ok", f"{added} key(s) loaded")
-        elif added:
-            state.tasks.update(
-                t, "warn",
-                f"{added} loaded; {'; '.join(errors)}")
-        elif errors:
-            state.tasks.update(t, "fail", "; ".join(errors))
-        else:
-            state.tasks.update(
-                t, "warn", "no default keys found in ~/.ssh")
-        _rebuild_rows(state)
-
-    threading.Thread(target=worker, daemon=True).start()
-
-
-def _fire_toggle_auto_refresh(state: State) -> None:
-    """Flip `state.auto_refresh_on_fs_change`, persist it, and reconcile
-    watchers so the change lands immediately (stopping the Observer on
-    disable, starting it on enable). Mirrors `_fire_toggle_task_log`'s
-    "apply + save + surface a task" pattern so the user gets one-row
-    feedback on whether the conf write actually persisted."""
-    from core.config import set_conf_value
-    from core.fs_watcher import reconcile_repo_watchers
-
-    new_enabled = not state.auto_refresh_on_fs_change
-    state.auto_refresh_on_fs_change = new_enabled
-    reconcile_repo_watchers(state)
-
-    t = state.tasks.add(
-        "enable auto-refresh" if new_enabled else "disable auto-refresh")
-    if set_conf_value("auto_refresh_on_fs_change",
-                      "true" if new_enabled else "false"):
-        state.tasks.update(
-            t, "ok",
-            "watching files" if new_enabled else "Ctrl+R only")
-    else:
-        state.tasks.update(
-            t, "warn",
-            "applied but conf write failed — won't persist across restart")
-    _rebuild_rows(state)
-
-
-def _fire_cycle_debounce(state: State) -> None:
-    """Advance `state.auto_refresh_debounce_ms` to the next entry in
-    `_DEBOUNCE_PRESETS_MS`, wrapping at the end. If the current value
-    isn't in the preset list (e.g. user hand-edited idlegit.conf to a
-    custom number), pick the first preset that's >= current, falling
-    back to the first preset. Persists the new value and surfaces a
-    one-shot task confirming the write landed."""
-    from core.config import set_conf_value
-
-    current = state.auto_refresh_debounce_ms
-    if current in _DEBOUNCE_PRESETS_MS:
-        idx = _DEBOUNCE_PRESETS_MS.index(current)
-        new_value = _DEBOUNCE_PRESETS_MS[
-            (idx + 1) % len(_DEBOUNCE_PRESETS_MS)]
-    else:
-        new_value = next(
-            (p for p in _DEBOUNCE_PRESETS_MS if p > current),
-            _DEBOUNCE_PRESETS_MS[0])
-    state.auto_refresh_debounce_ms = new_value
-
-    t = state.tasks.add(f"debounce → {new_value} ms")
-    if set_conf_value("auto_refresh_debounce_ms", str(new_value)):
-        state.tasks.update(t, "ok", "saved")
-    else:
-        state.tasks.update(
-            t, "warn",
-            "applied but conf write failed — won't persist across restart")
-    _rebuild_rows(state)
-
-
-def _fire_open_task_log(state: State) -> None:
-    """Hand the log file off to the platform's default opener via the
-    same `webbrowser` mechanism used for run URLs. Failures surface as
-    a warn task in the panel so the user gets feedback instead of a
-    silent no-op. Spawns a daemon thread because the dispatch can be
-    slow on some platforms (Linux desktops in particular)."""
-    import threading
-    from core.task_log import open_task_log
-
-    path = state.task_log_path
-
-    def worker() -> None:
-        t = state.tasks.add(f"open {path.name}")
-        # Create-if-missing so opening an "empty log" lands on a real
-        # file instead of "does not exist yet". The installer normally
-        # pre-creates this, but older installs / non-installed runs /
-        # exotic config dirs may not have it yet.
-        if not path.exists():
-            try:
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.touch()
-            except OSError as e:
-                state.tasks.update(
-                    t, "fail", f"could not create log: {e}")
-                return
-        if open_task_log(path):
-            state.tasks.update(t, "ok", "opened")
-        else:
-            state.tasks.update(t, "warn", "no opener available")
-
-    threading.Thread(target=worker, daemon=True).start()
-
-
-def _fire_clear_task_log(state: State) -> None:
-    """Truncate the log file to zero bytes. Reports the result as a
-    task row so the user can see it landed (or didn't). Rebuilds the
-    menu rows so the size display refreshes immediately."""
-    from core.task_log import clear_task_log
-
-    t = state.tasks.add(f"clear {state.task_log_path.name}")
-    if clear_task_log(state.task_log_path):
-        state.tasks.update(t, "ok", "log cleared")
-    else:
-        state.tasks.update(t, "fail", "could not write log file")
-    _rebuild_rows(state)
 
 
 def _exec_idlegit_update() -> None:
@@ -896,82 +341,28 @@ def draw_app_menu(stdscr, state: State, sidebar_x: int) -> None:
 # ---------- Handle --------------------------------------------------------
 
 
-def _move_selected(menu: AppMenu, direction: int) -> None:
-    """Move `selected` by `direction` (±1, ±10) skipping over rows
-    that aren't focusable. Stops at the ends without wrapping."""
-    n = len(menu.rows)
-    if n == 0:
-        return
-    new = menu.selected
-    step = 1 if direction > 0 else -1
-    remaining = abs(direction)
-    while remaining > 0:
-        candidate = new + step
-        if not (0 <= candidate < n):
-            break
-        new = candidate
-        if _is_focusable(menu.rows[new]):
-            remaining -= 1
-    menu.selected = new
-
-
 def handle_app_menu_key(state: State, key: int) -> None:
-    menu = state.app_menu
-    if menu is None:
-        return
+    effect = handle_app_menu_key_action(state, key)
+    _apply_app_menu_effect(state, effect)
 
-    if key in (27, 9):  # Esc or Tab — close the modal
-        state.app_menu = None
-        return
 
-    n = len(menu.rows)
-    if n == 0:
+def _apply_app_menu_effect(state: State, effect: AppMenuEffect) -> None:
+    if effect.kind in ("none", "close"):
         return
-
-    if key == curses.KEY_UP:
-        _move_selected(menu, -1)
+    if effect.kind == "update_now":
+        _exec_idlegit_update()
         return
-    if key == curses.KEY_DOWN:
-        _move_selected(menu, +1)
+    if effect.kind == "open_help":
+        from .help import open_help_screen
+        open_help_screen(state)
         return
-    if key == curses.KEY_PPAGE:
-        _move_selected(menu, -10)
+    if effect.kind == "open_ssh_keygen":
+        from features.ssh_keygen.session import open_ssh_keygen_modal
+        open_ssh_keygen_modal(state)
         return
-    if key == curses.KEY_NPAGE:
-        _move_selected(menu, +10)
+    if effect.kind == "open_workspace_creator":
+        from features.workspace_creator.session import open_workspace_creator
+        open_workspace_creator(
+            state, title="Add workspace",
+            intro="Add folder paths to scan for git repos.")
         return
-    if key == curses.KEY_HOME:
-        menu.selected = _first_focusable(menu.rows)
-        return
-    if key == curses.KEY_END:
-        # Walk back from the last row to the last focusable.
-        for i in range(n - 1, -1, -1):
-            if _is_focusable(menu.rows[i]):
-                menu.selected = i
-                break
-        return
-
-    if key in (10, 13, curses.KEY_ENTER, ord(" ")):
-        if not (0 <= menu.selected < n):
-            return
-        row = menu.rows[menu.selected]
-        if row.kind == "app_action":
-            _fire_app_action(state, row.attr_name)
-            return
-        if row.kind == "create_workspace":
-            from .workspace_creator import open_workspace_creator
-            open_workspace_creator(
-                state, title="Add workspace",
-                intro="Add folder paths to scan for git repos.")
-            return
-        if row.kind == "workspace":
-            try:
-                target = int(row.attr_name)
-            except ValueError:
-                return
-            state.app_menu = None
-            if (0 <= target < len(state.workspaces)
-                    and target != state.active_workspace_index):
-                from core.workers import switch_workspace
-                switch_workspace(state, target)
-            return

@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, List
 
 if TYPE_CHECKING:  # pragma: no cover - import-time-only typing
-    from .models import Workspace
+    from .state.workspaces import Workspace
 
 # `SubtreeSpec` and `Workspace` are constructor-only at runtime — type
 # hints are stringified via `from __future__ import annotations` and
@@ -192,7 +192,7 @@ DEFAULT_TASKS_MIN_WIDTH_PERCENT = 0.2
 DEFAULT_TASKS_MAX_WIDTH_PERCENT = 0.5
 DEFAULT_TRACK_ACTIONS = True
 DEFAULT_ACTIONS_POLL_SECONDS = 5.0
-DEFAULT_AUTO_REMOVE_COMPLETED_AFTER = -1.0  # <0 = never auto-remove
+DEFAULT_AUTO_REMOVE_COMPLETED_AFTER = 6.0  # <0 = never auto-remove
 # Cap on commit-message length displayed on the review screen. The
 # message wraps across as many rows as needed to fit; only end-
 # truncation kicks in once a single message exceeds the cap. Long
@@ -230,11 +230,14 @@ DEFAULT_TASK_LOG_ENABLED = False
 DEFAULT_TASK_LOG_PATH = ""
 DEFAULT_TASK_LOG_MAX_LINES = 0
 # Filesystem-watched auto-refresh: when ON, idlegit listens for OS-level
-# fs events (via watchdog) under each repo's working tree + `.git/` and
-# kicks a lightweight per-repo refresh after `auto_refresh_debounce_ms`
-# of quiet. OFF returns to the historical "Ctrl+R only" behaviour.
-DEFAULT_AUTO_REFRESH_ON_FS_CHANGE = True
+# fs events (via watchdog) under each repo's working tree and kicks a
+# lightweight per-repo refresh after `auto_refresh_debounce_ms` of quiet.
+# OFF keeps refresh work to workspace entry, periodic refresh, and Ctrl+R.
+DEFAULT_AUTO_REFRESH_ON_FS_CHANGE = False
 DEFAULT_AUTO_REFRESH_DEBOUNCE_MS = 400
+# Periodic refresh runs the same local refresh path as Ctrl+R at a fixed
+# idle interval. 0 = off; values >=1 are seconds.
+DEFAULT_PERIODIC_REFRESH_SECONDS = 60.0
 # When True, Ctrl+R does `git fetch --all` per repo before re-reading
 # state, so the displayed ahead/behind reflects actual upstream rather
 # than whatever the local `@{u}` ref was at last fetch. Off by default
@@ -269,6 +272,11 @@ def get_load_warnings() -> List[str]:
 
 def _clamp_percent(value: float) -> float:
     return max(0.0, min(1.0, value))
+
+
+def _normalize_suggest_limit(value: int) -> int:
+    """Suggestion limits use -1 for unlimited and 0 to hide a category."""
+    return max(-1, value)
 
 
 @dataclass
@@ -314,6 +322,7 @@ class Config:
     task_log_max_lines: int = DEFAULT_TASK_LOG_MAX_LINES
     auto_refresh_on_fs_change: bool = DEFAULT_AUTO_REFRESH_ON_FS_CHANGE
     auto_refresh_debounce_ms: int = DEFAULT_AUTO_REFRESH_DEBOUNCE_MS
+    periodic_refresh_seconds: float = DEFAULT_PERIODIC_REFRESH_SECONDS
     fetch_on_manual_refresh: bool = DEFAULT_FETCH_ON_MANUAL_REFRESH
     auto_start_ssh_agent: bool = DEFAULT_AUTO_START_SSH_AGENT
 
@@ -356,6 +365,7 @@ def load_config() -> Config:
     task_log_max_lines = DEFAULT_TASK_LOG_MAX_LINES
     auto_refresh_on_fs_change = DEFAULT_AUTO_REFRESH_ON_FS_CHANGE
     auto_refresh_debounce_ms = DEFAULT_AUTO_REFRESH_DEBOUNCE_MS
+    periodic_refresh_seconds = DEFAULT_PERIODIC_REFRESH_SECONDS
     fetch_on_manual_refresh = DEFAULT_FETCH_ON_MANUAL_REFRESH
     auto_start_ssh_agent = DEFAULT_AUTO_START_SSH_AGENT
 
@@ -446,6 +456,9 @@ def load_config() -> Config:
             auto_refresh_debounce_ms = cp.getint(
                 "idlegit", "auto_refresh_debounce_ms",
                 fallback=DEFAULT_AUTO_REFRESH_DEBOUNCE_MS)
+            periodic_refresh_seconds = cp.getfloat(
+                "idlegit", "periodic_refresh_seconds",
+                fallback=DEFAULT_PERIODIC_REFRESH_SECONDS)
             fetch_on_manual_refresh = cp.getboolean(
                 "idlegit", "fetch_on_manual_refresh",
                 fallback=DEFAULT_FETCH_ON_MANUAL_REFRESH)
@@ -463,9 +476,9 @@ def load_config() -> Config:
         task_name_truncation = DEFAULT_TRUNCATION_MODE
 
     return Config(
-        suggest_added=max(0, suggest_added),
-        suggest_updated=max(0, suggest_updated),
-        suggest_deleted=max(0, suggest_deleted),
+        suggest_added=_normalize_suggest_limit(suggest_added),
+        suggest_updated=_normalize_suggest_limit(suggest_updated),
+        suggest_deleted=_normalize_suggest_limit(suggest_deleted),
         lfs_warn_bytes=max(0, lfs_warn_mb) * 1024 * 1024,
         default_auto_stage=default_auto_stage,
         default_auto_push=default_auto_push,
@@ -500,6 +513,9 @@ def load_config() -> Config:
         task_log_max_lines=max(0, task_log_max_lines),
         auto_refresh_on_fs_change=auto_refresh_on_fs_change,
         auto_refresh_debounce_ms=max(50, auto_refresh_debounce_ms),
+        periodic_refresh_seconds=(
+            0 if periodic_refresh_seconds < 1
+            else periodic_refresh_seconds),
         fetch_on_manual_refresh=fetch_on_manual_refresh,
         auto_start_ssh_agent=auto_start_ssh_agent,
     )
@@ -607,6 +623,7 @@ WORKSPACE_OVERRIDE_TYPES: "dict[str, str]" = {
     "auto_remove_completed_tasks_after_interval": "float",
     "auto_refresh_on_fs_change": "bool",
     "auto_refresh_debounce_ms": "int",
+    "periodic_refresh_seconds": "float",
     "fetch_on_manual_refresh": "bool",
 }
 
@@ -645,6 +662,7 @@ WORKSPACE_OVERRIDE_TARGETS: "dict[str, str]" = {
     "auto_remove_completed_tasks_after_interval": "auto_remove_completed_after",
     "auto_refresh_on_fs_change": "auto_refresh_on_fs_change",
     "auto_refresh_debounce_ms": "auto_refresh_debounce_ms",
+    "periodic_refresh_seconds": "periodic_refresh_seconds",
     "fetch_on_manual_refresh": "fetch_on_manual_refresh",
 }
 
@@ -706,6 +724,11 @@ def state_attr_value_from_override(key: str, value):
             return _clamp_percent(float(value))
         except (TypeError, ValueError):
             return 0.0
+    if key in ("suggest_added", "suggest_updated", "suggest_deleted"):
+        try:
+            return _normalize_suggest_limit(int(value))
+        except (TypeError, ValueError):
+            return 0
     return value
 
 
@@ -776,7 +799,7 @@ def load_workspaces() -> "tuple[List[Workspace], int]":
     # Local import (see top-of-file note): keeps the module importable
     # as a standalone file during setuptools' `version = { attr = ... }`
     # build-time exec_module fallback.
-    from .models import SubtreeSpec, Workspace
+    from .state.workspaces import SubtreeSpec, Workspace
 
     _ensure_workspaces_file_ready()
     if not WORKSPACES_FILE.exists():
@@ -1003,6 +1026,7 @@ def apply_workspace_overrides(state, cfg: Config, ws: Workspace) -> None:
         cfg.default_auto_remove_backup_stash_after_merge)
     state.auto_refresh_on_fs_change = cfg.auto_refresh_on_fs_change
     state.auto_refresh_debounce_ms = cfg.auto_refresh_debounce_ms
+    state.periodic_refresh_seconds = cfg.periodic_refresh_seconds
     state.fetch_on_manual_refresh = cfg.fetch_on_manual_refresh
     state.auto_start_ssh_agent = cfg.auto_start_ssh_agent
     # fs_watch_ignore is workspace-scoped only — no idlegit.conf-level

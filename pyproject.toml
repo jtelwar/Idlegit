@@ -69,7 +69,7 @@ version = { attr = "core.config.VERSION" }
 py-modules = ["idlegit"]
 
 [tool.setuptools.packages.find]
-include = ["core*", "ui*", "scripts*"]
+include = ["core*", "features*", "ui*", "scripts*"]
 exclude = ["tests*", "agents*"]
 
 # Ruff configuration — pinned to keep CI deterministic across ruff

@@ -3,20 +3,20 @@ configured workspaces, also reachable from the future "Add workspace"
 action. Lets the user list one or more folder paths; each one becomes
 a workspace named after its folder basename.
 
-Live validation: as the user edits each row's path, a debounced worker
-thread re-runs `discover_repos` and stamps a tick + repo count next to
-the path. The tick is informational — workspaces with zero repos can
+Live validation: as the user edits each row's path, a debounced worker-owned
+job checks the folder and stamps a tick + repo count next to the
+path. The tick is informational — workspaces with zero repos can
 still be created, since the user may be pre-staging a folder where
 they'll later clone things."""
 from __future__ import annotations
 
 import curses
-import threading
-from pathlib import Path
-from typing import List
 
-from core.git_ops import discover_repos
-from core.models import State, Workspace, WorkspaceCreator, WorkspaceDraft
+from core.state.app import State
+from core.state.workspaces import WorkspaceCreator, WorkspaceDraft
+from features.workspace_creator.actions import (
+    handle_workspace_creator_key as handle_workspace_creator_key_action,
+)
 
 from ..colors import (
     PAIR_DLG_OK, PAIR_DLG_CYAN, PAIR_DLG_FG, PAIR_DLG_WARN,
@@ -58,138 +58,6 @@ def _hints(creator: WorkspaceCreator) -> list:
 def _draw_creator_hints(stdscr, creator: WorkspaceCreator, y: int,
                         x: int, w: int, attr: int) -> None:
     render_hints(stdscr, y, x, w, _hints(creator), attr=attr)
-
-
-# Debounce window: only fire a discover_repos check after the path has
-# been stable for this long. Keeps rapid keystrokes from spawning a
-# storm of short-lived worker threads.
-_DEBOUNCE_SECONDS = 0.25
-
-
-# ---------- Open / commit -------------------------------------------------
-
-
-def open_workspace_creator(state: State, *,
-                           title: str = "Set up workspaces",
-                           intro: str = "") -> None:
-    """Install the workspace creator modal with one empty draft and the
-    cursor on it. Defaults are tailored for the first-run path; callers
-    that re-open the modal later (e.g. an "Add workspace" item) should
-    customise `title` / `intro` to match the entry point."""
-    if not intro:
-        intro = ("Add folders to scan for git repos. Each becomes a "
-                 "workspace named after the folder.")
-    state.workspace_creator = WorkspaceCreator(
-        drafts=[WorkspaceDraft()],
-        title=title,
-        intro=intro,
-    )
-
-
-def _drafts_to_workspaces(drafts: List[WorkspaceDraft]) -> List[Workspace]:
-    """Convert the modal's drafts into Workspace objects, dropping
-    empty rows. Workspace names default to the folder's basename; on
-    name collisions we append `(2)`, `(3)`, … so each workspace stays
-    uniquely identifiable in the title-row selector."""
-    out: List[Workspace] = []
-    seen_names: dict = {}
-    for d in drafts:
-        text = d.path_text.strip()
-        if not text:
-            continue
-        try:
-            resolved = Path(text).expanduser().resolve()
-        except (OSError, RuntimeError):
-            continue
-        base = resolved.name or str(resolved) or "workspace"
-        name = base
-        n = seen_names.get(base, 0)
-        if n:
-            name = f"{base} ({n + 1})"
-        seen_names[base] = n + 1
-        out.append(Workspace(name=name, folders=[resolved]))
-    return out
-
-
-def commit_workspace_creator(state: State) -> None:
-    """Snapshot the dialogue's current drafts onto `creator.result` so
-    the main loop can pick the new workspace list up and switch into
-    it. Closing the modal is left to the main loop after it consumes
-    `result` — that way a stale modal can never linger after the swap."""
-    creator = state.workspace_creator
-    if creator is None:
-        return
-    creator.result = _drafts_to_workspaces(creator.drafts)
-
-
-# ---------- Live repo-count check ----------------------------------------
-
-
-def _kick_off_check(draft: WorkspaceDraft) -> None:
-    """Spawn a daemon thread that resolves `draft.path_text`, runs
-    `discover_repos`, and stamps the result back onto the draft. The
-    thread reads `draft.path_text` once at start and only writes back if
-    the text is still the same as what it checked — this is the lock-
-    free anti-stale guard. `draft.last_checked` is set to the text we
-    just attempted regardless of outcome so the redraw loop knows not
-    to re-spawn until the user edits again."""
-    text = draft.path_text.strip()
-    if not text:
-        # Empty input — clear any stale state and skip the worker.
-        draft.last_checked = draft.path_text
-        draft.repo_count = -1
-        draft.error = ""
-        draft.checking = False
-        return
-    target = draft.path_text
-    draft.checking = True
-
-    def worker() -> None:
-        repo_count = -1
-        error = ""
-        try:
-            p = Path(text).expanduser()
-            if not p.is_absolute():
-                p = p.resolve()
-            if not p.exists():
-                error = "(no such folder)"
-            elif not p.is_dir():
-                error = "(not a folder)"
-            else:
-                try:
-                    repos = discover_repos(p)
-                except OSError as e:
-                    error = f"(error: {e.strerror or e})"
-                else:
-                    repo_count = len(repos)
-        except (OSError, RuntimeError) as e:
-            error = f"(error: {e})"
-        # Only stamp if the user hasn't moved on to a different value.
-        if draft.path_text == target:
-            draft.repo_count = repo_count
-            draft.error = error
-            draft.last_checked = target
-            draft.checking = False
-
-    threading.Thread(target=worker, daemon=True).start()
-
-
-def tick_creator_checks(state: State) -> bool:
-    """Called from the main draw loop to (re)spawn discover_repos workers
-    for any draft whose `path_text` has drifted from `last_checked`. Returns
-    True if any draft is currently being checked, so the caller can keep
-    the spinner ticking. Debouncing is implicit: each draft is checked
-    once per stable text value, not once per keystroke."""
-    creator = state.workspace_creator
-    if creator is None:
-        return False
-    any_checking = False
-    for draft in creator.drafts:
-        if draft.path_text != draft.last_checked and not draft.checking:
-            _kick_off_check(draft)
-        if draft.checking:
-            any_checking = True
-    return any_checking
 
 
 # ---------- Draw ----------------------------------------------------------
@@ -330,124 +198,5 @@ def draw_workspace_creator(stdscr, state: State, sidebar_x: int) -> None:
                         sb | curses.A_DIM)
 
 
-# ---------- Handle --------------------------------------------------------
-
-
-def _focused_draft(creator: WorkspaceCreator) -> "WorkspaceDraft | None":
-    if 0 <= creator.selected < len(creator.drafts):
-        return creator.drafts[creator.selected]
-    return None
-
-
-def _on_done_row(creator: WorkspaceCreator) -> bool:
-    return creator.selected == len(creator.drafts)
-
-
-def _ensure_trailing_empty(creator: WorkspaceCreator) -> None:
-    """Keep one blank draft pinned at the end so the user always has a
-    place to add another path without a separate "+ new" command.
-    No-op when the last row is already blank."""
-    if not creator.drafts or creator.drafts[-1].path_text:
-        creator.drafts.append(WorkspaceDraft())
-
-
-def _move_to_field(creator: WorkspaceCreator, idx: int) -> None:
-    """Snap selection to row `idx` and park the field cursor at the end
-    of that row's path so the user can keep typing without first moving
-    the caret. No-op when `idx` is out of range or already focused."""
-    if idx < 0 or idx > len(creator.drafts):
-        return
-    creator.selected = idx
-    if idx < len(creator.drafts):
-        creator.field_cursor = len(creator.drafts[idx].path_text)
-    else:
-        creator.field_cursor = 0
-
-
 def handle_workspace_creator_key(state: State, key: int) -> None:
-    creator = state.workspace_creator
-    if creator is None:
-        return
-
-    if key == 27:
-        # Cancel — leave state.workspace_creator untouched (caller
-        # checks `result is None` to distinguish cancel from commit).
-        creator.result = []
-        state.workspace_creator = None
-        return
-
-    if key == curses.KEY_UP:
-        _move_to_field(creator, max(0, creator.selected - 1))
-        return
-    if key == curses.KEY_DOWN:
-        max_idx = len(creator.drafts)  # Done row index
-        # Stepping off the last (blank) draft jumps straight to Done.
-        if (creator.selected < len(creator.drafts)
-                and not creator.drafts[creator.selected].path_text):
-            _move_to_field(creator, max_idx)
-            return
-        _move_to_field(creator, min(max_idx, creator.selected + 1))
-        return
-
-    if _on_done_row(creator):
-        if key in (10, 13, curses.KEY_ENTER):
-            nonempty = sum(1 for d in creator.drafts if d.path_text.strip())
-            if nonempty == 0:
-                # Nothing to commit — bounce back to the first row so the
-                # user can type something.
-                _move_to_field(creator, 0)
-                return
-            commit_workspace_creator(state)
-            return
-        return
-
-    draft = _focused_draft(creator)
-    if draft is None:
-        return
-
-    text = draft.path_text
-    cur = max(0, min(creator.field_cursor, len(text)))
-
-    if key in (10, 13, curses.KEY_ENTER, 9):  # Enter or Tab
-        # Accept this row and advance. If we're on the trailing empty
-        # row this also seeds a fresh blank for the next entry.
-        if not text.strip():
-            # Empty Enter on a blank row jumps to Done.
-            _move_to_field(creator, len(creator.drafts))
-            return
-        _ensure_trailing_empty(creator)
-        _move_to_field(creator, creator.selected + 1)
-        return
-
-    if key == curses.KEY_LEFT:
-        creator.field_cursor = max(0, cur - 1)
-        return
-    if key == curses.KEY_RIGHT:
-        creator.field_cursor = min(len(text), cur + 1)
-        return
-    if key == curses.KEY_HOME or key == 1:
-        creator.field_cursor = 0
-        return
-    if key == curses.KEY_END or key == 5:
-        creator.field_cursor = len(text)
-        return
-
-    if key in (curses.KEY_BACKSPACE, 127, 8):
-        if cur > 0:
-            draft.path_text = text[: cur - 1] + text[cur:]
-            creator.field_cursor = cur - 1
-            draft.last_checked = ""  # invalidate so the worker re-runs
-        return
-    if key == curses.KEY_DC:
-        if cur < len(text):
-            draft.path_text = text[:cur] + text[cur + 1:]
-            draft.last_checked = ""
-        return
-    if 32 <= key < 127:
-        draft.path_text = text[:cur] + chr(key) + text[cur:]
-        creator.field_cursor = cur + 1
-        draft.last_checked = ""
-        # Make sure there's still a blank row at the end for the next
-        # workspace the user might want to add.
-        _ensure_trailing_empty(creator)
-        return
+    handle_workspace_creator_key_action(state, key)

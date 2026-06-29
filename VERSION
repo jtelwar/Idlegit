@@ -1,4 +1,734 @@
-0.29.0
+0.31.232
+
+### 0.31.232
+- 2026-06-29: consolidate workspace switch save and load progress into one task row.
+
+### 0.31.231
+- 2026-06-29: fix smart-sync recursive submodule alignment and parent propagation.
+
+### 0.31.230
+- 2026-06-28: ship the `features` package through installer and package metadata.
+
+### 0.31.229
+- 2026-06-25: fix commit-batch worker lease handoff for normal push.
+
+### 0.31.228
+- 2026-06-25: fix commit push workers self-conflicting on owned row leases.
+
+### 0.31.227
+- 2026-06-25: fix stale submodule row rendering after canonical repo topology refresh.
+
+### 0.31.226
+- 2026-06-23: bind safe-merge, remote-edit, and smart-sync rows to runtime jobs and harden cancellation.
+
+### 0.31.225
+- 2026-06-23: bind commit-batch task rows to runtime job ownership.
+
+### 0.31.224
+- 2026-06-23: link workflow polling and then-run rows to runtime jobs.
+
+### 0.31.223
+- 2026-06-23: route task-detail actions through runtime projection queries.
+
+### 0.31.222
+- 2026-06-23: bind smart-sync task rows to runtime job ownership.
+
+### 0.31.221
+- 2026-06-23: move task projection ownership into the runtime package.
+
+### 0.31.220
+- 2026-06-23: centralize production thread construction in runtime helpers.
+
+### 0.31.219
+- 2026-06-23: route job thread factories through runtime thread helpers.
+
+### 0.31.218
+- 2026-06-23: move thread-group ownership into the runtime package.
+
+### 0.31.217
+- 2026-06-23: move worker and refresh claim ownership into the runtime package.
+
+### 0.31.216
+- 2026-06-23: move job and mutation-lease ownership into the runtime package.
+
+### 0.31.215
+- 2026-06-23: replace the foundation rewrite plan with no-allowlist owner-boundary phases.
+
+### 0.31.214
+- 2026-06-23: delete workflow intent fields from repo projections.
+
+### 0.31.213
+- 2026-06-23: delete row-owned refresh locks from repo projections.
+
+### 0.31.212
+- 2026-06-23: move refresh mutex ownership into the state store.
+
+### 0.31.211
+- 2026-06-23: publish live post-action refreshes through store snapshots.
+
+### 0.31.210
+- 2026-06-23: move queued workflow intent off repo projections.
+
+### 0.31.209
+- 2026-06-23: keep commit-message buffers in store-owned row status.
+
+### 0.31.208
+- 2026-06-23: publish relink topology through store snapshots and stable claims.
+
+### 0.31.207
+- 2026-06-23: publish refresh status through typed store snapshots.
+
+### 0.31.206
+- 2026-06-23: move root app state and remaining modal records out of `core.models`.
+
+### 0.31.205
+- 2026-06-23: move smart-sync checkout records from `core.models` into `core.state.smart_sync`.
+
+### 0.31.204
+- 2026-06-23: move prompt records from `core.models` into `core.state.prompts`.
+
+### 0.31.203
+- 2026-06-23: move picker records from `core.models` into `core.state.pickers`.
+
+### 0.31.202
+- 2026-06-23: move action-menu records from `core.models` into `core.state.action_menu`.
+
+### 0.31.201
+- 2026-06-23: move safe-merge resolver records from `core.models` into `core.state.safe_merge`.
+
+### 0.31.200
+- 2026-06-23: move review projection records from `core.models` into `core.state.review`.
+
+### 0.31.199
+- 2026-06-23: move repo, child, and workflow metadata records from `core.models` into `core.state.repos`.
+
+### 0.31.198
+- 2026-06-23: move workspace, switcher, creator, and workspace-menu state from `core.models` into `core.state.workspaces`.
+
+### 0.31.197
+- 2026-06-23: move viewer and help screen state from `core.models` into `core.state.views`.
+
+### 0.31.196
+- 2026-06-23: move workflow, view-load, and review-draft registries from `core.models` into `core.state`.
+
+### 0.31.195
+- 2026-06-23: move task projection rows and queue ownership from `core.models` into `core.state.tasks`.
+
+### 0.31.194
+- 2026-06-23: tighten the foundation rewrite plan around no-bypass owner-boundary replacement slices.
+
+### 0.31.193
+- 2026-06-23: route app-loop row activity checks through store-backed row selectors.
+
+### 0.31.192
+- 2026-06-23: route main-screen column measurement through store-backed row selectors.
+
+### 0.31.191
+- 2026-06-23: route canonical-tree row busy marking through store child records.
+
+### 0.31.190
+- 2026-06-23: route repo-child local mutation gating through store-backed child expansion.
+
+### 0.31.189
+- 2026-06-23: route read-only row busy gating through store-backed workspace and child records.
+
+### 0.31.188
+- 2026-06-23: route migrated worker/review row enumeration through store-backed active workspace selectors.
+
+### 0.31.187
+- 2026-06-23: route worker, review, detached-preflight, and commit-batch message paths through store-owned row messages.
+
+### 0.31.186
+- 2026-06-23: route large and inline commit-message editing through store-owned row message accessors.
+
+### 0.31.185
+- 2026-06-23: route body-row selection, focused rows, message counts, and main-loop message reads through store-backed selectors.
+
+### 0.31.184
+- 2026-06-23: render branch labels, row state colours, child glyphs, hints, and cursors from store-owned row status snapshots.
+
+### 0.31.183
+- 2026-06-23: move row display status into store-owned snapshots and publish message/refresh updates through the SSOT.
+
+### 0.31.182
+- 2026-06-23: reset the foundation rewrite plan around SSOT-first replacement, runtime ownership, git gateway, and no feature-slice bypasses.
+
+### 0.31.181
+- 2026-06-23: move commit-message editor open gating, cursor projection, and key handling into the feature boundary.
+
+### 0.31.180
+- 2026-06-23: move SSH keygen session, projection, key handling, and generation job dispatch into the feature boundary.
+
+### 0.31.179
+- 2026-06-23: move task-detail session, action dispatch, cancel/browser jobs, and view-log effects into the feature boundary.
+
+### 0.31.178
+- 2026-06-23: move workspace-menu projection, session, path checks, and key lifecycle into the feature boundary.
+
+### 0.31.177
+- 2026-06-23: move workspace-creator session, path-check scheduling, and key lifecycle into the feature boundary.
+
+### 0.31.176
+- 2026-06-23: move clone modal session, projection helpers, and clone dispatch into the feature boundary.
+
+### 0.31.175
+- 2026-06-23: move diff-viewer session, projection helpers, and key lifecycle into the feature boundary.
+
+### 0.31.174
+- 2026-06-23: move task-log-viewer session, projection helpers, and key lifecycle into the feature boundary.
+
+### 0.31.173
+- 2026-06-23: move workspace-switcher session, projection helpers, and switch dispatch into the feature boundary.
+
+### 0.31.172
+- 2026-06-23: move workflow-picker session, projection helpers, and manual dispatch into the feature boundary.
+
+### 0.31.171
+- 2026-06-23: move reset-prompt session, projection helpers, and key dispatch into the feature boundary.
+
+### 0.31.170
+- 2026-06-23: move remote-branch-picker session, projection helpers, and key dispatch into the feature boundary.
+
+### 0.31.169
+- 2026-06-23: move branch-picker session, projection helpers, and key dispatch into the feature boundary.
+
+### 0.31.168
+- 2026-06-23: move app-menu key handling and action dispatch into the feature boundary.
+
+### 0.31.167
+- 2026-06-23: move app-menu row projection and status session lifecycle into the feature boundary.
+
+### 0.31.166
+- 2026-06-23: move branch-name prompt git preparation and submit behavior into the feature boundary.
+
+### 0.31.165
+- 2026-06-23: move action-menu open and close lifecycle into the feature boundary.
+
+### 0.31.164
+- 2026-06-23: move action-menu key behavior into feature-owned intent handling.
+
+### 0.31.163
+- 2026-06-23: move action-menu menu-state transitions into the feature boundary.
+
+### 0.31.162
+- 2026-06-23: move action-menu action execution into the feature boundary.
+
+### 0.31.161
+- 2026-06-23: move action-menu loader ownership into a feature boundary.
+
+### 0.31.160
+- 2026-06-23: reset the foundation rewrite plan around strict no-bypass architecture phases.
+
+### 0.31.159
+- 2026-06-23: move diff viewer tab loading behind worker-owned jobs.
+
+### 0.31.158
+- 2026-06-23: move branch picker loading behind worker-owned jobs.
+
+### 0.31.157
+- 2026-06-23: move task-log loading behind worker-owned jobs.
+
+### 0.31.156
+- 2026-06-23: move review file loading behind worker-owned jobs.
+
+### 0.31.155
+- 2026-06-23: move startup loading refresh and relink work behind worker-owned jobs.
+
+### 0.31.154
+- 2026-06-23: move workspace creation and switching persistence behind worker-owned jobs.
+
+### 0.31.153
+- 2026-06-23: move workspace-menu persistence writes behind worker-owned jobs.
+
+### 0.31.152
+- 2026-06-23: move workspace path validation checks behind worker-owned jobs.
+
+### 0.31.151
+- 2026-06-22: move SSH keygen modal preparation behind a worker-owned job.
+
+### 0.31.150
+- 2026-06-22: move app-menu status and settings work behind worker-owned jobs.
+
+### 0.31.149
+- 2026-06-22: move main-loop view-load animation checks behind state selectors.
+
+### 0.31.148
+- 2026-06-22: move sibling-relink child busy predicates behind state selectors.
+
+### 0.31.147
+- 2026-06-22: remove legacy repo and child refreshing state in favour of store-owned busy rows.
+
+### 0.31.146
+- 2026-06-22: make refresh claims respect store-backed row busy ownership before primitive locks.
+
+### 0.31.145
+- 2026-06-22: make store-backed row busy state reference-counted for overlapping claims.
+
+### 0.31.144
+- 2026-06-22: move smart-sync canonical tree row-state ownership into a lease claim.
+
+### 0.31.143
+- 2026-06-22: move sibling relink busy-child preservation to a state-backed predicate.
+
+### 0.31.142
+- 2026-06-22: move filesystem watcher refresh suppression to state-backed row busy state.
+
+### 0.31.141
+- 2026-06-22: move worker refresh and suggestion gating to state-backed row selectors.
+
+### 0.31.140
+- 2026-06-22: route main row edit and action gating through state selectors.
+
+### 0.31.139
+- 2026-06-22: move repo and child suggestion state into the runtime state store.
+
+### 0.31.138
+- 2026-06-22: move review re-suggest state into state-owned draft records.
+
+### 0.31.137
+- 2026-06-22: move review file-loader cancellation into state-owned view-load records.
+
+### 0.31.136
+- 2026-06-22: move action-menu loader lifecycle into state-owned view-load records.
+
+### 0.31.135
+- 2026-06-22: move commit-view loading into state-owned view-load records and fence stale loader publishes.
+
+### 0.31.134
+- 2026-06-22: move branch picker loading into state-owned view-load records.
+
+### 0.31.133
+- 2026-06-22: move remote-branch picker loading into state-owned view-load records.
+
+### 0.31.132
+- 2026-06-22: move task log viewer loading into state-owned view-load records.
+
+### 0.31.131
+- 2026-06-22: move diff viewer tab loading into state-owned view-load records.
+
+### 0.31.130
+- 2026-06-22: move review workflow tracking and then-run intent into state-owned draft records.
+
+### 0.31.129
+- 2026-06-22: move review commit messages into state-owned draft records.
+
+### 0.31.128
+- 2026-06-22: move review push and amend intent into state-owned draft records.
+
+### 0.31.127
+- 2026-06-22: move review file loading and staged-path selections into state-owned draft records.
+
+### 0.31.126
+- 2026-06-22: key workflow run and follow-up registries by durable subject IDs instead of task rows.
+
+### 0.31.125
+- 2026-06-22: remove task metadata control plane and move pending workflow follow-ups into state.
+
+### 0.31.124
+- 2026-06-22: move workflow run handles from task metadata into a state-owned registry.
+
+### 0.31.123
+- 2026-06-22: move local task cancellation handles from task metadata into the job registry.
+
+### 0.31.122
+- 2026-06-22: load branch picker contents through a read-only job instead of blocking modal open.
+
+### 0.31.121
+- 2026-06-22: route inline refresh completion through explicit job outcomes instead of task-row readback.
+
+### 0.31.120
+- 2026-06-22: move detached review preflight branch recovery and refresh behind a worker-owned job.
+
+### 0.31.119
+- 2026-06-22: route safe-merge jobs through typed worker outcomes instead of task or modal readback.
+
+### 0.31.118
+- 2026-06-22: route local pipeline cancellation through job-registry ownership instead of task metadata events.
+
+### 0.31.117
+- 2026-06-22: route workflow tracking job completion through typed poll outcomes instead of run-task reads.
+
+### 0.31.116
+- 2026-06-22: route smart-sync lifecycle completion through computed job outcome instead of header-row reads.
+
+### 0.31.115
+- 2026-06-22: route commit-batch outcomes through the job/task bridge instead of global task scans.
+
+### 0.31.114
+- 2026-06-22: route action worker outcomes through the job/task bridge instead of task-row scans.
+
+### 0.31.113
+- 2026-06-22: guard refresh lock ownership behind model and claim modules.
+
+### 0.31.112
+- 2026-06-22: migrate safe-merge refresh ownership to refresh claims.
+
+### 0.31.111
+- 2026-06-22: migrate pull-all refresh ownership to refresh claims.
+
+### 0.31.110
+- 2026-06-22: centralize fs-watch and inline-refresh row locks behind refresh claims.
+
+### 0.31.109
+- 2026-06-22: add store-backed row-busy state for refresh and worker presentation.
+
+### 0.31.108
+- 2026-06-22: move local mutation leases and row selectors toward store-backed repo IDs.
+
+### 0.31.107
+- 2026-06-22: add stable state-store IDs and reindex live workspace repos through State replacement.
+
+### 0.31.106
+- 2026-06-22: move action-menu stash and remote inventory loading off UI entry paths.
+
+### 0.31.105
+- 2026-06-22: move workspace cache-miss switching onto a read-only workspace-load job.
+
+### 0.31.104
+- 2026-06-22: add stale job and lease diagnostics without auto-clearing ownership.
+
+### 0.31.103
+- 2026-06-22: split smart-sync mutation completion from read-only refresh cleanup.
+
+### 0.31.102
+- 2026-06-22: route app-menu worker actions through central job-runner thread ownership.
+- 2026-06-22: update the foundation rewrite plan with no-allowlist phased ownership boundaries.
+
+### 0.31.101
+- 2026-06-22: route manual row-refresh flag writes through state-owned helpers and guard the boundary.
+
+### 0.31.100
+- 2026-06-22: move local mutation leases out of task storage and make smart-sync sentinels presentation-only.
+
+### 0.31.99
+- 2026-06-22: make smart-sync register precise repo and child mutation targets before worker start.
+
+### 0.31.98
+- 2026-06-22: move local mutation gating off task metadata and add row-state selectors plus architecture guards.
+
+### 0.31.97
+- 2026-06-22: update foundation rewrite plan to require a ground-up SSOT rewrite with no exception paths.
+
+### 0.31.96
+- 2026-06-22: use a longer timeout for user-started pushes so large LFS uploads are not killed after 120 seconds.
+
+### 0.31.95
+- 2026-06-22: show LFS upload subtasks during push and keep dirty pushing rows locked with the worker spinner.
+
+### 0.31.94
+- 2026-06-21: defer app-menu SSH status jobs until after menu open and wake filesystem watcher debounce threads on disable.
+
+### 0.31.93
+- 2026-06-21: create smart-sync task rows before preflight and move app-menu SSH status probes off the UI thread.
+
+### 0.31.92
+- 2026-06-21: move filesystem-watcher toggles off the UI thread and stop using recursive polling observers by default.
+
+### 0.31.91
+- 2026-06-21: draw the global app menu above the tasks panel.
+
+### 0.31.90
+- 2026-06-21: avoid repeated smart-sync parent propagation checks and harden Ctrl-S terminal flow-control clearing.
+
+### 0.31.89
+- 2026-06-21: update commit-message suggestion limits so -1 is unlimited, 0 hides a category, and defaults are 5.
+
+### 0.31.88
+- 2026-06-21: complete foundation refactor audit, verification, and test harness timeout hardening.
+
+### 0.31.87
+- 2026-06-21: guard live single-target refresh relinks with workspace refresh scopes.
+
+### 0.31.86
+- 2026-06-21: add coalesced UI change events for task and job updates.
+
+### 0.31.85
+- 2026-06-21: run smart-sync final cleanup inside the job without a timeout helper thread.
+
+### 0.31.84
+- 2026-06-21: guard fs-watch drain relinks with shared workspace refresh scopes.
+
+### 0.31.83
+- 2026-06-21: add workspace refresh scopes for guarded async result publishing.
+
+### 0.31.82
+- 2026-06-21: route commit-batch subworker fan-out through a tested thread group.
+
+### 0.31.81
+- 2026-06-21: extract inline refresh coalescing into a tested queue object.
+
+### 0.31.80
+- 2026-06-21: extract smart-sync canonical plan execution into a tested executor.
+
+### 0.31.79
+- 2026-06-21: extract smart-sync threaded execution into a runner helper.
+
+### 0.31.78
+- 2026-06-21: extract smart-sync parent propagation into a shared safe service.
+
+### 0.31.77
+- 2026-06-21: extract smart-sync sentinel lifecycle into a tested helper.
+
+### 0.31.76
+- 2026-06-21: guard inline-refresh incremental relinks after workspace switches.
+
+### 0.31.75
+- 2026-06-21: guard fs-watch drain relinks and requeue busy drain targets.
+
+### 0.31.74
+- 2026-06-21: extract smart-sync final cleanup lifecycle into a tested helper.
+
+### 0.31.73
+- 2026-06-21: make refresh and pull-all startup gates job-registry-first.
+
+### 0.31.72
+- 2026-06-21: make inline-refresh mutation gating rely on job registry ownership.
+
+### 0.31.71
+- 2026-06-21: make smart-sync job ownership active before sentinel claims.
+
+### 0.31.70
+- 2026-06-21: centralize local-mutation checks through job registry helper.
+
+### 0.31.69
+- 2026-06-21: migrate fresh workspace-switch relinks onto the reconciler.
+
+### 0.31.68
+- 2026-06-21: add generation-aware relink discard for stale inline refreshes.
+
+### 0.31.67
+- 2026-06-21: migrate startup loading and fs-watch drain relinks onto the reconciler.
+
+### 0.31.66
+- 2026-06-21: migrate commit-batch and inline-refresh cleanup onto the reconciler.
+
+### 0.31.65
+- 2026-06-21: migrate action and safe-merge refresh cleanup onto the reconciler.
+
+### 0.31.64
+- 2026-06-21: add refresh-and-relink reconciler and migrate smart-sync/pull-all cleanup.
+
+### 0.31.63
+- 2026-06-21: migrate smart-sync final cleanup refreshes onto the shared bounded helper.
+
+### 0.31.62
+- 2026-06-21: reuse the smart-sync planner for canonical no-op preflight.
+
+### 0.31.61
+- 2026-06-21: route smart-sync canonical winner selection through the pure planner.
+
+### 0.31.60
+- 2026-06-21: migrate inline refresh repo refreshes onto shared bounded refresh helper.
+
+### 0.31.59
+- 2026-06-21: add shared bounded refresh helper for startup and fs-watch drain paths.
+
+### 0.31.58
+- 2026-06-21: update worker inventory with current job migration and remaining gaps.
+
+### 0.31.57
+- 2026-06-21: notify clone modal callbacks when clone job start fails.
+
+### 0.31.56
+- 2026-06-21: clear commit-view and suggestion load states on job start failure.
+
+### 0.31.55
+- 2026-06-21: show post-push workflow discovery start failures in the task panel.
+
+### 0.31.54
+- 2026-06-21: queue fs-watch refreshes when debounce thread start fails.
+
+### 0.31.53
+- 2026-06-21: harden worker claim release and commit-batch start-failure cleanup.
+
+### 0.31.52
+- 2026-06-21: clear review suggestion spinners when job thread start fails.
+
+### 0.31.51
+- 2026-06-21: prevent smart-sync cleanup thread start failures from stranding sentinels.
+
+### 0.31.50
+- 2026-06-21: route release update checks through read-only jobs.
+
+### 0.31.49
+- 2026-06-21: route review-screen file loaders through read-only jobs.
+
+### 0.31.48
+- 2026-06-21: route action-menu state, tree, and commit loaders through read-only jobs.
+
+### 0.31.47
+- 2026-06-21: route task-log opener and diff-viewer tab loaders through read-only jobs.
+
+### 0.31.46
+- 2026-06-21: route task-detail cancel and browser actions through read-only jobs.
+
+### 0.31.45
+- 2026-06-21: route workspace creator and menu path checks through read-only jobs.
+
+### 0.31.44
+- 2026-06-21: route SSH key generation and ssh-add workers through job lifecycle handling.
+
+### 0.31.43
+- 2026-06-21: route remote-branch and task-log modal loaders through read-only jobs.
+
+### 0.31.42
+- 2026-06-21: route fs-watch pending refresh drains through read-only jobs and requeue failed starts.
+
+### 0.31.41
+- 2026-06-21: make refresh gates target-aware for registry jobs, task claims, and child mutations.
+
+### 0.31.40
+- 2026-06-21: route startup loading refresh through the job runner with thread-start failure handling.
+
+### 0.31.39
+- 2026-06-21: show nested repo rows during parent refresh; keep no-op smart-sync out of mutation jobs.
+
+### 0.31.38
+- 2026-06-21: fix smart-sync no-op cleanup freezes and job-registry completion drain.
+
+### 0.31.37
+- 2026-06-21: add pure smart-sync canonical alignment planner types and tests.
+
+### 0.31.36
+- 2026-06-21: route smart-sync through a local-mutation job registry runner.
+
+### 0.31.35
+- 2026-06-21: route inline workspace refresh through a read-only job registry runner.
+
+### 0.31.34
+- 2026-06-21: route safe-merge confirm phase through a local-mutation job registry runner.
+
+### 0.31.33
+- 2026-06-21: route safe-merge finalize phase through a local-mutation job registry runner.
+
+### 0.31.32
+- 2026-06-21: route safe-merge begin phase through a local-mutation job registry runner.
+
+### 0.31.31
+- 2026-06-21: route pull-all through a local-mutation job registry runner.
+
+### 0.31.30
+- 2026-06-21: add job registry ownership for commit/push batch supervision.
+
+### 0.31.29
+- 2026-06-21: route post-push workflow discovery through a read-only job registry runner.
+
+### 0.31.28
+- 2026-06-21: route workflow run polling through a read-only job registry runner.
+
+### 0.31.27
+- 2026-06-21: route manual workflow dispatch through a read-only job registry runner.
+
+### 0.31.26
+- 2026-06-21: route commit-view modal loading through a read-only job registry runner.
+
+### 0.31.25
+- 2026-06-21: route commit-message suggestion workers through read-only job registry runners.
+
+### 0.31.24
+- 2026-06-21: route single-repo action workers through the job registry runner.
+
+### 0.31.23
+- 2026-06-21: route clone workers through the job registry runner.
+
+### 0.31.22
+- 2026-06-21: route add-tag workers through the job registry runner.
+
+### 0.31.21
+- 2026-06-21: route remote-edit workers through the job registry runner.
+
+### 0.31.20
+- 2026-06-21: extract worker leases and add a tested job registry lifecycle skeleton.
+
+### 0.31.19
+- 2026-06-20: split task activity predicates, add mutation claims, and inventory worker migration paths.
+
+### 0.31.18
+- 2026-06-20: bound smart-sync cleanup after skipped propagation and harden Ctrl-S flow-control handling.
+
+### 0.31.17
+- 2026-06-20: skip smart-sync parent propagation when nested or parent dirt is present.
+
+### 0.31.16
+- 2026-06-20: clear stale pending then-run task messages when tag follow-ups run.
+
+### 0.31.15
+- 2026-06-20: keep smart-sync guards active through cleanup and lock nested propagation writes.
+
+### 0.31.14
+- 2026-06-20: refresh stale workspace edits, worker spawn rollback, and push exception task cleanup.
+
+### 0.31.13
+- 2026-06-20: harden worker claim rollback, smart-sync/refresh spawn failures, and cancellable push exception cleanup.
+
+### 0.31.12
+- 2026-06-20: bound smart-sync push tasks, stage only validated parent gitlink bumps, and ignore dirty-only nested submodules for parent propagation.
+
+### 0.31.11
+- 2026-06-20: fix Ctrl-R refresh gate messaging, Esc timeout restoration, and all-workspace loading rows.
+
+### 0.31.10
+- 2026-06-20: show a visible summary task for manual Ctrl-R refreshes.
+
+### 0.31.9
+- 2026-06-20: make the app menu full-width, switch task auto-remove to icon-only progress, and consolidate worker repo claims.
+
+### 0.31.8
+- 2026-06-20: preserve curses input timeout after Escape key peeks so Esc cannot leave the UI blocking.
+
+### 0.31.7
+- 2026-06-20: stop startup loading from refreshing inactive workspaces in the background.
+
+### 0.31.6
+- 2026-06-20: keep detached-recovery preflight responsive and tolerate post-recovery refresh failures.
+
+### 0.31.5
+- 2026-06-20: pin safe-merge and action cleanup relinks to the workspace where each operation started.
+
+### 0.31.4
+- 2026-06-20: pin pull-all and smart-sync refresh/relink cleanup to the workspace where each job started.
+
+### 0.31.3
+- 2026-06-20: convert sibling-sync exceptions into failed task rows so commit and safe-merge fan-out workers keep cleaning up.
+
+### 0.31.2
+- 2026-06-20: make inline refresh resilient to repo/link failures and keep quit confirmation responsive after Esc.
+
+### 0.31.1
+- 2026-06-20: let workspace-entry refreshes run per active workspace so rapid switching cannot block the final workspace behind stale refresh work.
+
+### 0.31.0
+- 2026-06-20: default successful-task auto-removal to 6s with progress/fade removal, disable file watching by default, and add active-workspace periodic refresh.
+
+### 0.30.8
+- 2026-06-20: shorten the tasks panel above a full-width footer so key hints and legend span under both panels.
+
+### 0.30.7
+- 2026-06-20: keep the tasks panel width stable across workspace switches by letting the commit message field absorb repo-name width changes.
+
+### 0.30.6
+- 2026-06-20: clear each repo refresh spinner as soon as its local status refresh completes instead of waiting for workspace relink.
+
+### 0.30.5
+- 2026-06-20: keep known dirty, merging, and error status visible while refreshes run instead of masking those rows with spinners.
+
+### 0.30.4
+- 2026-06-20: coalesce rapid workspace-switch refreshes and defer watcher reconciliation to avoid blocking workspace cycling.
+
+### 0.30.3
+- 2026-06-20: lock remote-edit workers, drain fs-watch pending refreshes asynchronously, and surface manual-refresh fetch failures.
+
+### 0.30.2
+- 2026-06-20: drain cancellable git command pipes while polling and sync nested submodule origins from `.gitmodules` before sibling alignment.
+
+### 0.30.1
+- 2026-06-20: reduce refresh git probes and shorten submodule relink locking with race-safe child reconciliation.
+
+### 0.30.0
+- 2026-06-20: make refresh local-first, defer workflow-state hydration to review, bound startup loading, reduce cache-hit workspace switch relinking, and avoid macOS FSEvents watcher aborts.
+
+### 0.29.1
+- 2026-06-19: add refresh/status performance audit covering startup loading, workflow-state hydration, submodule relinking, sync, and locking.
 
 ### 0.29.0
 - 2026-06-15: add safe-merge: full-screen conflict resolver — ↑/↓ between conflicts, ←/→ pick ours/theirs (b: both) with rich repo/branch/commit labels, then merge commit + confirm screen (push toggle, off-by-default remove-backup-stash box) and submodule sync. Backs up the working tree to a `pre-merge-at-…` stash first; never runs destructive git ops.

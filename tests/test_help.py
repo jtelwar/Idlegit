@@ -233,7 +233,7 @@ class TestRenderMarkdown(unittest.TestCase):
 
 class TestModalHelpPageDataclass(unittest.TestCase):
     def test_help_page_holds_raw_body(self) -> None:
-        from core.models import HelpPage
+        from core.state.views import HelpPage
         p = HelpPage(title="T", filename="01-t.md", body="# T\n\nbody")
         self.assertEqual(p.title, "T")
         self.assertEqual(p.filename, "01-t.md")

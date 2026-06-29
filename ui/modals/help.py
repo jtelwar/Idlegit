@@ -19,7 +19,8 @@ from typing import List, Tuple
 
 from core.config import APP_DISPLAY_NAME, VERSION
 from core.help_loader import load_help_pages
-from core.models import HelpScreen, State
+from core.state.app import State
+from core.state.views import HelpPage, HelpScreen
 
 from ..colors import (
     PAIR_BRANCH, PAIR_DLG_CYAN, PAIR_DLG_FG, PAIR_DLG_FG_HINT_TEXT,
@@ -265,7 +266,6 @@ def open_help_screen(state: State) -> None:
     silent no-op."""
     pages = load_help_pages()
     if not pages:
-        from core.models import HelpPage
         pages = [HelpPage(
             title="(no help available)",
             filename="",

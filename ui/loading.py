@@ -2,13 +2,11 @@
 from __future__ import annotations
 
 import curses
-import threading
 from typing import List, Tuple
 
-from core.models import Repo
+from core.state.repos import Repo
 from core.config import APP_DISPLAY_NAME, DEFAULT_TRUNCATION_MODE, VERSION
-from core.git_ops import link_siblings
-from core.workers import refresh_repo_with_remote_state
+from core.workers import kick_off_startup_refresh
 
 from .colors import PAIR_BRANCH, PAIR_HEADER, PAIR_OK
 from .geometry import safe_addstr
@@ -29,23 +27,17 @@ def refresh_all_workspaces(stdscr,
                            name_max: int,
                            name_mode: str = DEFAULT_TRUNCATION_MODE,
                            active_index: int = 0) -> bool:
-    """Refresh every repo across every configured workspace in parallel,
-    rendering a grouped loading screen so the user sees all workspaces
-    at once instead of one in isolation.
+    """Refresh the active workspace for startup loading.
 
     `workspace_repos` is a list of (workspace_name, repos, subtrees)
     triples — typically built from `state.workspaces` plus a per-
     workspace `discover_repos`. `active_index` is the workspace the
     main UI will land in once loading completes; it gets an "(active)"
-    marker on its header row. Total work is parallel across all repos
-    in all workspaces, so a 3-workspace startup completes in roughly
-    the same wall-clock time as a single-workspace one.
+    marker on its header row. Inactive workspaces are intentionally left
+    untouched and refresh on entry via switch_workspace.
 
     Returns True on a clean completion, False when the user pressed
-    Esc to abort. On cancel, in-flight refreshes keep running in
-    their daemon threads and die with the process — the caller is
-    expected to return from `run()` promptly rather than continue
-    setting up the main UI."""
+    Esc while the active workspace is loading."""
     all_repos: List[Repo] = [r for _, repos, _ in workspace_repos
                              for r in repos]
     if not all_repos:
@@ -54,34 +46,25 @@ def refresh_all_workspaces(stdscr,
     # their own bit without coordinating on a shared index.
     done: dict = {id(r): False for r in all_repos}
 
-    def work(r: Repo) -> None:
-        # Exceptions are swallowed so a single broken repo doesn't
-        # leave the loading screen stuck — the repo just stays
-        # spinning forever, which the user can Esc out of and re-
-        # investigate after the main UI loads with whatever did
-        # succeed. The previous `f.result()` re-raise pattern bubbled
-        # the first exception up through the executor and tore the
-        # app down before the user saw anything.
-        try:
-            refresh_repo_with_remote_state(r)
-        except Exception:  # noqa: BLE001
-            pass
+    def mark_done(r: Repo) -> None:
         done[id(r)] = True
 
-    # Daemon threads (rather than ThreadPoolExecutor) so an Esc-driven
-    # cancel doesn't have to wait for `shutdown(wait=True)` to drain
-    # the in-flight refreshes before we can return. The executor's
-    # workers aren't daemons by default — they outlive the function
-    # return and keep the process alive, which is the opposite of
-    # what "cancel" should mean.
-    for r in all_repos:
-        threading.Thread(target=work, args=(r,), daemon=True).start()
+    active_repos: List[Repo] = []
+    active_subtrees = []
+    if 0 <= active_index < len(workspace_repos):
+        active_repos = list(workspace_repos[active_index][1])
+        active_subtrees = workspace_repos[active_index][2]
+    else:
+        active_repos = list(all_repos)
+
+    if not kick_off_startup_refresh(active_repos, active_subtrees, mark_done):
+        return True
 
     curses.curs_set(0)
     stdscr.timeout(_FRAME_POLL_MS)
     frame = 0
     cancelled = False
-    while not all(done.values()):
+    while not all(done.get(id(r), False) for r in active_repos):
         draw_workspace_loading(
             stdscr, workspace_repos, done, name_max, name_mode,
             active_index, SPINNER_FRAMES[frame % len(SPINNER_FRAMES)])
@@ -102,13 +85,8 @@ def refresh_all_workspaces(stdscr,
 
     draw_workspace_loading(
         stdscr, workspace_repos, done, name_max, name_mode,
-        active_index, "✓")
+        active_index, SPINNER_FRAMES[frame % len(SPINNER_FRAMES)])
     curses.napms(120)
-    # Link siblings within each workspace independently — a submodule
-    # inside one workspace shouldn't be linked to a same-URL repo in
-    # a different workspace.
-    for _, repos, subtrees in workspace_repos:
-        link_siblings(repos, subtrees)
     return True
 
 
@@ -186,5 +164,3 @@ def draw_workspace_loading(stdscr,
         y += 1
 
     stdscr.refresh()
-
-

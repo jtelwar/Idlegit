@@ -18,9 +18,11 @@ for _p in (str(_HERE.parent), str(_HERE)):
 from _helpers import (  # noqa: E402
     make_repo_model as _make_repo, make_state as _state,
 )
-from core.models import (  # noqa: E402
-    State, Workspace, WorkspaceCreator, WorkspaceDraft, WorkspaceMenu,
-    AppMenu,
+from core.state.app import State  # noqa: E402
+from core.state.app_menu import AppMenu  # noqa: E402
+from core.runtime.jobs import JobSpec, JobStatus  # noqa: E402
+from core.state.workspaces import (  # noqa: E402
+    Workspace, WorkspaceCreator, WorkspaceDraft, WorkspaceMenu,
 )
 
 # UI imports curses at module load — skip on headless.
@@ -103,15 +105,15 @@ class TestEscHint(unittest.TestCase):
 
     def test_esc_clears_message_when_focused_field_is_dirty(self) -> None:
         a = _make_repo("a")
-        a.message = "wip"
         s = _state(a, selected=3)  # focus row 3 = first repo
+        s.store.set_row_message(a, "wip")
         self.assertEqual(_esc_hint(s).action, "clear message")
 
     def test_esc_warns_about_discard_with_unfocused_messages(self) -> None:
         a = _make_repo("a")
         b = _make_repo("b")
-        b.message = "wip"
         s = _state(a, b, selected=3)  # focused on a (no message)
+        s.store.set_row_message(b, "wip")
         self.assertEqual(_esc_hint(s).action, "discard messages + quit")
 
     def test_esc_returns_back_to_repos_in_task_focus(self) -> None:
@@ -182,8 +184,8 @@ class TestBodyRowHints(unittest.TestCase):
     def test_dirty_repo_with_message_omits_suggest_hints(self) -> None:
         a = _make_repo("a")
         a.staged = [("M", "x")]
-        a.message = "fix"
         s = _state(a, selected=3)
+        s.store.set_row_message(a, "fix")
         keys = [h.keys for h in _body_row_hints(s)]
         # Suggest hints disappear once a message is typed.
         self.assertNotIn("←", keys)
@@ -212,11 +214,39 @@ class TestTaskPanelHints(unittest.TestCase):
         actions = [h.action for h in _task_panel_hints(s)]
         self.assertNotIn("remove task", actions)
 
+    def test_pending_task_shows_no_remove_hint(self) -> None:
+        s = _state(_make_repo("a"))
+        s.focused_panel = "tasks"
+        t = s.tasks.add("pending thing")
+        s.tasks.update(t, "pending")
+        actions = [h.action for h in _task_panel_hints(s)]
+        self.assertNotIn("remove task", actions)
+
     def test_completed_task_shows_remove_hint(self) -> None:
         s = _state(_make_repo("a"))
         s.focused_panel = "tasks"
         t = s.tasks.add("done thing")
         s.tasks.update(t, "ok")
+        actions = [h.action for h in _task_panel_hints(s)]
+        self.assertIn("remove task", actions)
+
+    def test_active_job_hides_remove_hint_for_completed_task_row(self) -> None:
+        s = _state(_make_repo("a"))
+        s.focused_panel = "tasks"
+        t = s.tasks.add("done thing")
+        s.tasks.update(t, "ok")
+        job = s.job_registry.start(JobSpec(kind="commit", label="commit"))
+        s.job_registry.link_task(job, t)
+        actions = [h.action for h in _task_panel_hints(s)]
+        self.assertNotIn("remove task", actions)
+
+    def test_finished_job_shows_remove_hint_for_task_row(self) -> None:
+        s = _state(_make_repo("a"))
+        s.focused_panel = "tasks"
+        t = s.tasks.add("done thing")
+        job = s.job_registry.start(JobSpec(kind="commit", label="commit"))
+        s.job_registry.link_task(job, t)
+        s.job_registry.finish(job, JobStatus.OK)
         actions = [h.action for h in _task_panel_hints(s)]
         self.assertIn("remove task", actions)
 
@@ -286,56 +316,69 @@ class TestConfirmHints(unittest.TestCase):
 @unittest.skipUnless(UI_AVAILABLE, "ui module unavailable")
 class TestBranchPickerHints(unittest.TestCase):
     def _picker(self, branches=("main", "dev"), current="main", selected=0):
-        from core.models import BranchPicker
-        return BranchPicker(
+        from core.state.pickers import BranchPicker
+        state = State(repos=[], workspace_name="ws")
+        picker = BranchPicker(
             target_label="x", target_path=Path("/tmp"),
-            branches=list(branches), current=current, selected=selected)
+            load_id="branch-picker:test", selected=selected)
+        state.view_loads.finish(
+            picker.load_id, list(branches), details={"current": current})
+        return state, picker
 
     def test_empty_branches_only_back(self) -> None:
-        p = self._picker(branches=())
-        self.assertEqual(_pairs(branch_picker_hints(p)),
+        s, p = self._picker(branches=())
+        self.assertEqual(_pairs(branch_picker_hints(s, p)),
                          [("Esc", "back")])
 
     def test_focused_on_current_branch_shows_stay(self) -> None:
-        p = self._picker(branches=("main",), current="main", selected=0)
-        actions = [h.action for h in branch_picker_hints(p)]
+        s, p = self._picker(branches=("main",), current="main", selected=0)
+        actions = [h.action for h in branch_picker_hints(s, p)]
         self.assertIn("stay (already checked out)", actions)
 
     def test_focused_on_other_branch_names_checkout_target(self) -> None:
-        p = self._picker(branches=("main", "dev"), current="main", selected=1)
-        actions = [h.action for h in branch_picker_hints(p)]
+        s, p = self._picker(
+            branches=("main", "dev"), current="main", selected=1)
+        actions = [h.action for h in branch_picker_hints(s, p)]
         self.assertIn("checkout dev", actions)
 
 
 @unittest.skipUnless(UI_AVAILABLE, "ui module unavailable")
 class TestRemoteBranchPickerHints(unittest.TestCase):
     def _picker(self, refs=("origin/main",), loading=False, selected=0):
-        from core.models import RemoteBranchPicker
-        return RemoteBranchPicker(
+        from core.state.pickers import RemoteBranchPicker
+        state = State(repos=[], workspace_name="ws")
+        picker = RemoteBranchPicker(
             target_label="x", target_path=Path("/tmp"),
-            refs=list(refs), loading=loading, selected=selected)
+            load_id="remote-branch-picker:test", selected=selected)
+        if loading:
+            state.view_loads.create(picker.load_id)
+        else:
+            state.view_loads.finish(picker.load_id, list(refs))
+        return state, picker
 
     def test_loading_only_back(self) -> None:
         from ui.modals.remote_branch_picker import _hints as hints_fn
-        self.assertEqual(_pairs(hints_fn(self._picker(loading=True))),
+        state, picker = self._picker(loading=True)
+        self.assertEqual(_pairs(hints_fn(state, picker)),
                          [("Esc", "back")])
 
     def test_empty_refs_suggests_fetch(self) -> None:
         from ui.modals.remote_branch_picker import _hints as hints_fn
-        actions = [h.action for h in hints_fn(self._picker(refs=()))]
+        state, picker = self._picker(refs=())
+        actions = [h.action for h in hints_fn(state, picker)]
         self.assertIn("(no remote branches — fetch first)", actions)
 
     def test_enter_names_track_checkout(self) -> None:
         from ui.modals.remote_branch_picker import _hints as hints_fn
-        actions = [h.action for h in hints_fn(
-            self._picker(refs=("origin/dev",)))]
+        state, picker = self._picker(refs=("origin/dev",))
+        actions = [h.action for h in hints_fn(state, picker)]
         self.assertIn("checkout dev (track origin/dev)", actions)
 
 
 @unittest.skipUnless(UI_AVAILABLE, "ui module unavailable")
 class TestResetPromptHints(unittest.TestCase):
     def _prompt(self, typed=""):
-        from core.models import ResetPrompt
+        from core.state.prompts import ResetPrompt
         return ResetPrompt(target_label="x", target_path=Path("/tmp"),
                            typed=typed)
 
@@ -355,7 +398,8 @@ class TestResetPromptHints(unittest.TestCase):
 @unittest.skipUnless(UI_AVAILABLE, "ui module unavailable")
 class TestWorkflowPickerHints(unittest.TestCase):
     def test_runnable_row_describes_branch_target(self) -> None:
-        from core.models import WorkflowInfo, WorkflowPicker
+        from core.state.pickers import WorkflowPicker
+        from core.state.repos import WorkflowInfo
         wf = WorkflowInfo(
             name="ci", path=".github/workflows/ci.yml",
             state="active", dispatchable=True)
@@ -365,7 +409,8 @@ class TestWorkflowPickerHints(unittest.TestCase):
         self.assertIn("run on main", actions)
 
     def test_disabled_workflow_marks_unavailable(self) -> None:
-        from core.models import WorkflowInfo, WorkflowPicker
+        from core.state.pickers import WorkflowPicker
+        from core.state.repos import WorkflowInfo
         wf = WorkflowInfo(
             name="ci", path=".github/workflows/ci.yml",
             state="disabled_manually", dispatchable=True)
@@ -378,8 +423,8 @@ class TestWorkflowPickerHints(unittest.TestCase):
 @unittest.skipUnless(UI_AVAILABLE, "ui module unavailable")
 class TestAlignHeadsHints(unittest.TestCase):
     def test_branch_chosen_names_target(self) -> None:
-        from core.models import AlignHeadsPrompt
-        p = AlignHeadsPrompt(canonical_label="x", winner_label="y",
+        from core.state.prompts import AlignHeadsPrompt
+        p = AlignHeadsPrompt(canonical_name="x", winner_parent_name="y",
                              winner_sha="deadbeef",
                              branches=["main", "dev"], selected=1)
         actions = [h.action for h in align_heads_hints(p)]
@@ -451,9 +496,9 @@ class TestWorkspaceMenuHints(unittest.TestCase):
         self.assertIn("cancel edit", actions)
 
     def test_folder_row_with_multiple_offers_remove(self) -> None:
-        from ui.modals.workspace_menu import _build_rows
+        from features.workspace_menu.projection import build_rows
         s = self._state_with_menu([Path("/a"), Path("/b")])
-        rows = _build_rows(s.active_workspace)
+        rows = build_rows(s.active_workspace)
         m = WorkspaceMenu(rows=rows)
         # Find the first folder row index
         for i, r in enumerate(rows):
@@ -464,9 +509,9 @@ class TestWorkspaceMenuHints(unittest.TestCase):
         self.assertIn("remove folder", actions)
 
     def test_folder_row_with_single_refuses_remove(self) -> None:
-        from ui.modals.workspace_menu import _build_rows
+        from features.workspace_menu.projection import build_rows
         s = self._state_with_menu([Path("/only")])
-        rows = _build_rows(s.active_workspace)
+        rows = build_rows(s.active_workspace)
         m = WorkspaceMenu(rows=rows)
         for i, r in enumerate(rows):
             if r.kind == "folder":

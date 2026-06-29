@@ -4,26 +4,35 @@ from __future__ import annotations
 import curses
 from typing import Optional
 
-from core.models import State
+from core.runtime.jobs import JobStatus
+from core.runtime.task_actions import task_can_remove
+from core.state.app import State
+from core.state.selectors import (
+    RowDisplayState,
+    child_row_state,
+    commit_message_count,
+    repo_row_state,
+)
+from features.action_menu.session import open_action_menu
 from core.workers import (
-    _build_recovery_prompt,
-    execute_detached_recovery,
+    cancel_review_file_loads,
+    kick_off_detached_review_preflight,
     kick_off_bulk_suggest,
+    kick_off_review_files_load,
     kick_off_safe_merge_confirm,
     kick_off_safe_merge_finalize,
     kick_off_suggest_for,
     kick_off_workers,
-    refresh_repo_with_remote_state,
     safe_merge_abort,
 )
 from .colors import PAIR_WARN
 from .geometry import safe_addstr
 from .main_screen import _focused_message_holder, draw_main
 from .modals import (
+    _any_tab_loading,
     draw_diff_viewer,
     handle_detached_recovery_prompt_key,
     handle_diff_viewer_key,
-    open_action_menu,
     open_commit_msg_editor,
     open_diff_viewer,
     open_task_action_menu,
@@ -38,7 +47,6 @@ from .review import (
     draw_review,
     fire_toolbar_action,
     is_toolbar_toggle,
-    kick_off_review_files_load,
 )
 from .safe_merge import (
     all_decided,
@@ -56,7 +64,33 @@ def _reset_field_cursor(state: State) -> None:
     """Park the cursor at the end of the focused row's message — runs after
     every selection change so each field starts in a familiar place."""
     holder = _focused_message_holder(state)
-    state.field_cursor = len(holder.message) if holder is not None else 0
+    state.field_cursor = (
+        len(_holder_message(state, holder)) if holder is not None else 0
+    )
+
+
+def _holder_message(state: State, holder) -> str:
+    return "" if holder is None else state.store.row_message(holder)
+
+
+def _set_holder_message(state: State, holder, message: str) -> None:
+    state.store.set_row_message(holder, message)
+
+
+def _focused_row_state(state: State) -> Optional[RowDisplayState]:
+    """Return selector state for the currently focused editable row."""
+    cur = state.current_repo
+    if cur is not None:
+        return repo_row_state(state, cur)
+    cur_child = state.current_child
+    if cur_child is not None:
+        return child_row_state(state, cur_child[1])
+    return None
+
+
+def _focused_row_is_busy(state: State) -> bool:
+    row_state = _focused_row_state(state)
+    return bool(row_state is not None and row_state.busy)
 
 
 def _clamp_task_selection(state: State) -> None:
@@ -84,7 +118,7 @@ def handle_task_panel_key(state: State, key: int) -> Optional[str]:
         state.focused_panel = "repos"
         return None
 
-    if key == 18:  # Ctrl+R — refresh
+    if key == 18 or key == curses.KEY_F5:  # Ctrl+R / F5 — refresh
         return "refresh"
     if key == 19:
         return "sync"
@@ -126,7 +160,7 @@ def handle_task_panel_key(state: State, key: int) -> Optional[str]:
         # would silently cancel the queued follow-up.
         if 0 <= state.task_selected < n:
             t = items[state.task_selected]
-            if t.status not in ("running", "pending"):
+            if task_can_remove(state, t):
                 state.tasks.remove(t)
                 _clamp_task_selection(state)
         return None
@@ -167,7 +201,7 @@ def handle_main_key(state: State, key: int) -> Optional[str]:
     if state.focused_panel == "tasks":
         return handle_task_panel_key(state, key)
 
-    if key == 18:  # Ctrl+R — refresh state, prune tasks
+    if key == 18 or key == curses.KEY_F5:  # Ctrl+R / F5 — refresh state
         return "refresh"
     if key == 19:  # Ctrl+S — fetch + checkout every tracked sibling
         return "sync"
@@ -212,7 +246,7 @@ def handle_main_key(state: State, key: int) -> Optional[str]:
         if key == curses.KEY_RIGHT:
             return _cycle_workspace(state, +1)
         if key in (10, 13, curses.KEY_ENTER):
-            from .modals.workspace_switcher import open_workspace_switcher
+            from features.workspace_switcher.session import open_workspace_switcher
             open_workspace_switcher(state)
             return None
         if key == 9:  # Tab — opens the workspace settings modal
@@ -241,10 +275,7 @@ def handle_main_key(state: State, key: int) -> Optional[str]:
         return None
 
     if key == 9:  # Tab — open per-row action menu
-        cur = state.current_repo
-        cur_child = state.current_child
-        if (cur is not None and cur.refreshing) or \
-                (cur_child is not None and cur_child[1].refreshing):
+        if _focused_row_is_busy(state):
             return None  # action in flight — ignore until lock releases
         open_action_menu(state)
         return None
@@ -259,10 +290,11 @@ def handle_main_key(state: State, key: int) -> Optional[str]:
     target_message_holder = _focused_message_holder(state)
 
     if key == 27:
-        if target_message_holder is not None and target_message_holder.refreshing:
+        if target_message_holder is not None and _focused_row_is_busy(state):
             return "confirm-quit" if state.has_messages else "quit"
-        if target_message_holder is not None and target_message_holder.message:
-            target_message_holder.message = ""
+        if target_message_holder is not None and _holder_message(
+                state, target_message_holder):
+            _set_holder_message(state, target_message_holder, "")
             state.field_cursor = 0
             return None
         return "confirm-quit" if state.has_messages else "quit"
@@ -270,10 +302,10 @@ def handle_main_key(state: State, key: int) -> Optional[str]:
     if target_message_holder is None:
         return None  # subtree row or otherwise non-editable
 
-    if target_message_holder.refreshing:
+    if _focused_row_is_busy(state):
         return None  # message retained but not editable until refresh finishes
 
-    msg = target_message_holder.message
+    msg = _holder_message(state, target_message_holder)
     cur = max(0, min(state.field_cursor, len(msg)))
 
     if key == curses.KEY_LEFT:
@@ -298,15 +330,27 @@ def handle_main_key(state: State, key: int) -> Optional[str]:
 
     if key in (curses.KEY_BACKSPACE, 127, 8):
         if cur > 0:
-            target_message_holder.message = msg[: cur - 1] + msg[cur:]
+            _set_holder_message(
+                state,
+                target_message_holder,
+                msg[: cur - 1] + msg[cur:],
+            )
             state.field_cursor = cur - 1
         return None
     if key == curses.KEY_DC:  # forward delete
         if cur < len(msg):
-            target_message_holder.message = msg[:cur] + msg[cur + 1:]
+            _set_holder_message(
+                state,
+                target_message_holder,
+                msg[:cur] + msg[cur + 1:],
+            )
         return None
     if 32 <= key < 127:
-        target_message_holder.message = msg[:cur] + chr(key) + msg[cur:]
+        _set_holder_message(
+            state,
+            target_message_holder,
+            msg[:cur] + chr(key) + msg[cur:],
+        )
         state.field_cursor = cur + 1
         return None
     return None
@@ -327,9 +371,10 @@ def ensure_cursor_visible(line_index: int, scroll: int, body_h: int) -> int:
 def confirm_quit(stdscr, state: State) -> bool:
     """Show a 'Quit and discard N message(s)? [y/N]' prompt at the bottom of
     the main screen. Returns True if the user confirms, False to cancel."""
+    stdscr.timeout(100)
     draw_main(stdscr, state)
     h, _ = stdscr.getmaxyx()
-    n = sum(1 for r in state.repos if r.message.strip())
+    n = commit_message_count(state)
     plural = "" if n == 1 else "s"
     prompt = f"Quit and discard {n} commit message{plural}? [y/N]"
     try:
@@ -355,109 +400,37 @@ def confirm_quit(stdscr, state: State) -> bool:
 
 
 def _detached_review_preflight(stdscr, state: State) -> bool:
-    """Pop the recovery modal for every detached-HEAD repo / submodule
-    child that has a queued commit message, BEFORE the review screen
-    draws. Returns True when the review can proceed (every detached
-    target either got fast-forwarded or wasn't on the commit list);
-    False if the user cancelled any prompt — in which case the review
-    is aborted and the cursor goes back to the main panel.
+    """Run detached-HEAD review recovery as a worker-owned preflight.
 
-    Without this preflight, a detached canonical row got past review
-    all the way to `commit_worker` before the recovery modal popped,
-    which felt like idlegit was "about to push on origin/(detached)"
-    even though the commit_worker guard would still have caught it.
-    Surfacing the modal at review time matches the user's mental
-    model of "I just told it to commit; ask now"."""
-    while True:
-        target = _next_detached_review_target(state)
-        if target is None:
-            return True
-        path, label = target
-        prompt = _build_recovery_prompt(path, label)
-        if prompt is None:
-            # No recovery branch available — surface a one-shot warn
-            # task and abort the review so commit_worker doesn't try
-            # to push a (detached) refspec.
-            t = state.tasks.add(f"{label}: cannot commit")
-            state.tasks.update(
-                t, "fail",
-                "detached HEAD with no recoverable target branch")
-            return False
-        state.detached_recovery_prompt = prompt
-        if not _drive_modal_until_closed(stdscr, state,
-                                         "detached_recovery_prompt"):
-            return False
-        if prompt.chosen_action != "ff":
-            return False
-        ok, msg = execute_detached_recovery(path, prompt.target_branch)
-        if not ok:
-            t = state.tasks.add(f"{label}: cannot commit")
-            state.tasks.update(t, "fail", msg or "recovery failed")
-            return False
-        # Refresh the in-memory Repo so build_review_blocks sees the
-        # real branch name instead of the stale "(detached)" sentinel.
-        for repo in state.repos:
-            if repo.path == path:
-                refresh_repo_with_remote_state(repo)
-                break
-            for ref in repo.children:
-                if ref.kind == "submodule" and ref.nested_path == path:
-                    refresh_repo_with_remote_state(ref.repo)
-                    break
-        # Loop back — the next iteration finds the next detached
-        # target (if any) and runs the same flow.
-
-
-def _next_detached_review_target(state: State):
-    """Return `(path, label)` for the next detached commit target with
-    a queued message, or None when none remain. Walks top-level repos
-    first, then submodule children — so the modal sequence is stable
-    and predictable."""
-    from core.git_ops import git
-    for repo in state.repos:
-        if not repo.message.strip():
-            continue
-        rc, out, _ = git(repo.path, ["branch", "--show-current"])
-        if rc == 0 and not out.strip():
-            return repo.path, repo.display_name
-    for parent in state.repos:
-        for child in parent.children:
-            if child.kind != "submodule" or not child.message.strip():
-                continue
-            rc, out, _ = git(child.nested_path, ["branch", "--show-current"])
-            if rc == 0 and not out.strip():
-                label = (f"↳ {child.repo.display_name} "
-                         f"in {parent.display_name}")
-                return child.nested_path, label
-    return None
-
-
-def _drive_modal_until_closed(stdscr, state: State, slot: str) -> bool:
-    """Inner event loop that draws the main UI plus whichever modal
-    `state.<slot>` is set to, dispatching keys to the matching
-    handler until the modal clears its slot. Used by the review-
-    screen preflight to surface a `DetachedRecoveryPrompt` from the
-    main thread (workers use `result_event` instead).
-
-    Returns True when the modal closed normally; False on a Ctrl+C
-    interrupt (caller treats this as a cancel)."""
-    handler = {
-        "detached_recovery_prompt": handle_detached_recovery_prompt_key,
-    }[slot]
-    while getattr(state, slot) is not None:
+    The UI loop only draws and routes the recovery prompt while the worker
+    performs git probing, safe recovery, and refresh. This keeps review entry
+    from blocking the input thread before a task/job exists."""
+    job = kick_off_detached_review_preflight(state)
+    if job is None:
+        return True
+    if job.terminal:
+        return job.status in (JobStatus.OK, JobStatus.WARN)
+    stdscr.timeout(100)
+    while not job.terminal:
         draw_main(stdscr, state)
         stdscr.refresh()
         try:
             key = read_key(stdscr)
         except KeyboardInterrupt:
-            setattr(state, slot, None)
+            prompt = state.detached_recovery_prompt
+            if prompt is not None:
+                prompt.chosen_action = "cancel"
+                prompt.result_event.set()
+                state.detached_recovery_prompt = None
+            state.job_registry.request_cancel(job)
             return False
         if key == -1:
             continue
         if key == curses.KEY_RESIZE:
             continue
-        handler(state, key)
-    return True
+        if state.detached_recovery_prompt is not None:
+            handle_detached_recovery_prompt_key(state, key)
+    return job.status in (JobStatus.OK, JobStatus.WARN)
 
 
 def handle_confirm(stdscr, state: State) -> None:
@@ -484,9 +457,9 @@ def handle_confirm(stdscr, state: State) -> None:
     blocks = build_review_blocks(state)
     if not blocks:
         return
-    kick_off_review_files_load(blocks)
+    kick_off_review_files_load(state, blocks)
 
-    focusables = _collect_review_focusables(blocks)
+    focusables = _collect_review_focusables(state, blocks)
     # Land on the first message (suggest) row — the top of each block and
     # the natural starting point; ↓ steps down through LFS, the push
     # toggle, and the on-push actions in pipeline order. Falls back to
@@ -498,11 +471,12 @@ def handle_confirm(stdscr, state: State) -> None:
 
     try:
         while True:
-            anim = any(b.files_loading or b.suggesting for b in blocks) or (
+            anim = any(
+                state.review_drafts.get_or_create(b.draft_id).files_loading
+                or state.review_drafts.get_or_create(
+                    b.draft_id).suggesting for b in blocks) or (
                 state.diff_viewer is not None
-                and (state.diff_viewer.loading
-                     or state.diff_viewer.log_loading
-                     or state.diff_viewer.blame_loading))
+                and _any_tab_loading(state, state.diff_viewer))
             stdscr.timeout(100 if anim else 1000)
             scroll = draw_review(stdscr, state, blocks, focusables,
                                  focus, panel_focus, scroll)
@@ -531,19 +505,10 @@ def handle_confirm(stdscr, state: State) -> None:
             if key == 27:  # Esc
                 return
             if key == 11:  # Ctrl+K — clear all then-run chains
-                # Manual reset escape hatch for the case where the
-                # spec's "queue → forget" auto-clear hasn't fired
-                # yet (after-workflow chains stay until `_poll_run`
-                # pops them; the user may want to reset before that
-                # lands). Wipes every Repo's then-run state plus
-                # `track_workflow` so the next review starts clean.
+                # Manual reset escape hatch for review-owned chains.
                 # Doesn't touch commit messages or staged-paths.
-                for r in state.repos:
-                    r.track_workflow.clear()
-                    r.then_run_after_push = ""
-                    r.then_run_params_after_push.clear()
-                    r.then_run_after_workflow.clear()
-                    r.then_run_params_after_workflow.clear()
+                for b in blocks:
+                    state.review_drafts.clear_workflow_intent(b.draft_id)
                 continue
             if key in (10, 13, curses.KEY_ENTER):
                 if panel_focus == "left":
@@ -552,7 +517,10 @@ def handle_confirm(stdscr, state: State) -> None:
                     # staging step and bail with "nothing staged". The
                     # left-pane Enter hint is hidden in the same
                     # condition so this is just defence in depth.
-                    if any(b.files_loading for b in blocks):
+                    if any(
+                            state.review_drafts.get_or_create(
+                                b.draft_id).files_loading
+                            for b in blocks):
                         continue
                     kick_off_workers(state, blocks)
                     return  # async pipeline takes over the sidebar
@@ -563,7 +531,7 @@ def handle_confirm(stdscr, state: State) -> None:
                 if 0 <= bi < len(blocks):
                     block = blocks[bi]
                     if block.toolbar_focus >= 0:
-                        fire_toolbar_action(block, block.toolbar_focus)
+                        fire_toolbar_action(state, block, block.toolbar_focus)
                 continue
             if key == 9:  # Tab — only meaningful in the right (Changes) pane
                 # No-op when the user is on the left review pane: there's
@@ -577,9 +545,10 @@ def handle_confirm(stdscr, state: State) -> None:
                 bi = _focused_block_idx(focusables, focus)
                 if 0 <= bi < len(blocks):
                     block = blocks[bi]
-                    if (not block.files_loading and block.files
-                            and 0 <= block.file_selected < len(block.files)):
-                        fe = block.files[block.file_selected]
+                    draft = state.review_drafts.get_or_create(block.draft_id)
+                    if (not draft.files_loading and draft.files
+                            and 0 <= block.file_selected < len(draft.files)):
+                        fe = draft.files[block.file_selected]
                         open_diff_viewer(
                             state,
                             target_path=block.target_path,
@@ -611,23 +580,23 @@ def handle_confirm(stdscr, state: State) -> None:
                         _then_run_param_value,
                     )
                     sel, param_name = focusables[focus][2]
-                    spec = _find_param_spec(sel, param_name)
+                    spec = _find_param_spec(state, sel, param_name)
                     if spec is None:
                         continue
                     if key in (curses.KEY_BACKSPACE, 127, 8):
-                        cur = _then_run_param_value(sel, param_name)
+                        cur = _then_run_param_value(state, sel, param_name)
                         _set_then_run_param_value(
-                            sel, param_name, cur[:-1])
+                            state, sel, param_name, cur[:-1])
                         continue
                     if 32 <= key < 127:
                         ch = chr(key)
-                        cur = _then_run_param_value(sel, param_name)
+                        cur = _then_run_param_value(state, sel, param_name)
                         if (not cur and ch == "-"
                                 and spec.refuse_leading_dash):
                             continue
                         if ch in spec.valid_chars:
                             _set_then_run_param_value(
-                                sel, param_name, cur + ch)
+                                state, sel, param_name, cur + ch)
                         continue
                     # Fall through for ↑/↓ (handled below) and any
                     # other gesture that should still navigate.
@@ -636,13 +605,16 @@ def handle_confirm(stdscr, state: State) -> None:
                     if kind == "lfs":
                         obj.track = not obj.track
                     elif kind == "toggle":
-                        on = obj.repo.track_workflow.get(
+                        draft = state.review_drafts.get_or_create(
+                            obj.draft_id)
+                        on = draft.track_workflow.get(
                             obj.workflow_name, False)
-                        obj.repo.track_workflow[obj.workflow_name] = not on
+                        state.review_drafts.set_track_workflow(
+                            obj.draft_id, obj.workflow_name, not on)
                         # Tracking an action shows its then-run chain;
                         # untracking hides it — so rebuild the focusables
                         # list and clamp focus, same as the push toggle.
-                        focusables = _collect_review_focusables(blocks)
+                        focusables = _collect_review_focusables(state, blocks)
                         if focus >= len(focusables):
                             focus = max(0, len(focusables) - 1)
                     elif kind == "push":
@@ -651,8 +623,9 @@ def handle_confirm(stdscr, state: State) -> None:
                         # tracking, then-run-after-push), so rebuild the
                         # focusables list and clamp focus — same dance
                         # as cycling a then-run target below.
-                        obj.push = not obj.push
-                        focusables = _collect_review_focusables(blocks)
+                        draft = state.review_drafts.get_or_create(obj.draft_id)
+                        state.review_drafts.set_push(obj.draft_id, not draft.push)
+                        focusables = _collect_review_focusables(state, blocks)
                         if focus >= len(focusables):
                             focus = max(0, len(focusables) - 1)
                     # Space on a suggest / then-run row is a no-op
@@ -663,7 +636,8 @@ def handle_confirm(stdscr, state: State) -> None:
                     _, kind, obj = focusables[focus]
                     if kind == "then_run":
                         cycle_then_run(
-                            obj, -1 if key == curses.KEY_LEFT else 1)
+                            state, obj,
+                            -1 if key == curses.KEY_LEFT else 1)
                         # Cycling can add or remove the tag_input
                         # row that follows this selector — rebuild
                         # the focusables list so Down lands on the
@@ -671,7 +645,7 @@ def handle_confirm(stdscr, state: State) -> None:
                         # just disappeared). Clamp focus so an
                         # entry that was at the tail doesn't fall
                         # past the end after the rebuild.
-                        focusables = _collect_review_focusables(blocks)
+                        focusables = _collect_review_focusables(state, blocks)
                         if focus >= len(focusables):
                             focus = max(0, len(focusables) - 1)
                     elif kind == "suggest" and key == curses.KEY_LEFT:
@@ -691,7 +665,8 @@ def handle_confirm(stdscr, state: State) -> None:
                 bi = _focused_block_idx(focusables, focus)
                 if 0 <= bi < len(blocks):
                     block = blocks[bi]
-                    n = len(block.files)
+                    draft = state.review_drafts.get_or_create(block.draft_id)
+                    n = len(draft.files)
                     if block.toolbar_focus >= 0:
                         # Toolbar focus mode — Up is a no-op (already
                         # at the top of the pane), Down drops back to
@@ -715,7 +690,7 @@ def handle_confirm(stdscr, state: State) -> None:
                         elif key == ord(" ") and is_toolbar_toggle(
                                 block.toolbar_focus):
                             fire_toolbar_action(
-                                block, block.toolbar_focus)
+                                state, block, block.toolbar_focus)
                     else:
                         if key == curses.KEY_UP and block.file_selected > 0:
                             block.file_selected -= 1
@@ -730,14 +705,14 @@ def handle_confirm(stdscr, state: State) -> None:
                             block.file_selected += 1
                         elif key == ord(" ") and 0 <= block.file_selected < n:
                             # Toggle the staged-for-commit checkbox.
-                            # Pipeline reads block.staged_paths at
-                            # commit dispatch.
-                            fe = block.files[block.file_selected]
-                            cur = block.staged_paths.get(fe.path, False)
-                            block.staged_paths[fe.path] = not cur
+                            # Pipeline reads review_drafts at commit
+                            # dispatch.
+                            fe = draft.files[block.file_selected]
+                            cur = draft.staged_paths.get(fe.path, False)
+                            state.review_drafts.set_staged(
+                                block.draft_id, fe.path, not cur)
     finally:
-        for b in blocks:
-            b.cancel_event.set()
+        cancel_review_file_loads(state, blocks)
 
 
 def handle_safe_merge(stdscr, state: State) -> None:

@@ -15,6 +15,7 @@ This file is just the entry point — the real code lives in:
 
 See README.md for config locations and the keymap.
 """
+
 from __future__ import annotations
 
 import contextlib
@@ -28,11 +29,10 @@ from core.config import (
     apply_workspace_overrides,
     load_config,
     load_workspaces,
-    save_workspaces,
     get_load_warnings,
 )
 from core.git_ops import discover_repos
-from core.models import State
+from core.state.app import State
 from ui import (
     SPINNER_FRAMES,
     confirm_quit,
@@ -71,8 +71,10 @@ from core.workers import (
     kick_off_inline_refresh,
     kick_off_pull_all,
     kick_off_sync_siblings,
+    kick_off_workspace_settings_save,
     switch_workspace,
 )
+from core.state.selectors import view_load_activity_active
 
 
 @contextlib.contextmanager
@@ -122,20 +124,57 @@ def _disable_flow_control() -> None:
     """Stop the tty from eating Ctrl+S (XOFF) and Ctrl+Q (XON). Curses
     enables cbreak by default, which leaves the kernel-level
     software flow control on — Ctrl+S then pauses output and never
-    reaches our getch loop. Clearing IXON/IXOFF on stdin makes both
-    keys deliverable like any other control char. No-op if stdin
-    isn't a real tty (CI, pipes, ...) or if termios is unavailable
+    reaches our getch loop. Clearing IXON/IXOFF on every plausible
+    controlling-tty fd makes both keys deliverable like any other
+    control char. No-op if no real tty is available (CI, pipes, ...)
+    or if termios is unavailable
     (Windows: XON/XOFF is a POSIX terminal-driver concept; there's
     nothing to clear)."""
-    if sys.platform == "win32" or not sys.stdin.isatty():
+    if sys.platform == "win32":
         return
     import termios
+
+    candidates = []
+    seen = set()
+
+    def add_fd(fd: int, close_after: bool = False) -> None:
+        if fd < 0 or fd in seen:
+            if close_after:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            return
+        seen.add(fd)
+        candidates.append((fd, close_after))
+
+    add_fd(0)
     try:
-        attrs = termios.tcgetattr(sys.stdin)
-        attrs[0] &= ~(termios.IXON | termios.IXOFF)
-        termios.tcsetattr(sys.stdin, termios.TCSANOW, attrs)
-    except termios.error:
+        add_fd(sys.stdin.fileno())
+    except (AttributeError, OSError):
         pass
+    try:
+        flags = os.O_RDWR
+        if hasattr(os, "O_NOCTTY"):
+            flags |= os.O_NOCTTY
+        add_fd(os.open("/dev/tty", flags), close_after=True)
+    except (termios.error, OSError):
+        pass
+
+    for fd, close_after in candidates:
+        try:
+            if os.isatty(fd):
+                attrs = termios.tcgetattr(fd)
+                attrs[0] &= ~(termios.IXON | termios.IXOFF)
+                termios.tcsetattr(fd, termios.TCSANOW, attrs)
+        except (termios.error, OSError):
+            pass
+        finally:
+            if close_after:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
 
 
 def _discover_workspace_repos(folders) -> list:
@@ -159,27 +198,28 @@ def _run_workspace_creator_subloop(stdscr, cfg, startup_warnings=None):
     """Run the workspace creator as a self-contained sub-loop. Used at
     first launch when idlegit.workspaces is empty/missing — drives a
     blank welcome backdrop with the creator modal overlaid until the
-    user either commits at least one workspace (returns the list, also
-    persisted via save_workspaces) or cancels with Esc (returns [])."""
-    from core.models import State
+    user either commits at least one workspace (returns the list) or
+    cancels with Esc (returns [])."""
+    from core.state.app import State
     from ui import (
-        PAIR_HEADER, draw_workspace_creator,
+        PAIR_HEADER,
+        draw_workspace_creator,
         open_workspace_creator,
         sidebar_geometry,
     )
+
     state = State(
-        repos=[], workspace_name="", workspaces=[], base_config=cfg,
+        repos=[],
+        workspace_name="",
+        workspaces=[],
+        base_config=cfg,
     )
-    intro = ("No workspaces are configured yet. Add one or more folder "
-             "paths to scan for git repos.")
+    intro = "No workspaces are configured yet. Add one or more folder paths to scan for git repos."
     if startup_warnings:
-        intro = (f"{startup_warnings[0]}\n\n"
-                 "Add one or more folder paths to scan for git repos.")
-    open_workspace_creator(
-        state,
-        title="Welcome to Idlegit",
-        intro=intro)
+        intro = f"{startup_warnings[0]}\n\nAdd one or more folder paths to scan for git repos."
+    open_workspace_creator(state, title="Welcome to Idlegit", intro=intro)
     from ui.mouse import enable_mouse, read_key
+
     enable_mouse()
     stdscr.timeout(100)
     while state.workspace_creator is not None:
@@ -191,8 +231,13 @@ def _run_workspace_creator_subloop(stdscr, cfg, startup_warnings=None):
         stdscr.erase()
         h, w = stdscr.getmaxyx()
         title = "Idlegit"
-        safe_addstr(stdscr, 1, max(2, (w - len(title)) // 2), title,
-                    curses.A_BOLD | curses.color_pair(PAIR_HEADER))
+        safe_addstr(
+            stdscr,
+            1,
+            max(2, (w - len(title)) // 2),
+            title,
+            curses.A_BOLD | curses.color_pair(PAIR_HEADER),
+        )
         sidebar_x, _ = sidebar_geometry(w)
         draw_workspace_creator(stdscr, state, sidebar_x)
         stdscr.refresh()
@@ -219,8 +264,7 @@ def _run_workspace_creator_subloop(stdscr, cfg, startup_warnings=None):
     return result
 
 
-def run(stdscr, cfg, workspaces, initial_active_idx: int = 0,
-        startup_warnings=None) -> None:
+def run(stdscr, cfg, workspaces, initial_active_idx: int = 0, startup_warnings=None) -> None:
     try:
         curses.set_escdelay(25)
     except (AttributeError, curses.error):
@@ -230,24 +274,22 @@ def run(stdscr, cfg, workspaces, initial_active_idx: int = 0,
     _disable_flow_control()
     stdscr.keypad(True)
     from ui.mouse import enable_mouse
+
     enable_mouse()
     stdscr.timeout(100)  # non-blocking getch — drives sidebar animation.
 
+    first_run_created_workspaces = False
     # First-run path: idlegit.workspaces missing or empty drops us into
     # the creator wizard before the main UI gets to draw. The wizard
-    # blocks until the user commits at least one workspace (then we
-    # persist it) or cancels with Esc (we exit cleanly).
+    # blocks until the user commits at least one workspace or cancels
+    # with Esc (we exit cleanly). Persistence is scheduled once the
+    # main State exists so the same worker-owned writer handles first
+    # run and runtime creation.
     if not workspaces:
-        workspaces = _run_workspace_creator_subloop(
-            stdscr, cfg, startup_warnings=startup_warnings)
+        workspaces = _run_workspace_creator_subloop(stdscr, cfg, startup_warnings=startup_warnings)
         if not workspaces:
             return
-        try:
-            save_workspaces(workspaces, active_index=0)
-        except OSError:
-            # Persistence failure is non-fatal — the user can re-create
-            # the workspaces next run; right now just keep going.
-            pass
+        first_run_created_workspaces = True
         active_idx = 0
     else:
         # Honour the persisted last-active index from idlegit.workspaces
@@ -255,33 +297,25 @@ def run(stdscr, cfg, workspaces, initial_active_idx: int = 0,
         # validated this against the post-filter workspace list.
         active_idx = max(0, min(initial_active_idx, len(workspaces) - 1))
     active_ws = workspaces[active_idx]
-    # Discover repos for EVERY configured workspace up front, then
-    # refresh them all in parallel. Loading every workspace at startup
-    # makes ←/→ workspace switching instant (the lists are already
-    # there, no async fetch race), and surfaces every workspace's
-    # repos on the loading screen so the user can see the whole
-    # picture instead of just the active workspace's contents.
-    workspace_repos: list = []
-    for ws in workspaces:
-        ws_repos = _discover_workspace_repos(ws.folders)
-        # Stash the discovered list onto the Workspace so switching
-        # later just reuses these refreshed Repo objects — no re-
-        # discovery, no async refresh race when the user rapid-fires
-        # ←/→ between workspaces.
-        ws.cached_repos = ws_repos
-        workspace_repos.append((ws.display_name, ws_repos, ws.subtrees))
-    repos = workspace_repos[active_idx][1]
-    # Esc during the initial parallel-refresh aborts the load and
-    # quits — the only "quit" gesture available before the main loop
-    # gets to dispatch keys. Background refresh threads are daemons
-    # and die with the process.
+    # Discover and refresh only the active workspace at startup, but pass
+    # every workspace through to the loading screen so the user sees the
+    # whole configured set. Inactive workspaces keep any cached rows they
+    # already have and refresh on entry via switch_workspace.
+    active_repos = _discover_workspace_repos(active_ws.folders)
+    active_ws.cached_repos = active_repos
+    workspace_repos = []
+    for i, ws in enumerate(workspaces):
+        repos_for_row = active_repos if i == active_idx else list(ws.cached_repos)
+        workspace_repos.append((ws.display_name, repos_for_row, ws.subtrees))
+    repos = active_repos
+    # Esc during the initial refresh aborts the load and quits — the
+    # only "quit" gesture available before the main loop dispatches keys.
     if not refresh_all_workspaces(
-            stdscr, workspace_repos, cfg.name_display_max,
-            cfg.name_truncation, active_index=active_idx):
+        stdscr, workspace_repos, cfg.name_display_max, cfg.name_truncation, active_index=active_idx
+    ):
         return
 
-    title = (f"Idlegit · {active_ws.display_name}"
-             if active_ws.display_name else "Idlegit")
+    title = f"Idlegit · {active_ws.display_name}" if active_ws.display_name else "Idlegit"
     # Re-emit immediately after curses owns the terminal: VS Code's
     # integrated terminal (and a few others) overwrite the title with
     # the running-process name once the alt-screen comes up.
@@ -293,11 +327,19 @@ def run(stdscr, cfg, workspaces, initial_active_idx: int = 0,
         active_workspace_index=active_idx,
         base_config=cfg,
     )
+    state.replace_repos(active_repos, workspace=active_ws, notify=False)
+    if first_run_created_workspaces:
+        kick_off_workspace_settings_save(
+            state,
+            label="save new workspaces",
+            success_message="workspaces saved",
+        )
     # Task logging is global (not workspace-scoped) so it's wired from
     # the loaded Config directly, not from apply_workspace_overrides.
     # When enabled, every terminal task transition appends a line to
     # `task_log_path`; the cap rotates oldest-first when exceeded.
     from core.task_log import resolve_task_log_path, wire_task_log
+
     state.task_log_enabled = cfg.task_log_enabled
     state.task_log_path = resolve_task_log_path(cfg.task_log_path)
     state.task_log_max_lines = cfg.task_log_max_lines
@@ -316,8 +358,10 @@ def run(stdscr, cfg, workspaces, initial_active_idx: int = 0,
     # no-op (and tears down any leftover observer) when the config flag
     # is off; the manager handles per-repo schedule + debounce.
     from core.fs_watcher import (
-        reconcile_repo_watchers, stop_repo_watchers,
+        reconcile_repo_watchers,
+        stop_repo_watchers,
     )
+
     reconcile_repo_watchers(state)
 
     try:
@@ -329,20 +373,87 @@ def run(stdscr, cfg, workspaces, initial_active_idx: int = 0,
         stop_repo_watchers()
 
 
+def _periodic_refresh_interval(state) -> float:
+    interval = getattr(state, "periodic_refresh_seconds", 0)
+    return interval if interval >= 1 else 0.0
+
+
+def _local_mutation_active(state) -> bool:
+    from core.state.selectors import any_local_mutation_active
+    return any_local_mutation_active(state)
+
+
+def _row_activity_active(state) -> bool:
+    from core.state.selectors import (
+        active_workspace_child_rows,
+        active_workspace_repo_rows,
+        child_row_state,
+        read_only_row_busy_active,
+        repo_row_state,
+    )
+    if read_only_row_busy_active(state):
+        return True
+    for repo in active_workspace_repo_rows(state):
+        if repo_row_state(state, repo).suggesting:
+            return True
+    for _parent, child in active_workspace_child_rows(state):
+        if child_row_state(state, child).suggesting:
+            return True
+    return False
+
+
+def _periodic_refresh_idle(state) -> bool:
+    if state.in_review or state.in_safe_merge:
+        return False
+    if _local_mutation_active(state):
+        return False
+    from core.state.selectors import read_only_row_busy_active
+    if read_only_row_busy_active(state):
+        return False
+    return True
+
+
+def _main_loop_timeout_ms(
+        state,
+        *,
+        anim_running: bool,
+        mutation_jobs_just_drained: bool,
+        periodic_refresh_fired: bool,
+) -> int:
+    ui_event_pending = state.ui_events.drain()
+    if anim_running or mutation_jobs_just_drained or periodic_refresh_fired or ui_event_pending:
+        return 100
+    return 1000
+
+
 def _run_main_loop(stdscr, state, title):
     from core.fs_watcher import drain_pending_refreshes
     from ui.mouse import read_key
+
     last_title_emitted = title
     last_title_at = time.monotonic()
-    # Track tasks.has_running() across iterations so we can detect the
-    # transition from "actions in flight" → "idle" and drain queued
+    last_periodic_workspace_index = state.active_workspace_index
+    last_periodic_interval = _periodic_refresh_interval(state)
+    next_periodic_refresh_at = (
+        last_title_at + last_periodic_interval if last_periodic_interval > 0 else None
+    )
+    # Track local mutation jobs across iterations so we can detect the
+    # transition from "actions mutating repos" → "idle" and drain queued
     # fs-watch events at that boundary. Without this, a sync (which
     # writes to multiple working trees as it goes) would queue events
     # in `_pending` but never fire — the user would see the action
     # complete but the repo rows stay stale until they hit Ctrl+R.
-    prev_tasks_running = False
+    prev_mutation_jobs_running = False
     while True:
         now = time.monotonic()
+        current_interval = _periodic_refresh_interval(state)
+        if (
+            current_interval != last_periodic_interval
+            or state.active_workspace_index != last_periodic_workspace_index
+        ):
+            last_periodic_workspace_index = state.active_workspace_index
+            last_periodic_interval = current_interval
+            next_periodic_refresh_at = now + current_interval if current_interval > 0 else None
         # Prune any completed tasks that have aged past the auto-remove
         # window. Negative interval is a no-op (legacy never-prune mode).
         state.tasks.prune_aged(state.auto_remove_completed_after)
@@ -384,30 +495,27 @@ def _run_main_loop(stdscr, state, title):
         # text changed since its last check. The tick returns True
         # while any worker is in flight so the spinner keeps animating.
         creator_checking = (
-            tick_creator_checks(state)
-            if state.workspace_creator is not None else False)
+            tick_creator_checks(state) if state.workspace_creator is not None else False
+        )
         # Same idea for the workspace settings modal — its folder rows
         # carry per-path drafts that need re-checking when text edits
         # land. Bundling both into anim_running keeps the spinner
         # ticking through any in-flight discover_repos work.
-        menu_checking = (
-            tick_menu_path_checks(state)
-            if state.workspace_menu is not None else False)
+        menu_checking = tick_menu_path_checks(state) if state.workspace_menu is not None else False
         # The global app menu's APPLICATION section runs an async
         # GitHub Releases query when the user fires "Check for
         # updates". The tick rebuilds rows on `checking → done /
         # failed` transitions and reports True while the worker is
         # still in flight so the spinner glyph keeps animating.
         app_menu_checking = (
-            tick_app_menu_update_check(state)
-            if state.app_menu is not None else False)
+            tick_app_menu_update_check(state) if state.app_menu is not None else False
+        )
         # Runtime commit: if the creator finished while open as a
         # modal (e.g. via the "+ Create new workspace" picker entry),
         # consume its result here — append the new workspaces, persist,
         # close both modals, and switch to the first new workspace so
         # the user lands inside what they just created.
-        if (state.workspace_creator is not None
-                and state.workspace_creator.result is not None):
+        if state.workspace_creator is not None and state.workspace_creator.result is not None:
             new_ws = state.workspace_creator.result
             state.workspace_creator = None
             if new_ws:
@@ -415,48 +523,20 @@ def _run_main_loop(stdscr, state, title):
                 state.workspaces = list(state.workspaces) + list(new_ws)
                 state.app_menu = None
                 switch_workspace(state, first_new_index)
-                # switch_workspace now persists the post-switch active
-                # index; mirror it here for the append+save case so the
-                # newly-created workspace is also written to disk.
-                try:
-                    save_workspaces(state.workspaces,
-                                    state.active_workspace_index)
-                except OSError:
-                    pass
                 ws = state.active_workspace
                 if ws is not None:
-                    title = (f"Idlegit · {ws.name}"
-                             if ws.name else "Idlegit")
-        action_menu_loading = (
-            state.action_menu is not None
-            and (state.action_menu.state_loading
-                 or state.action_menu.tree_loading
-                 or state.action_menu.commits_loading))
-        commit_view_loading = (
-            state.commit_view_modal is not None
-            and (state.commit_view_modal.tags_loading
-                 or state.commit_view_modal.details_loading
-                 or state.commit_view_modal.files_loading
-                 or state.commit_view_modal.reflog_loading))
-        anim_running = (state.tasks.has_running()
-                        or state.tasks.has_pending_auto_remove(
-                            state.auto_remove_completed_after)
-                        or any(r.suggesting or r.refreshing for r in state.repos)
-                        or any(c.suggesting or c.refreshing
-                               for r in state.repos for c in r.children)
-                        or creator_checking
-                        or menu_checking
-                        or app_menu_checking
-                        or action_menu_loading
-                        or commit_view_loading
-                        or (state.diff_viewer is not None
-                            and (state.diff_viewer.loading
-                                 or state.diff_viewer.log_loading
-                                 or state.diff_viewer.blame_loading))
-                        or (state.task_log_viewer is not None
-                            and state.task_log_viewer.loading)
-                        or (state.remote_branch_picker is not None
-                            and state.remote_branch_picker.loading))
+                    title = f"Idlegit · {ws.name}" if ws.name else "Idlegit"
+        local_mutation_active = _local_mutation_active(state)
+        anim_running = (
+            state.tasks.has_visible_activity()
+            or state.tasks.has_pending_auto_remove(state.auto_remove_completed_after)
+            or local_mutation_active
+            or _row_activity_active(state)
+            or creator_checking
+            or menu_checking
+            or app_menu_checking
+            or view_load_activity_active(state)
+        )
         if anim_running:
             state.spinner_frame = (state.spinner_frame + 1) % len(SPINNER_FRAMES)
 
@@ -467,11 +547,22 @@ def _run_main_loop(stdscr, state, title):
         # snapshot without thrashing the spinner during the action
         # itself. `drain_pending_refreshes` is a no-op when nothing
         # was queued.
-        cur_tasks_running = state.tasks.has_running()
-        tasks_just_drained = prev_tasks_running and not cur_tasks_running
-        if tasks_just_drained:
+        cur_mutation_jobs_running = local_mutation_active
+        mutation_jobs_just_drained = prev_mutation_jobs_running and not cur_mutation_jobs_running
+        if mutation_jobs_just_drained:
             drain_pending_refreshes()
-        prev_tasks_running = cur_tasks_running
+        prev_mutation_jobs_running = cur_mutation_jobs_running
+
+        periodic_refresh_fired = False
+        if (
+            next_periodic_refresh_at is not None
+            and now >= next_periodic_refresh_at
+            and last_periodic_interval > 0
+            and _periodic_refresh_idle(state)
+        ):
+            kick_off_inline_refresh(state)
+            next_periodic_refresh_at = now + last_periodic_interval
+            periodic_refresh_fired = True
 
         # Dynamic getch timeout: snappy 100ms while anything is animating
         # so the spinner / fade-outs run smoothly, lazy 1s when truly
@@ -480,8 +571,8 @@ def _run_main_loop(stdscr, state, title):
         # background worker that adds a task will set anim_running on
         # the next iteration, snapping us back to 10 Hz automatically.
         #
-        # `tasks_just_drained` forces one extra snappy tick on the
-        # running→idle edge: a worker (smart-sync especially) lands its
+        # `mutation_jobs_just_drained` forces one extra snappy tick on the
+        # mutation-active→idle edge: a worker (smart-sync especially) lands its
         # final `refresh_repo` + `link_siblings` and only THEN clears its
         # spinner flags / marks the header task terminal, so on this very
         # iteration `anim_running` can already be False. Without the
@@ -492,7 +583,12 @@ def _run_main_loop(stdscr, state, title):
         # because its working-tree writes trigger an fs-watcher refresh
         # that keeps the loop awake; an align-only sync touches no
         # watched file, so it needs this explicit edge.
-        stdscr.timeout(100 if (anim_running or tasks_just_drained) else 1000)
+        stdscr.timeout(_main_loop_timeout_ms(
+            state,
+            anim_running=anim_running,
+            mutation_jobs_just_drained=mutation_jobs_just_drained,
+            periodic_refresh_fired=periodic_refresh_fired,
+        ))
 
         try:
             key = read_key(stdscr)
@@ -506,7 +602,7 @@ def _run_main_loop(stdscr, state, title):
             # this, cells from the old layout (most visibly: black bars
             # in the task panel) survive into the new draw because curses
             # only writes cells it thinks have changed.
-            try: 
+            try:
                 curses.update_lines_cols()
             except (AttributeError, curses.error):
                 pass
@@ -603,8 +699,7 @@ def _run_main_loop(stdscr, state, title):
             if ws_action == "switch-workspace":
                 ws = state.active_workspace
                 if ws is not None:
-                    title = (f"Idlegit · {ws.name}"
-                             if ws.name else "Idlegit")
+                    title = f"Idlegit · {ws.name}" if ws.name else "Idlegit"
             continue
 
         action = handle_main_key(state, key)
@@ -616,7 +711,7 @@ def _run_main_loop(stdscr, state, title):
             continue
         if action == "refresh":
             state.tasks.prune_completed()
-            kick_off_inline_refresh(state)
+            kick_off_inline_refresh(state, manual=True)
             continue
         if action == "sync":
             kick_off_sync_siblings(state)
@@ -665,10 +760,10 @@ def main() -> int:
     workspaces, persisted_active_idx = load_workspaces()
     startup_warnings = get_load_warnings()
     from core.ssh import ensure_ssh_agent, ssh_tools_status
+
     tools = ssh_tools_status()
     if cfg.auto_start_ssh_agent and not tools.has_ssh_agent:
-        startup_warnings.append(
-            "SSH: ssh-agent not on PATH — auto-start skipped (install OpenSSH)")
+        startup_warnings.append("SSH: ssh-agent not on PATH — auto-start skipped (install OpenSSH)")
     else:
         ssh_status, ssh_warn = ensure_ssh_agent(cfg.auto_start_ssh_agent)
         if ssh_status == "started":
@@ -679,9 +774,9 @@ def main() -> int:
     # we drop the entry whose folders no longer exist, we can still try
     # to honour the user's previous choice in the resulting list (or
     # fall back to 0 cleanly).
-    remembered_name = (workspaces[persisted_active_idx].name
-                       if 0 <= persisted_active_idx < len(workspaces)
-                       else "")
+    remembered_name = (
+        workspaces[persisted_active_idx].name if 0 <= persisted_active_idx < len(workspaces) else ""
+    )
     # Drop folders that no longer exist on disk; if a workspace loses
     # all its folders, drop the workspace entirely. The in-app creator
     # wizard fires when run() sees an empty list.
@@ -691,8 +786,7 @@ def main() -> int:
             if f.is_dir():
                 kept.append(f)
             else:
-                startup_warnings.append(
-                    f"{ws.name}: workspace folder unavailable: {f}")
+                startup_warnings.append(f"{ws.name}: workspace folder unavailable: {f}")
         ws.folders = kept
     workspaces = [ws for ws in workspaces if ws.folders]
     # Re-resolve the remembered active index against the post-filter
@@ -713,9 +807,11 @@ def main() -> int:
     # (still honours "the launch location wins over the persisted
     # active workspace" — just avoids a duplicate entry).
     from core.ephemeral import (
-        build_ephemeral_workspace, find_git_repo_root,
+        build_ephemeral_workspace,
+        find_git_repo_root,
         repo_covered_by_workspace,
     )
+
     detected_repo = find_git_repo_root()
     if detected_repo is not None:
         covering = repo_covered_by_workspace(detected_repo, workspaces)
@@ -725,10 +821,8 @@ def main() -> int:
             workspaces.insert(0, build_ephemeral_workspace(detected_repo))
             initial_active_idx = 0
 
-    title_name = (workspaces[initial_active_idx].display_name
-                  if workspaces else "")
-    _set_terminal_title(
-        f"{APP_DISPLAY_NAME} · {title_name}" if title_name else APP_DISPLAY_NAME)
+    title_name = workspaces[initial_active_idx].display_name if workspaces else ""
+    _set_terminal_title(f"{APP_DISPLAY_NAME} · {title_name}" if title_name else APP_DISPLAY_NAME)
     try:
         # _silenced_stderr_fd swallows interpreter / library noise
         # (broken-OpenSSL hashlib spam, etc.) for the lifetime of
@@ -736,8 +830,9 @@ def main() -> int:
         with _silenced_stderr_fd():
             curses.wrapper(
                 lambda stdscr: run(
-                    stdscr, cfg, workspaces, initial_active_idx,
-                    startup_warnings=startup_warnings))
+                    stdscr, cfg, workspaces, initial_active_idx, startup_warnings=startup_warnings
+                )
+            )
     except KeyboardInterrupt:
         pass
     finally:

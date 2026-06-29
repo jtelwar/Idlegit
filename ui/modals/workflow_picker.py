@@ -2,19 +2,23 @@
 from __future__ import annotations
 
 import curses
-from typing import Tuple
 
-from core.models import State, WorkflowPicker
-from core.workers import kick_off_manual_dispatch
+from core.state.app import State
+from core.state.pickers import WorkflowPicker
+from features.workflow_picker.actions import (
+    handle_workflow_picker_key as handle_workflow_picker_key_action,
+)
+from features.workflow_picker.projection import (
+    workflow_picker_hint_specs,
+    workflow_row_status,
+)
 
 from ..colors import PAIR_DLG_CYAN, PAIR_DLG_FG
 from ..geometry import (
     clamp_scroll, draw_modal_fill, draw_scroll_overflow, end_truncate,
     modal_geometry, safe_addstr, wrap_label_value,
 )
-from ..hints import (
-    KEY_ENTER, KEY_ESC, KEY_UP_DOWN, Hint, render_hints,
-)
+from ..hints import Hint, render_hints
 
 
 _PAD_TOP = 1
@@ -27,64 +31,8 @@ def _hints(picker) -> list:
     """Footer hints for the workflow_dispatch picker. Enter is gated
     on the focused workflow being runnable — disabled / non-
     dispatchable rows show why instead of pretending Enter will fire."""
-    if not picker.workflows:
-        return [Hint(KEY_ESC, "back")]
-    hints = [Hint(KEY_UP_DOWN, "select")]
-    wf = picker.workflows[picker.selected]
-    runnable, reason = _workflow_row_status(wf)
-    if runnable:
-        hints.append(Hint(KEY_ENTER, f"run on {picker.branch}"))
-    else:
-        hints.append(Hint(KEY_ENTER, f"unavailable {reason}".rstrip()))
-    hints.append(Hint(KEY_ESC, "back"))
-    return hints
-
-
-def _workflow_row_status(wf) -> Tuple[bool, str]:
-    """Return (runnable, reason) for a workflow row in the picker.
-    `runnable` gates Enter; `reason` is a short trailing tag shown after
-    the name for any unrunnable row (empty for runnable rows)."""
-    if wf.state.startswith("disabled"):
-        return False, f"({wf.state.replace('_', ' ')})"
-    if not wf.dispatchable:
-        return False, "(no workflow_dispatch trigger)"
-    return True, ""
-
-
-def open_workflow_picker(state: State) -> None:
-    """Open the workflow picker on the focused row's repo. Lists every
-    workflow we discovered locally (including non-dispatchable + remotely
-    disabled ones) so the user can see *why* a workflow can't be run from
-    here. Enter on a runnable row triggers the dispatch + tracks the
-    resulting run via kick_off_manual_dispatch; on disabled rows it's a
-    no-op. Defaults the cursor to the first runnable row, falling back
-    to row 0."""
-    menu = state.action_menu
-    if menu is None:
-        return
-    target_repo = menu.target_repo
-    if target_repo is None and menu.target_child is not None:
-        target_repo = menu.target_child.repo
-    if target_repo is None:
-        return
-    workflows = list(target_repo.workflows)
-    if not workflows:
-        return
-    initial = 0
-    for i, wf in enumerate(workflows):
-        if wf.dispatchable and not wf.state.startswith("disabled"):
-            initial = i
-            break
-    state.workflow_picker = WorkflowPicker(
-        target_label=menu.target_label,
-        target_path=menu.target_path,
-        target_repo=target_repo,
-        target_parent=menu.target_parent,
-        target_child=menu.target_child,
-        workflows=workflows,
-        branch=menu.branch or target_repo.branch,
-        selected=initial,
-    )
+    return [Hint(keys, action)
+            for keys, action in workflow_picker_hint_specs(picker)]
 
 
 def _title_lines(picker: WorkflowPicker, inner_w: int) -> "list[str]":
@@ -168,7 +116,7 @@ def draw_workflow_picker(stdscr, state: State, sidebar_x: int) -> None:
 
         wf = picker.workflows[idx]
         focused = (idx == picker.selected)
-        runnable, reason = _workflow_row_status(wf)
+        runnable, reason = workflow_row_status(wf)
         prefix = "→ " if focused else "  "
         label = wf.name if runnable else f"{wf.name}  {reason}"
         text = end_truncate(prefix + label, inner_w).ljust(inner_w)
@@ -187,33 +135,4 @@ def draw_workflow_picker(stdscr, state: State, sidebar_x: int) -> None:
 
 
 def handle_workflow_picker_key(state: State, key: int) -> None:
-    picker = state.workflow_picker
-    if picker is None:
-        return
-    if key == 27:
-        state.workflow_picker = None
-        return
-    if not picker.workflows:
-        return
-    if key == curses.KEY_UP:
-        picker.selected = max(0, picker.selected - 1)
-        return
-    if key == curses.KEY_DOWN:
-        picker.selected = min(len(picker.workflows) - 1, picker.selected + 1)
-        return
-    if key == curses.KEY_PPAGE:
-        picker.selected = max(0, picker.selected - 10)
-        return
-    if key == curses.KEY_NPAGE:
-        picker.selected = min(len(picker.workflows) - 1, picker.selected + 10)
-        return
-    if key in (10, 13, curses.KEY_ENTER):
-        wf = picker.workflows[picker.selected]
-        runnable, _ = _workflow_row_status(wf)
-        if not runnable:
-            return  # silently no-op on disabled / non-dispatchable rows
-        if picker.target_repo is not None:
-            kick_off_manual_dispatch(
-                state, picker.target_repo, wf.name, picker.branch)
-        state.workflow_picker = None
-        state.action_menu = None
+    handle_workflow_picker_key_action(state, key)

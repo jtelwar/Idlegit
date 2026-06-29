@@ -7,6 +7,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
@@ -14,7 +15,13 @@ for _p in (str(_HERE.parent), str(_HERE)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from _helpers import _run, make_repo, stage_and_commit, write_file  # noqa: E402
+from _helpers import (  # noqa: E402
+    _run,
+    assert_repo_refresh_available,
+    make_repo,
+    stage_and_commit,
+    write_file,
+)
 from core import git_ops, workers  # noqa: E402
 from core.git_ops import (  # noqa: E402
     _parse_conflict_markers, begin_safe_merge, complete_safe_merge_commit,
@@ -23,7 +30,11 @@ from core.git_ops import (  # noqa: E402
     parse_safe_merge_conflicts, rebuild_resolved_text,
     remaining_conflict_paths, write_conflict_resolution,
 )
-from core.models import ConflictFile, Repo, State  # noqa: E402
+from core.state.app import State  # noqa: E402
+from core.state.safe_merge import ConflictFile, SafeMergeScreen  # noqa: E402
+from core.state.repos import Repo  # noqa: E402
+from core.state.repos import ChildRef  # noqa: E402
+from core.state.workspaces import Workspace  # noqa: E402
 
 
 def _cf_from_text(text: str, choices) -> ConflictFile:
@@ -83,6 +94,120 @@ class TestMarkerParser(unittest.TestCase):
         text = ("<<<<<<< HEAD\nfoo\n=======\nbar\n=======\n"
                 "theirs\n>>>>>>> f\n")
         self.assertIsNone(_parse_conflict_markers(text))
+
+
+class TestSafeMergeSyncFanout(unittest.TestCase):
+    def test_sync_exception_becomes_failed_task_and_clears_spinner(self) -> None:
+        canonical = Repo("canonical", Path("/workspace/canonical"),
+                         branch="main")
+        parent = Repo("parent", Path("/workspace/parent"))
+        child = ChildRef(
+            repo=canonical,
+            nested_path=Path("/workspace/parent/vendor/canonical"),
+            branch="main",
+        )
+        parent.children = [child]
+        state = State(repos=[parent, canonical], workspace_name="test")
+        header = state.tasks.add("safe-merge")
+        screen = SafeMergeScreen(
+            target_child=child,
+            header_task=header,
+            is_tracked_submodule=True,
+        )
+
+        with mock.patch.object(
+                workers, "sync_sibling",
+                side_effect=RuntimeError("sync boom")):
+            workers._safe_merge_sync_submodule(state, screen)
+
+        self.assertFalse(state.store.repo_busy(canonical))
+        rows = state.tasks.snapshot()
+        self.assertEqual(rows[-1].status, "fail")
+        self.assertEqual(rows[-1].message, "sync boom")
+
+    def test_push_exception_marks_push_task_terminal(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        repo_path = make_repo(Path(tmp.name), "repo", with_initial_commit=True)
+        state = State(repos=[], workspace_name="test")
+        screen = SafeMergeScreen(target_path=repo_path)
+
+        with mock.patch.object(
+                workers,
+                "git_cancellable",
+                side_effect=RuntimeError("push exploded"),
+        ):
+            self.assertFalse(workers._safe_merge_push(state, screen))
+
+        push_task = next(
+            task for task in state.tasks.snapshot()
+            if task.label == "  ↳ push")
+        self.assertEqual(push_task.status, "fail")
+        self.assertEqual(push_task.message, "push exploded")
+
+    def test_begin_thread_start_failure_releases_locks(self) -> None:
+        class FailingThread:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def start(self):
+                raise RuntimeError("thread start failed")
+
+        repo = Repo("repo", Path("/workspace/repo"))
+        state = State(repos=[repo], workspace_name="test")
+
+        with mock.patch.object(workers.threading, "Thread", FailingThread):
+            opened = workers.kick_off_safe_merge(
+                state,
+                target_label="repo",
+                target_path=repo.path,
+                target_repo=repo,
+                target_parent=None,
+                merge_ref="origin/main",
+            )
+
+        self.assertFalse(opened)
+        self.assertIsNone(state.safe_merge)
+        self.assertFalse(state.store.repo_busy(repo))
+        assert_repo_refresh_available(self, state, repo)
+        task = next(
+            task for task in state.tasks.snapshot()
+            if task.label.startswith("safe-merge repo"))
+        self.assertEqual(task.status, "fail")
+        self.assertEqual(task.message, "thread start failed")
+
+    def test_abort_relinks_starting_workspace_after_switch(self) -> None:
+        a_repo = Repo("a", Path("/workspace/a"), branch="main")
+        b_repo = Repo("b", Path("/workspace/b"), branch="main")
+        state = State(
+            repos=[b_repo],
+            workspace_name="B",
+            workspaces=[
+                Workspace(name="A", folders=[Path("/workspace/a")],
+                          cached_repos=[a_repo]),
+                Workspace(name="B", folders=[Path("/workspace/b")],
+                          cached_repos=[b_repo]),
+            ],
+            active_workspace_index=1,
+        )
+        header = state.tasks.add("safe-merge a")
+        screen = SafeMergeScreen(
+            target_path=a_repo.path,
+            target_repo=a_repo,
+            header_task=header,
+            snapshot_repos=[a_repo],
+            snapshot_subtrees=[],
+        )
+
+        with mock.patch.object(workers, "merge_head_sha", return_value=None), \
+             mock.patch.object(workers, "_refresh_repo_snapshot_into_state"), \
+             mock.patch.object(workers, "_state_link_siblings") as link:
+            workers.safe_merge_abort(state, screen)
+
+        link.assert_called_once()
+        self.assertIs(link.call_args.args[0], state)
+        self.assertEqual(link.call_args.args[1:3], ([a_repo], []))
+        self.assertIs(state.repos[0], b_repo)
 
 # Commands the Cardinal Rule forbids idlegit from ever issuing.
 _BANNED = [
@@ -411,6 +536,31 @@ class TestWorkerFlow(unittest.TestCase):
         # way the file is resolvable here.
         self.assertEqual([f.path for f in screen.files], ["f.txt"])
         self.assertGreaterEqual(len(screen.decisions), 1)
+
+    def test_safe_merge_refresh_targets_uses_reconciler(self) -> None:
+        repo = Repo(rel="repo", path=self.tmp / "repo")
+        parent = Repo(rel="parent", path=self.tmp / "parent")
+        other = Repo(rel="other", path=self.tmp / "other")
+        state = State(repos=[other], workspace_name="t")
+        screen = SafeMergeScreen(
+            target_repo=repo,
+            target_parent=parent,
+            snapshot_repos=[repo, parent, other],
+            snapshot_subtrees=[],
+        )
+
+        with mock.patch.object(workers, "reconcile_repos_bounded") as reconcile:
+            workers._safe_merge_refresh_targets(state, screen)
+
+        reconcile.assert_called_once()
+        self.assertEqual(reconcile.call_args.args, ([repo, parent], []))
+        self.assertEqual(reconcile.call_args.kwargs["link_repos"],
+                         [repo, parent, other])
+        with mock.patch.object(
+                workers, "_refresh_repo_snapshot_into_state") as refresh:
+            reconcile.call_args.kwargs["refresh_fn"](repo)
+        refresh.assert_called_once_with(state, repo)
+        self.assertIsNotNone(reconcile.call_args.kwargs["link_fn"])
 
 
 if __name__ == "__main__":

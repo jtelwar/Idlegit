@@ -7,8 +7,9 @@ from __future__ import annotations
 import curses
 import time
 
-from core.models import State
 from core.git_ops import format_time_ago
+from core.state.app import State
+from core.runtime.tasks import TASK_AUTO_REMOVE_PROGRESS_SECONDS
 
 from .colors import (
     PAIR_SB_CYAN, PAIR_SB_CYAN_ACTIVE,
@@ -20,6 +21,9 @@ from .colors import (
 from .geometry import safe_addstr
 from .glyphs import SPINNER_FRAMES
 from .hints import KEY_CTRL_R, KEY_SHIFT_TAB, Hint, render_hints
+
+FOOTER_H = 4
+_REMOVE_PROGRESS_GLYPHS = ("◰", "◧", "◲", "◼")
 
 
 def _empty_panel_hints(focused: bool) -> list:
@@ -37,6 +41,29 @@ def _row_span(task) -> int:
     """How many vertical rows a task occupies in the sidebar — 2 if its
     fail/warn message gets a detail row, 1 otherwise."""
     return 2 if (task.message and task.status in ("fail", "warn")) else 1
+
+
+def _removal_progress(task, auto_remove_after: float, now: float) -> float:
+    """0 until the success row enters its final removal animation."""
+    if (auto_remove_after < 0
+            or task.status != "ok"
+            or task.finished_at is None):
+        return 0.0
+    elapsed = max(0.0, now - task.finished_at)
+    if elapsed < auto_remove_after:
+        return 0.0
+    return min(
+        1.0,
+        (elapsed - auto_remove_after) / TASK_AUTO_REMOVE_PROGRESS_SECONDS)
+
+
+def _removal_progress_glyph(progress: float) -> str:
+    if progress <= 0.0:
+        return ""
+    idx = min(
+        len(_REMOVE_PROGRESS_GLYPHS) - 1,
+        max(0, int(progress * len(_REMOVE_PROGRESS_GLYPHS))))
+    return _REMOVE_PROGRESS_GLYPHS[idx]
 
 
 def _measure_visible(items, start_idx: int, body_top: int,
@@ -58,6 +85,7 @@ def draw_sidebar(stdscr, state: State, x: int, w: int) -> None:
     if w <= 0:
         return
     h, _ = stdscr.getmaxyx()
+    panel_bottom = max(1, h - FOOTER_H)
     focused = state.focused_panel == "tasks"
     fill_attr = curses.color_pair(
         PAIR_SB_FG_ACTIVE if focused else PAIR_SB_FG)
@@ -71,9 +99,10 @@ def draw_sidebar(stdscr, state: State, x: int, w: int) -> None:
 
     # Leave the very top row at the default terminal background so the
     # title row (`Idlegit · …`) reads as one continuous strip instead of
-    # being clipped by the sidebar panel.
+    # being clipped by the sidebar panel. Also leave the shared footer
+    # area clear so key hints can span under both panels.
     fill = " " * w
-    for y in range(1, h):
+    for y in range(1, panel_bottom):
         safe_addstr(stdscr, y, x, fill, fill_attr)
 
     header_y = 2
@@ -89,15 +118,16 @@ def draw_sidebar(stdscr, state: State, x: int, w: int) -> None:
         safe_addstr(stdscr, header_y, x + 1, "Tasks", header_attr)
         safe_addstr(stdscr, header_y + 2, x + 1, "(no tasks yet)",
                     sb | curses.A_DIM)
-        render_hints(stdscr, header_y + 3, x + 1, max(0, w - 2),
-                     _empty_panel_hints(focused), attr=sb | curses.A_DIM)
+        if header_y + 3 < panel_bottom:
+            render_hints(stdscr, header_y + 3, x + 1, max(0, w - 2),
+                         _empty_panel_hints(focused), attr=sb | curses.A_DIM)
         return
 
     sel_idx = state.task_selected if focused else -1
 
     body_top = header_y + 2
-    # Reserve the last row for the "+N more" overflow hint when needed.
-    body_max_y = h - 1
+    # Reserve the panel's last row for the "+N more" overflow hint.
+    body_max_y = max(body_top, panel_bottom - 1)
 
     # Auto-scroll so the selected task is visible while focused.
     state.task_scroll = max(0, min(state.task_scroll, max(0, len(items) - 1)))
@@ -169,12 +199,10 @@ def draw_sidebar(stdscr, state: State, x: int, w: int) -> None:
         max_label_w = max(0, tag_x - label_start - 1)
 
         is_selected = i == sel_idx
-        # Suppress the fade overlay on the selected row so its colour
-        # change isn't muddied by the progress-bar background.
-        is_fading = (not is_selected
-                     and auto_remove >= 0
-                     and t.status in ("ok", "fail", "warn")
-                     and t.finished_at is not None)
+        removal_progress = _removal_progress(t, auto_remove, now)
+        progress_icon = _removal_progress_glyph(removal_progress)
+        if progress_icon:
+            icon, color = progress_icon, c_ok
 
         if is_selected:
             safe_addstr(stdscr, y, x, "▸",
@@ -195,20 +223,6 @@ def draw_sidebar(stdscr, state: State, x: int, w: int) -> None:
         if max_label_w > 0 and tag_x > label_start:
             safe_addstr(stdscr, y, tag_x, time_tag, sb | curses.A_DIM)
 
-        if is_fading:
-            if auto_remove > 0:
-                since_done = max(0.0, now - t.finished_at)
-                progress = min(1.0, since_done / auto_remove)
-            else:
-                progress = 1.0
-            row_w = max(0, w - 1)
-            fill_w = max(0, int(round((1.0 - progress) * row_w)))
-            if fill_w > 0:
-                try:
-                    stdscr.chgat(y, x + 1, fill_w, sb | curses.A_REVERSE)
-                except curses.error:
-                    pass
-
         y += 1
         if span == 2:
             detail = t.message[: max(0, w - 6)]
@@ -218,6 +232,6 @@ def draw_sidebar(stdscr, state: State, x: int, w: int) -> None:
 
     if has_more_below:
         n_below = len(items) - 1 - last_visible
-        safe_addstr(stdscr, h - 1, x + 1,
+        safe_addstr(stdscr, panel_bottom - 1, x + 1,
                     f"+{n_below} more (↓)",
                     sb | curses.A_DIM)

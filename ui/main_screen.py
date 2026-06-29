@@ -5,11 +5,20 @@ import curses
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from core.models import ChildRef, Repo, State
+from core.runtime.task_actions import task_can_remove
+from core.state.app import State
+from core.state.repos import ChildRef, Repo
 from core.config import APP_DISPLAY_NAME, VERSION, WORKSPACES_FILE
+from core.state.selectors import (
+    active_workspace_child_rows,
+    active_workspace_repo_rows,
+    child_row_state_for_parent,
+    child_row_state,
+    repo_row_state,
+)
 from .colors import (
     PAIR_AHEAD, PAIR_BEHIND, PAIR_BRANCH, PAIR_DIRTY, PAIR_ERR, PAIR_HEADER,
-    PAIR_OK, child_state_color, state_color,
+    PAIR_OK, status_state_color,
 )
 from .geometry import (
     clamp_scroll, draw_scroll_overflow, field_visible, safe_addstr, truncate,
@@ -31,12 +40,12 @@ from .modals import (
     draw_workspace_switcher,
 )
 from .sidebar import SPINNER_FRAMES, draw_sidebar
+from .sidebar import FOOTER_H
 
 def _body_height_for(state: State, h: int) -> int:
     """Height (in rows) available for the repo body. Reserves space for the
-    title (1), toggles row (1) + blank (1), one blank line before hints,
-    two hint lines, and the state legend (1) — 7 rows of chrome total."""
-    chrome = 7
+    title/workspace header plus the full-width footer hint band."""
+    chrome = 4 + FOOTER_H
     avail = h - chrome
     if avail < 1:
         return 1
@@ -56,24 +65,28 @@ def _ensure_focused_visible(state: State, body_h: int, total_body: int) -> None:
                                      total_body, body_h)
 
 
-def _split_remaining_width(remaining_w: int, tasks_min_pct: float,
+def _split_remaining_width(total_w: int, fixed_left_w: int,
+                           tasks_min_pct: float,
                            tasks_max_pct: float) -> Tuple[int, int]:
-    """Split width after fixed repo columns into (message_w, tasks_w).
+    """Split screen width into (message_w, tasks_w).
 
-    The task panel starts from an even split, then clamps to the
-    configured percentage band. Percentages are of `remaining_w`, not
-    of the full terminal width."""
-    if remaining_w <= 0:
+    The task panel width is based on the terminal width so it stays stable
+    when repo/workspace names change; the commit message field absorbs the
+    difference from wider name or branch columns."""
+    available_w = total_w - fixed_left_w
+    if available_w <= 0:
         return 0, 0
+    if available_w < 2:
+        return available_w, 0
     min_pct = max(0.0, min(1.0, tasks_min_pct))
     max_pct = max(min_pct, max(0.0, min(1.0, tasks_max_pct)))
-    min_w = int(remaining_w * min_pct)
-    max_w = int(remaining_w * max_pct)
-    ideal_w = remaining_w // 2
+    min_w = int(total_w * min_pct)
+    max_w = int(total_w * max_pct)
+    ideal_w = total_w // 2
     tasks_w = max(min_w, min(max_w, ideal_w))
-    if remaining_w >= 2 and tasks_w >= remaining_w:
-        tasks_w = remaining_w - 1
-    return remaining_w - tasks_w, tasks_w
+    if available_w >= 2 and tasks_w >= available_w:
+        tasks_w = available_w - 1
+    return available_w - tasks_w, tasks_w
 
 
 def _focused_message_holder(state: State):
@@ -83,11 +96,90 @@ def _focused_message_holder(state: State):
     if state.on_title_row or state.on_workspace_row:
         return None
     if state.current_repo is not None:
-        return state.current_repo
+        repo = state.current_repo
+        return repo if repo_row_state(state, repo).editable else None
     cur_child = state.current_child
-    if cur_child is not None and cur_child[1].kind == "submodule":
-        return cur_child[1]
+    if cur_child is not None:
+        parent, child = cur_child
+        row_state = child_row_state_for_parent(state, parent, child)
+        return child if row_state.editable else None
     return None
+
+
+def _repo_status(state: State, repo: Repo):
+    status = state.store.repo_status(repo)
+    if status is None:
+        raise RuntimeError("repo row is not registered in state store")
+    return status
+
+
+def _child_status(
+        state: State,
+        child: ChildRef,
+        parent: Optional[Repo] = None,
+):
+    if parent is None:
+        status = state.store.child_status(child)
+    else:
+        child_id_value = state.store.child_id_for_parent_child(parent, child)
+        status = (
+            None if child_id_value is None
+            else state.store.child_status_by_id(child_id_value)
+        )
+    if status is None:
+        raise RuntimeError("child row is not registered in state store")
+    return status
+
+
+def _holder_message(state: State, holder) -> str:
+    if isinstance(holder, Repo):
+        row_state = repo_row_state(state, holder)
+        return row_state.message
+    if isinstance(holder, ChildRef):
+        row_state = child_row_state(state, holder)
+        return row_state.message
+    return ""
+
+
+def _column_widths(
+        state: State,
+        *,
+        name_max: int,
+        child_name_max: int,
+        branch_max: int,
+        name_mode: str,
+        branch_mode: str,
+) -> Tuple[int, int]:
+    """Return main-list name and branch column widths from store rows."""
+    repo_rows = active_workspace_repo_rows(state)
+    name_lengths = [
+        len(truncate(repo.display_name, name_max, name_mode))
+        for repo in repo_rows
+    ] or [max(8, len(state.workspace_name))]
+    branch_lengths: List[int] = []
+    for repo in repo_rows:
+        status = _repo_status(state, repo)
+        branch_lengths.append(
+            len(f"[{truncate(status.branch, branch_max, branch_mode)}]"))
+    for _parent, child in active_workspace_child_rows(state):
+        name_lengths.append(
+            4 + len(truncate(child.repo.display_name, child_name_max,
+                             name_mode)))
+        child_status = _child_status(state, child, _parent)
+        if child_status.branch:
+            branch = truncate(child_status.branch, branch_max, branch_mode)
+            branch_lengths.append(len(f"[{branch}]"))
+    if not branch_lengths:
+        branch_lengths = [0]
+    return max(name_lengths) + 2, max(branch_lengths) + 2
+
+
+def _repo_refresh_spinner_visible(state: State, repo: Repo) -> bool:
+    return repo_row_state(state, repo).show_spinner
+
+
+def _child_refresh_spinner_visible(state: State, child: ChildRef) -> bool:
+    return child_row_state(state, child).show_spinner
 
 
 # ---------- Main-screen hints registry -----------------------------------
@@ -99,7 +191,7 @@ def _esc_hint(state: State) -> Hint:
     if state.focused_panel == "tasks":
         return Hint(KEY_ESC, "back to repos")
     holder = _focused_message_holder(state)
-    if holder is not None and holder.message:
+    if holder is not None and _holder_message(state, holder):
         return Hint(KEY_ESC, "clear msg")
     if state.has_messages:
         return Hint(KEY_ESC, "discard + quit")
@@ -136,9 +228,12 @@ def _body_row_hints(state: State) -> List[Hint]:
 
     # Tab opens the per-row action menu for repos and submodule
     # children; a subtree child has no actions menu, so we omit it.
-    if cur_repo is not None or (cur_child is not None
-                                and cur_child[1].kind == "submodule"):
+    if cur_repo is not None:
         hints.append(Hint(KEY_TAB, "actions…"))
+    elif cur_child is not None:
+        child_status = _child_status(state, cur_child[1])
+        if child_status.kind == "submodule":
+            hints.append(Hint(KEY_TAB, "actions…"))
 
     if holder is not None:
         # Editable row: typing edits the message inline. Suggest /
@@ -147,7 +242,7 @@ def _body_row_hints(state: State) -> List[Hint]:
         # edit-in-place when there's content). Both Shift hints are
         # gated to `holder is not None` so they never appear on a
         # subtree row or a clean repo with no message holder.
-        if not holder.message:
+        if not _holder_message(state, holder):
             hints.append(Hint(KEY_LEFT, "suggest"))
             hints.append(Hint(f"Shift+{KEY_LEFT}", "suggest all"))
         hints.append(Hint(f"Shift+{KEY_RIGHT}", "edit msg"))
@@ -171,7 +266,7 @@ def _task_panel_hints(state: State) -> List[Hint]:
         hints.append(Hint(KEY_TAB, "task detail…"))
         if 0 <= state.task_selected < n:
             t = items[state.task_selected]
-            if t.status != "running":
+            if task_can_remove(state, t):
                 hints.append(Hint(KEY_ENTER, "remove task"))
     return hints
 
@@ -276,27 +371,21 @@ def draw_main(stdscr, state: State) -> None:
     # never fires (it just looks like end-truncation by clipping).
     # Empty-repo fallback: keep the name column wide enough to fit the
     # workspace name (which now lives on row 2 where "Repositories"
-    # used to). Prevents a visual collapse when state.repos is empty.
-    name_lengths = [len(truncate(r.display_name, nm, nmode))
-                    for r in state.repos] or [
-                        max(8, len(state.workspace_name))]
-    branch_lengths = [len(f"[{truncate(r.branch, bm, bmode)}]")
-                      for r in state.repos] or [0]
-    for parent in state.repos:
-        for ch in parent.children:
-            name_lengths.append(
-                4 + len(truncate(ch.repo.display_name, cnm, nmode)))
-            if ch.branch:
-                branch_lengths.append(
-                    len(f"[{truncate(ch.branch, bm, bmode)}]"))
-    name_w = max(name_lengths) + 2
-    branch_w = max(branch_lengths) + 2
+    # used to). Prevents a visual collapse when there are no repo rows.
+    name_w, branch_w = _column_widths(
+        state,
+        name_max=nm,
+        child_name_max=cnm,
+        branch_max=bm,
+        name_mode=nmode,
+        branch_mode=bmode,
+    )
     marker_w = 3
     field_x = 2 + name_w + branch_w + marker_w
-    remaining_w = max(0, w - field_x - 1)
     _main_tasks_gap = 1
     field_w, sidebar_w = _split_remaining_width(
-        max(0, remaining_w - _main_tasks_gap),
+        w,
+        field_x + _main_tasks_gap + 1,
         state.tasks_min_width_percent,
         state.tasks_max_width_percent)
     sidebar_x = field_x + field_w + _main_tasks_gap
@@ -329,15 +418,15 @@ def draw_main(stdscr, state: State) -> None:
         focused = repos_panel_active and (state.selected == body_idx)
         if row[0] == "repo":
             row_cursor = state.field_cursor if focused else 0
-            draw_repo_row(stdscr, y, row[1], focused,
+            draw_repo_row(stdscr, state, y, row[1], focused,
                           name_w, branch_w, field_x, field_w,
                           nm, bm, nmode, bmode, row_cursor, spinner_char)
         else:  # child
             row_cursor = state.field_cursor if focused else 0
-            draw_child_row(stdscr, y, row[2], focused,
+            draw_child_row(stdscr, state, y, row[2], focused,
                            name_w, branch_w, field_x, field_w,
                            cnm, bm, nmode, bmode,
-                           row_cursor, spinner_char)
+                           row_cursor, spinner_char, parent=row[1])
 
     if visible_start > 0:
         draw_scroll_overflow(stdscr, base_y - 1, 2, main_w - 2,
@@ -360,8 +449,8 @@ def draw_main(stdscr, state: State) -> None:
         safe_addstr(stdscr, focus_y, 0, "›",
                     curses.color_pair(PAIR_BRANCH) | curses.A_BOLD)
 
-    hint_y = base_y + body_h + 1
-    hint_max_w = max(0, main_w - 4)
+    hint_y = h - FOOTER_H + 1
+    hint_max_w = max(0, w - 4)
     render_hints(stdscr, hint_y, 2, hint_max_w,
                  _main_hints_primary(state), attr=curses.A_DIM)
     render_hints(stdscr, hint_y + 1, 2, hint_max_w,
@@ -388,6 +477,12 @@ def draw_main(stdscr, state: State) -> None:
                     or state.help_screen is not None
                     or state.ssh_keygen_modal is not None
                     or state.workspace_switcher is not None)
+
+    # Paint the tasks panel before modals so global overlays (especially
+    # the app menu) can cover both the repos and tasks panels.
+    if sidebar_w > 0:
+        draw_sidebar(stdscr, state, sidebar_x, sidebar_w)
+
     if state.action_menu is not None:
         draw_action_menu(stdscr, state, sidebar_x)
     if state.branch_picker is not None:
@@ -415,7 +510,7 @@ def draw_main(stdscr, state: State) -> None:
     # Picker drawn before creator so the creator (when both are open)
     # paints on top — common during the "Create new workspace" flow.
     if state.app_menu is not None:
-        draw_app_menu(stdscr, state, sidebar_x)
+        draw_app_menu(stdscr, state, w)
     if state.workspace_switcher is not None:
         draw_workspace_switcher(stdscr, state, sidebar_x)
     if state.workspace_creator is not None:
@@ -446,12 +541,6 @@ def draw_main(stdscr, state: State) -> None:
     if state.ssh_keygen_modal is not None:
         draw_ssh_keygen_modal(stdscr, state, sidebar_x)
 
-    # Sidebar drawn LAST so it's always the freshest paint on screen —
-    # avoids the resize artifacts where stale cells from the old layout
-    # bleed through under the panel.
-    if sidebar_w > 0:
-        draw_sidebar(stdscr, state, sidebar_x, sidebar_w)
-
     # The hardware cursor on the focused commit-message field is only
     # advertised when the repos panel itself owns focus. While the user
     # is over on the tasks panel, state.selected still names a body row
@@ -460,7 +549,7 @@ def draw_main(stdscr, state: State) -> None:
     # cursor reappears on the same column when focus returns.
     cursor_set = False
     # Commit-message editor owns the cursor while it's open — paint the
-    # caret last, AFTER sidebar redraw, so the modal's textarea has a
+    # caret last, AFTER modal redraw, so the modal's textarea has a
     # visible cursor even though `modal_active` is True.
     if state.commit_msg_editor is not None:
         from .modals.commit_msg_editor import apply_commit_msg_editor_cursor
@@ -474,21 +563,22 @@ def draw_main(stdscr, state: State) -> None:
             target = None
             if row[0] == "repo":
                 r = row[1]
-                target = r if ((r.is_dirty or r.message)
-                               and not r.refreshing) else None
-            elif row[0] == "child" and row[2].kind == "submodule":
+                target = r if repo_row_state(state, r).editable else None
+            elif row[0] == "child":
                 ch = row[2]
-                target = ch if ((ch.dirty or ch.message)
-                                and not ch.refreshing) else None
+                child_status = _child_status(state, ch)
+                if child_status.kind == "submodule":
+                    target = ch if child_row_state(state, ch).editable else None
             if target is not None:
                 # field_w-1 leaves a single trailing cell as an
                 # end-of-field cap; the message itself starts at
                 # field_x so the cursor's home is the first
                 # character (no inert leading column).
                 inner_w = field_w - 1
-                cur = max(0, min(state.field_cursor, len(target.message)))
+                target_message = _holder_message(state, target)
+                cur = max(0, min(state.field_cursor, len(target_message)))
                 _, cur_in_visible = field_visible(
-                    target.message, cur, inner_w, True)
+                    target_message, cur, inner_w, True)
                 cur_x = field_x + cur_in_visible
                 cur_y = y_for_body[body_idx]
                 # Ask for a "very visible" hardware cursor — without the
@@ -523,7 +613,7 @@ def draw_state_legend(stdscr, y: int, x: int) -> None:
         cur += 2 + len(label) + 2
 
 
-def draw_repo_row(stdscr, y: int, repo: Repo, focused: bool,
+def draw_repo_row(stdscr, state: State, y: int, repo: Repo, focused: bool,
                   name_w: int, branch_w: int, field_x: int, field_w: int,
                   name_max: int, branch_max: int,
                   name_mode: str, branch_mode: str,
@@ -534,26 +624,29 @@ def draw_repo_row(stdscr, y: int, repo: Repo, focused: bool,
                 truncate(repo.display_name, name_max, name_mode).ljust(name_w),
                 name_attr)
 
-    branch_str = f"[{truncate(repo.branch, branch_max, branch_mode)}]".ljust(branch_w)
+    status = _repo_status(state, repo)
+    branch_str = f"[{truncate(status.branch, branch_max, branch_mode)}]".ljust(branch_w)
     safe_addstr(stdscr, y, 2 + name_w, branch_str,
                 curses.color_pair(PAIR_BRANCH))
 
-    if repo.refreshing:
+    row_state = repo_row_state(state, repo)
+    show_refresh_spinner = row_state.show_spinner
+    if show_refresh_spinner:
         safe_addstr(stdscr, y, 2 + name_w + branch_w,
                     f" {spinner_char} ", curses.color_pair(PAIR_BRANCH))
     else:
-        _, state_attr = state_color(repo)
+        _, state_attr = status_state_color(status)
         safe_addstr(stdscr, y, 2 + name_w + branch_w, " ● ", state_attr)
 
-    if not repo.refreshing:
-        if repo.suggesting and not repo.message:
+    if not show_refresh_spinner:
+        if row_state.suggesting and not row_state.message:
             inner_w = field_w - 1
             text = (f"{spinner_char} generating…").ljust(inner_w + 1)
             safe_addstr(stdscr, y, field_x, text,
                         curses.color_pair(PAIR_BRANCH) | curses.A_DIM)
-        elif repo.is_dirty or repo.message:
+        elif row_state.show_message_field:
             inner_w = field_w - 1
-            visible, _ = field_visible(repo.message, field_cursor, inner_w, focused)
+            visible, _ = field_visible(row_state.message, field_cursor, inner_w, focused)
             field_text = visible.ljust(inner_w) + " "
             # Outline-only field styling: leaves the terminal background
             # untouched (so the hardware cursor stays readable on both light
@@ -567,12 +660,13 @@ def draw_repo_row(stdscr, y: int, repo: Repo, focused: bool,
             safe_addstr(stdscr, y, field_x, field_text, field_attr)
 
 
-def draw_child_row(stdscr, y: int, child: ChildRef, focused: bool,
+def draw_child_row(stdscr, state: State, y: int, child: ChildRef, focused: bool,
                    name_w: int, branch_w: int, field_x: int, field_w: int,
                    name_max: int, branch_max: int,
                    name_mode: str, branch_mode: str,
                    field_cursor: int = 0,
-                   spinner_char: str = " ") -> None:
+                   spinner_char: str = " ",
+                   parent: Optional[Repo] = None) -> None:
     name_attr = curses.A_BOLD if focused else curses.A_DIM
     # Submodule glyph is a composite "needs your attention?" indicator:
     #   pink   — out of sync vs canonical (drift takes precedence — the
@@ -585,17 +679,24 @@ def draw_child_row(stdscr, y: int, child: ChildRef, focused: bool,
     # Subtree rows use ⊕ in the normal name attribute unless refreshing.
     # While refreshing, the glyph uses the same spinner as repo rows /
     # the state column so in-flight work is obvious at a glance.
-    if child.refreshing:
+    row_state = (
+        child_row_state(state, child)
+        if parent is None
+        else child_row_state_for_parent(state, parent, child)
+    )
+    status = _child_status(state, child, parent)
+    show_refresh_spinner = row_state.show_spinner
+    if show_refresh_spinner:
         glyph = spinner_char
         glyph_attr = curses.color_pair(PAIR_BRANCH)
         if focused:
             glyph_attr |= curses.A_BOLD
     else:
-        glyph = "↳" if child.kind == "submodule" else "⊕"
-        if child.kind == "submodule":
-            if not child.in_sync:
+        glyph = "↳" if status.kind == "submodule" else "⊕"
+        if status.kind == "submodule":
+            if not status.in_sync:
                 glyph_pair = PAIR_BEHIND
-            elif child.dirty:
+            elif status.dirty:
                 glyph_pair = PAIR_DIRTY
             else:
                 glyph_pair = PAIR_OK
@@ -608,12 +709,12 @@ def draw_child_row(stdscr, y: int, child: ChildRef, focused: bool,
     safe_addstr(stdscr, y, 6,
                 truncate(child.repo.display_name, name_max, name_mode),
                 name_attr)
-    if child.kind == "submodule":
+    if status.kind == "submodule":
         # Branch label in the same column as parent rows, but a dimmer
         # cyan to keep the visual hierarchy obvious at a glance.
-        if child.branch:
+        if status.branch:
             branch_str = (
-                f"[{truncate(child.branch, branch_max, branch_mode)}]"
+                f"[{truncate(status.branch, branch_max, branch_mode)}]"
                 .ljust(branch_w))
             safe_addstr(stdscr, y, 2 + name_w, branch_str,
                         curses.color_pair(PAIR_BRANCH) | curses.A_DIM)
@@ -621,22 +722,22 @@ def draw_child_row(stdscr, y: int, child: ChildRef, focused: bool,
         # the child is mid-action / mid-refresh, swap the dot for the
         # global spinner so the row is obviously in-flight instead of
         # carrying a stale state colour.
-        if child.refreshing:
+        if show_refresh_spinner:
             safe_addstr(stdscr, y, 2 + name_w + branch_w,
                         f" {spinner_char} ", curses.color_pair(PAIR_BRANCH))
         else:
-            _, state_attr = child_state_color(child)
+            _, state_attr = status_state_color(status)
             safe_addstr(stdscr, y, 2 + name_w + branch_w, " ● ", state_attr)
-        if not child.refreshing:
-            if child.suggesting and not child.message:
+        if not show_refresh_spinner:
+            if row_state.suggesting and not row_state.message:
                 inner_w = field_w - 1
                 text = (f"{spinner_char} generating…").ljust(inner_w + 1)
                 safe_addstr(stdscr, y, field_x, text,
                             curses.color_pair(PAIR_BRANCH) | curses.A_DIM)
-            elif child.dirty or child.message:
+            elif row_state.show_message_field:
                 inner_w = field_w - 1
                 visible, _ = field_visible(
-                    child.message, field_cursor, inner_w, focused)
+                    row_state.message, field_cursor, inner_w, focused)
                 field_text = visible.ljust(inner_w) + " "
                 # Outline-only field styling: leaves the terminal background
                 # untouched (so the hardware cursor stays readable on both

@@ -10,8 +10,11 @@ import os
 import subprocess
 import sys
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Iterable, Iterator, Optional
+
+TEST_COMMAND_TIMEOUT_SECONDS = 30
 
 
 def bootstrap_paths() -> None:
@@ -89,13 +92,22 @@ def _run(cwd: Path, *args: str, check: bool = True) -> subprocess.CompletedProce
     env.setdefault("GIT_COMMITTER_EMAIL", "test@idlegit.local")
     env.setdefault("GIT_CONFIG_GLOBAL", os.devnull)
     env.setdefault("GIT_CONFIG_SYSTEM", os.devnull)
+    env.setdefault("GIT_TERMINAL_PROMPT", "0")
+    env.setdefault("GCM_INTERACTIVE", "Never")
     cmd = list(args)
     if cmd and cmd[0] == "git":
         cmd = ["git", "-c", "protocol.file.allow=always", *cmd[1:]]
-    return subprocess.run(
-        cmd, cwd=str(cwd), capture_output=True, text=True,
-        check=check, env=env,
-    )
+    try:
+        return subprocess.run(
+            cmd, cwd=str(cwd), capture_output=True, text=True,
+            check=check, env=env, timeout=TEST_COMMAND_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        command = " ".join(cmd)
+        raise RuntimeError(
+            f"test command timed out after {TEST_COMMAND_TIMEOUT_SECONDS}s: "
+            f"{command}"
+        ) from exc
 
 
 def make_repo(parent: Path, name: str,
@@ -138,13 +150,68 @@ def stage_and_commit(repo: Path, message: str,
 def make_repo_model(rel: str = "r", **kwargs):
     """Phantom Repo dataclass instance — no filesystem touched. The
     on-disk counterpart is `make_repo()` above."""
-    from core.models import Repo
+    from core.state.repos import Repo
     return Repo(rel=rel, path=Path(f"/tmp/{rel}"), **kwargs)
 
 
 def make_state(*repos, **kwargs):
     """State factory for unit tests. Defaults workspace_name='ws' so
     callers don't have to repeat it; any kwarg the caller passes wins."""
-    from core.models import State
+    from core.state.app import State
     kwargs.setdefault("workspace_name", "ws")
     return State(repos=list(repos), **kwargs)
+
+
+def assert_repo_refresh_available(testcase, state, repo, *, timeout=None) -> None:
+    """Assert the store-owned repo refresh mutex is currently claimable."""
+    acquired, repo_id = state.store.acquire_repo_refresh(repo, timeout=timeout)
+    testcase.assertTrue(acquired)
+    state.store.release_repo_refresh_by_id(repo_id)
+
+
+def assert_repo_refresh_blocked(testcase, state, repo) -> None:
+    """Assert the store-owned repo refresh mutex is currently held."""
+    acquired, repo_id = state.store.acquire_repo_refresh(repo)
+    testcase.assertFalse(acquired)
+    state.store.release_repo_refresh_by_id(repo_id)
+
+
+def assert_child_refresh_available(testcase, state, child, *, timeout=None) -> None:
+    """Assert the store-owned child refresh mutex is currently claimable."""
+    acquired, child_id = state.store.acquire_child_refresh(
+        child,
+        timeout=timeout,
+    )
+    testcase.assertTrue(acquired)
+    state.store.release_child_refresh_by_id(child_id)
+
+
+def assert_child_refresh_blocked(testcase, state, child) -> None:
+    """Assert the store-owned child refresh mutex is currently held."""
+    acquired, child_id = state.store.acquire_child_refresh(child)
+    testcase.assertFalse(acquired)
+    state.store.release_child_refresh_by_id(child_id)
+
+
+@contextmanager
+def held_repo_refresh(state, repo) -> Iterator[object]:
+    """Hold a store-owned repo refresh mutex for a test block."""
+    acquired, repo_id = state.store.acquire_repo_refresh(repo)
+    if not acquired:
+        raise AssertionError("repo refresh mutex was not available")
+    try:
+        yield repo_id
+    finally:
+        state.store.release_repo_refresh_by_id(repo_id)
+
+
+@contextmanager
+def held_child_refresh(state, child) -> Iterator[object]:
+    """Hold a store-owned child refresh mutex for a test block."""
+    acquired, child_id = state.store.acquire_child_refresh(child)
+    if not acquired:
+        raise AssertionError("child refresh mutex was not available")
+    try:
+        yield child_id
+    finally:
+        state.store.release_child_refresh_by_id(child_id)

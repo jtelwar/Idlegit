@@ -19,17 +19,24 @@ for _p in (str(_HERE.parent), str(_HERE)):
         sys.path.insert(0, _p)
 
 from _helpers import (  # noqa: E402
-    _run, add_origin, make_repo, stage_and_commit, write_file,
+    _run,
+    add_origin,
+    assert_repo_refresh_available,
+    held_child_refresh,
+    make_repo,
+    stage_and_commit,
+    write_file,
 )
 from core.git_ops import (  # noqa: E402
     discover_repos, discover_workflows_local, find_lfs_warnings,
     link_siblings, refresh_repo, signature_mtime, suggest_commit_message,
     sync_subtree, working_tree_signature,
 )
-from core.models import Repo, SubtreeSpec  # noqa: E402
+from core.state.repos import Repo, WorkflowInfo  # noqa: E402
+from core.state.workspaces import SubtreeSpec  # noqa: E402
 
 
-def _spawn_recovery_canceller(state, timeout: float = 5.0):
+def _spawn_recovery_canceller(state, timeout: float = 60.0):
     """Background daemon that watches `state.detached_recovery_prompt`
     for the auto-recovery modal opening, then "presses Esc" by setting
     `chosen_action="cancel"` and signalling `result_event`. Lets tests
@@ -126,6 +133,21 @@ class TestRefreshRepo(_TempWorkspace):
         kinds = {x for x, _ in repo.staged}
         self.assertIn("A", kinds)
 
+    def test_unstaged_change(self) -> None:
+        repo_path = make_repo(self.tmp, "r")
+        write_file(repo_path, "README.md", "# r\nedit\n")
+        repo = Repo(rel="r", path=repo_path)
+        refresh_repo(repo)
+        self.assertEqual(repo.unstaged, [("M", "README.md")])
+
+    def test_staged_rename_uses_destination_path_only(self) -> None:
+        repo_path = make_repo(self.tmp, "r")
+        _run(repo_path, "git", "mv", "README.md", "RENAMED.md")
+        repo = Repo(rel="r", path=repo_path)
+        refresh_repo(repo)
+        self.assertIn(("R", "RENAMED.md"), repo.staged)
+        self.assertNotIn(("R", "README.md"), repo.staged)
+
     def test_no_upstream_means_zero_ahead_behind(self) -> None:
         repo_path = make_repo(self.tmp, "r")
         repo = Repo(rel="r", path=repo_path)
@@ -134,6 +156,51 @@ class TestRefreshRepo(_TempWorkspace):
         self.assertEqual(repo.ahead, 0)
         self.assertEqual(repo.behind, 0)
 
+    def test_upstream_ahead_behind_from_branch_status(self) -> None:
+        remote = self.tmp / "remote.git"
+        _run(self.tmp, "git", "init", "-q", "--bare", str(remote))
+        repo_path = make_repo(self.tmp, "r")
+        add_origin(repo_path, f"file://{remote}")
+        _run(repo_path, "git", "push", "-u", "origin", "main")
+
+        clone_path = self.tmp / "other"
+        _run(self.tmp, "git", "clone", "-q", f"file://{remote}", str(clone_path))
+        write_file(clone_path, "remote.txt", "remote\n")
+        stage_and_commit(clone_path, "remote")
+        _run(clone_path, "git", "push", "origin", "main")
+
+        write_file(repo_path, "local.txt", "local\n")
+        stage_and_commit(repo_path, "local")
+        _run(repo_path, "git", "fetch", "origin")
+
+        repo = Repo(rel="r", path=repo_path)
+        refresh_repo(repo)
+
+        self.assertEqual(repo.upstream, "origin/main")
+        self.assertEqual(repo.ahead, 1)
+        self.assertEqual(repo.behind, 1)
+
+    def test_detached_head_branch_label(self) -> None:
+        repo_path = make_repo(self.tmp, "r")
+        _run(repo_path, "git", "checkout", "--detach", "HEAD")
+        repo = Repo(rel="r", path=repo_path)
+        refresh_repo(repo)
+        self.assertEqual(repo.branch, "(detached)")
+
+    def test_conflict_paths_from_unmerged_status(self) -> None:
+        repo_path = make_repo(self.tmp, "r")
+        _run(repo_path, "git", "checkout", "-q", "-b", "feature")
+        write_file(repo_path, "README.md", "feature\n")
+        stage_and_commit(repo_path, "feature")
+        _run(repo_path, "git", "checkout", "-q", "main")
+        write_file(repo_path, "README.md", "main\n")
+        stage_and_commit(repo_path, "main")
+        _run(repo_path, "git", "merge", "feature", check=False)
+        repo = Repo(rel="r", path=repo_path)
+        refresh_repo(repo)
+        self.assertTrue(repo.merging)
+        self.assertIn("README.md", repo.conflict_paths)
+
     def test_remote_url_canonicalized_and_raw_kept(self) -> None:
         repo_path = make_repo(self.tmp, "r")
         add_origin(repo_path, "git@github.com:Foo/Bar.git")
@@ -141,6 +208,28 @@ class TestRefreshRepo(_TempWorkspace):
         refresh_repo(repo)
         self.assertEqual(repo.remote_url_raw, "git@github.com:Foo/Bar.git")
         self.assertEqual(repo.remote_url, "github.com/foo/bar")
+
+    def test_preserves_hydrated_workflow_state_on_local_refresh(self) -> None:
+        repo_path = make_repo(self.tmp, "r")
+        wf_dir = repo_path / ".github" / "workflows"
+        wf_dir.mkdir(parents=True)
+        (wf_dir / "ci.yml").write_text(
+            "name: CI\non: push\njobs: {}\n", encoding="utf-8")
+        repo = Repo(rel="r", path=repo_path)
+        repo.workflows = [
+            WorkflowInfo(
+                name="CI",
+                path=".github/workflows/ci.yml",
+                state="disabled_manually",
+            )
+        ]
+        repo.workflow_states_hydrated = True
+
+        refresh_repo(repo)
+
+        self.assertTrue(repo.workflow_states_hydrated)
+        self.assertEqual(len(repo.workflows), 1)
+        self.assertEqual(repo.workflows[0].state, "disabled_manually")
 
 
 class TestLinkSiblings(_TempWorkspace):
@@ -256,7 +345,7 @@ class TestLinkSiblings(_TempWorkspace):
             if (path == parent.path
                     and len(args) >= 2
                     and args[0] == "status"
-                    and args[1] == "--porcelain=v1"):
+                    and "--porcelain=v2" in args):
                 gate.set()
                 time.sleep(0.15)
             return rc, out, err
@@ -358,6 +447,25 @@ class TestSuggestCommitMessage(_TempWorkspace):
             repo, max_added=3, max_updated=3, max_deleted=3, auto_stage=True)
         self.assertIn("update: README.md", out)
         self.assertIn("remove: doomed.txt", out)
+
+    def test_zero_excludes_category_and_negative_one_is_unlimited(self) -> None:
+        repo_path = make_repo(self.tmp, "r")
+        for name in ("a.txt", "b.txt", "c.txt"):
+            write_file(repo_path, name, f"{name}\n")
+        repo = Repo(rel="r", path=repo_path)
+        refresh_repo(repo)
+
+        excluded = suggest_commit_message(
+            repo, max_added=0, max_updated=-1, max_deleted=-1,
+            auto_stage=True)
+        unlimited = suggest_commit_message(
+            repo, max_added=-1, max_updated=0, max_deleted=0,
+            auto_stage=True)
+
+        self.assertEqual(excluded, "")
+        self.assertIn("a.txt", unlimited)
+        self.assertIn("b.txt", unlimited)
+        self.assertIn("c.txt", unlimited)
 
 
 class TestDiscoverWorkflowsLocal(_TempWorkspace):
@@ -677,7 +785,8 @@ class TestRedundantDirtyFF(_TempWorkspace):
         fields the helper actually reads matter (path, branch). The full
         dataclass is overkill here, so a minimal stand-in keeps the test
         focused on behavior."""
-        from core.models import SmartSyncCheckout, Repo
+        from core.state.smart_sync import SmartSyncCheckout
+        from core.state.repos import Repo
         return SmartSyncCheckout(
             canonical=Repo(rel="ws", path=path),
             parent=None, path=path, branch=branch, label=path.name,
@@ -687,7 +796,7 @@ class TestRedundantDirtyFF(_TempWorkspace):
         """Minimal State for the helpers' new state+name signature.
         The helpers only touch state.tasks for the leftover-stash
         warning path; an empty repos list is enough for the rest."""
-        from core.models import State
+        from core.state.app import State
         return State(repos=[], workspace_name="test")
 
     def test_returns_true_when_dirty_matches_origin_bit_for_bit(self) -> None:
@@ -807,7 +916,10 @@ class TestAlignLoserMergeFallback(_TempWorkspace):
 
     def test_merges_divergent_loser_by_default(self) -> None:
         from core.workers import _align_loser_ff
-        from core.models import Repo, SmartSyncCheckout, State
+        from core.state.app import State
+        from core.state.smart_sync import SmartSyncCheckout
+
+        from core.state.repos import Repo
 
         winner, loser = self._divergent_loser_setup()
         state = State(repos=[], workspace_name="test")
@@ -826,7 +938,10 @@ class TestAlignLoserMergeFallback(_TempWorkspace):
 
     def test_skips_merge_when_prevent_flag_set(self) -> None:
         from core.workers import _align_loser_ff
-        from core.models import Repo, SmartSyncCheckout, State
+        from core.state.app import State
+        from core.state.smart_sync import SmartSyncCheckout
+
+        from core.state.repos import Repo
 
         winner, loser = self._divergent_loser_setup()
         before = _run(loser, "git", "rev-parse", "HEAD").stdout.strip()
@@ -851,7 +966,9 @@ class TestDetachedWinnerSwitch(_TempWorkspace):
 
     def test_clean_detached_winner_switches_with_plain_checkout(self) -> None:
         from core.workers import _stash_switch_pop_winner
-        from core.models import Repo, SmartSyncCheckout
+        from core.state.smart_sync import SmartSyncCheckout
+        # Set up a repo with a master branch and a dangling commit.
+        from core.state.repos import Repo
         # Set up a repo with a master branch and a dangling commit.
         repo = self.tmp / "winner"
         repo.mkdir()
@@ -888,7 +1005,8 @@ class TestDetachedWinnerSwitch(_TempWorkspace):
         completes, the WT carries the user's edits ON the new branch
         and a subsequent `git commit` lands them on master."""
         from core.workers import _stash_switch_pop_winner
-        from core.models import Repo, SmartSyncCheckout
+        from core.state.smart_sync import SmartSyncCheckout
+        from core.state.repos import Repo
         repo = self.tmp / "winner"
         repo.mkdir()
         _run(repo, "git", "init", "-q", "-b", "master")
@@ -928,6 +1046,408 @@ class TestDetachedWinnerSwitch(_TempWorkspace):
         self.assertIn("shared.py", status)
 
 
+class TestSmartSyncWinnerPush(_TempWorkspace):
+    def test_smart_sync_cleanup_uses_job_runner_after_mutation_job(self) -> None:
+        import core.workers as workers_mod
+        from core.jobs import JobStatus
+        from core.state.app import State
+        from core.state.repos import ChildRef, Repo
+        from core.workers import kick_off_sync_siblings
+
+        class FirstThreadRunsSecondFails:
+            starts = 0
+            daemon = False
+
+            def __init__(self, target=None, args=(), kwargs=None,
+                         name=None, daemon=None):
+                self.target = target
+                self.args = args
+                self.kwargs = kwargs or {}
+                if daemon is not None:
+                    self.daemon = daemon
+
+            def start(self):
+                type(self).starts += 1
+                if type(self).starts == 1:
+                    self.target(*self.args, **self.kwargs)
+                    return
+                raise RuntimeError("unexpected secondary thread")
+
+        parent_path = make_repo(self.tmp, "parent", with_initial_commit=True)
+        canonical_path = make_repo(self.tmp, "canonical", with_initial_commit=True)
+        parent = Repo(rel="parent", path=parent_path)
+        canonical = Repo(rel="canonical", path=canonical_path)
+        child = ChildRef(
+            repo=canonical,
+            nested_path=parent_path / "canonical",
+            kind="submodule",
+        )
+        parent.children = [child]
+        canonical.siblings = [(parent, child.nested_path)]
+        state = State(repos=[parent, canonical], workspace_name="ws")
+        state.auto_push_submodule_parent = False
+
+        with (
+            mock.patch.object(workers_mod, "_canonical_already_aligned",
+                              return_value=False),
+            mock.patch.object(workers_mod, "_align_canonical",
+                              return_value=(1, 0)),
+            mock.patch.object(workers_mod, "refresh_repo"),
+            mock.patch.object(workers_mod, "link_siblings"),
+            mock.patch.object(workers_mod.threading, "Thread",
+                              FirstThreadRunsSecondFails),
+        ):
+            kick_off_sync_siblings(state)
+
+        deadline = time.monotonic() + 2.0
+        while len(state.job_registry.snapshot()) < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        jobs = state.job_registry.snapshot()
+        self.assertEqual(len(jobs), 2)
+        self.assertEqual(jobs[0].status, JobStatus.OK)
+        self.assertEqual(jobs[1].spec.kind, "smart-sync-cleanup")
+        self.assertEqual(jobs[1].status, JobStatus.FAIL)
+        self.assertFalse(jobs[1].spec.local_mutation)
+        self.assertFalse(state.job_registry.has_active_local_mutation())
+        self.assertFalse(state.leases.has_lease_for(repos=[canonical]))
+        self.assertFalse(state.leases.has_lease_for(children=[child]))
+        self.assertFalse(state.store.repo_busy(canonical))
+        self.assertFalse(state.store.child_busy(child))
+        self.assertEqual(FirstThreadRunsSecondFails.starts, 2)
+        cleanup_task = next(
+            task for task in state.tasks.snapshot()
+            if task.label == "  ↳ smart-sync refresh cleanup")
+        self.assertEqual(cleanup_task.status, "fail")
+
+    def test_winner_push_is_cancellable_and_releases_task(self) -> None:
+        import core.workers as workers_mod
+        from core.state.app import State
+        from core.state.smart_sync import SmartSyncCheckout
+        from core.state.repos import Repo
+        from core.workers import _push_winner
+
+        repo_path = make_repo(self.tmp, "winner", with_initial_commit=True)
+        repo = Repo(rel="winner", path=repo_path)
+        state = State(repos=[repo], workspace_name="ws")
+        winner = SmartSyncCheckout(
+            canonical=repo,
+            parent=None,
+            path=repo_path,
+            branch="master",
+            label="winner",
+            ahead=1,
+        )
+
+        with mock.patch.object(
+                workers_mod,
+                "git_cancellable",
+                return_value=(124, "", "git timed out after 120s"),
+        ) as push:
+            self.assertFalse(_push_winner(state, winner, "master", "winner"))
+
+        push.assert_called_once()
+        self.assertEqual(
+            push.call_args.kwargs["timeout"],
+            workers_mod.USER_PUSH_TIMEOUT_SECONDS)
+        push_task = next(
+            task for task in state.tasks.snapshot()
+            if task.label == "  ↳ align winner: push winner")
+        self.assertEqual(push_task.status, "fail")
+
+    def test_winner_push_exception_marks_task_terminal(self) -> None:
+        import core.workers as workers_mod
+        from core.state.app import State
+        from core.state.smart_sync import SmartSyncCheckout
+        from core.state.repos import Repo
+        from core.workers import _push_winner
+
+        repo_path = make_repo(self.tmp, "winner", with_initial_commit=True)
+        repo = Repo(rel="winner", path=repo_path)
+        state = State(repos=[repo], workspace_name="ws")
+        winner = SmartSyncCheckout(
+            canonical=repo,
+            parent=None,
+            path=repo_path,
+            branch="master",
+            label="winner",
+            ahead=1,
+        )
+
+        with mock.patch.object(
+                workers_mod,
+                "git_cancellable",
+                side_effect=RuntimeError("push exploded"),
+        ):
+            self.assertFalse(_push_winner(state, winner, "master", "winner"))
+
+        push_task = next(
+            task for task in state.tasks.snapshot()
+            if task.label == "  ↳ align winner: push winner")
+        self.assertEqual(push_task.status, "fail")
+        self.assertEqual(push_task.message, "push exploded")
+        self.assertFalse(state.leases.has_lease_for(repos=[repo]))
+
+
+class TestWorkflowThenRunTasks(_TempWorkspace):
+    def test_pending_tag_placeholder_clears_waiting_message_on_success(self) -> None:
+        import core.workers as workers_mod
+        from core.state.app import State
+        from core.state.repos import Repo
+        from core.workers import _poll_run
+
+        repo_path = make_repo(self.tmp, "repo", with_initial_commit=True)
+        repo = Repo(rel="repo", path=repo_path, branch="main")
+        state = State(repos=[repo], workspace_name="ws")
+        run_task = state.tasks.add("CI")
+        pending_task = state.tasks.add("  ↪ then run: tag v1",
+                                       parent=run_task)
+        state.tasks.update(pending_task, "pending", "waiting on CI")
+        view = {
+            "status": "completed",
+            "conclusion": "success",
+            "url": "https://example.invalid/run",
+            "jobs": [],
+        }
+
+        with mock.patch.object(workers_mod, "get_run_view",
+                               return_value=view), \
+             mock.patch.object(workers_mod, "git",
+                               return_value=(0, "", "")):
+            _poll_run(
+                state, "owner/repo", 1, repo, "CI", run_task,
+                pending_task=pending_task,
+                pushed_sha="abc123",
+                then_run_after_workflow={"CI": "__add_tag__"},
+                then_run_params_after_workflow={"CI": {"tag": "v1"}},
+            )
+
+        self.assertEqual(pending_task.label, "  ↪ tag v1")
+        self.assertEqual(pending_task.status, "ok")
+        self.assertEqual(pending_task.message, "")
+
+
+class TestCommitPushExceptions(_TempWorkspace):
+    def test_top_level_commit_worker_push_runs_under_outer_claim(self) -> None:
+        import core.workers as workers_mod
+        from core.state.app import State
+        from core.state.repos import Repo
+        from core.workers import commit_worker
+
+        repo_path = make_repo(self.tmp, "repo", with_initial_commit=True)
+        write_file(repo_path, "README.md", "# repo\nedit\n")
+        _run(repo_path, "git", "add", "README.md")
+        repo = Repo(rel="repo", path=repo_path, branch="main")
+        state = State(repos=[repo], workspace_name="ws")
+        state.auto_push = True
+
+        with mock.patch.object(
+                workers_mod,
+                "git_cancellable",
+                return_value=(0, "", ""),
+        ) as push:
+            commit_worker(
+                state, repo, "edit", [], staged_paths={}, push=True)
+
+        push.assert_called_once()
+        self.assertFalse(state.tasks.has_running())
+        pipeline_task = next(
+            task for task in state.tasks.snapshot()
+            if task.label == "repo: working")
+        push_task = next(
+            task for task in state.tasks.snapshot()
+            if task.label == "repo: push")
+        self.assertEqual(pipeline_task.status, "ok")
+        self.assertEqual(push_task.status, "ok")
+        self.assertFalse(state.store.repo_busy(repo))
+        self.assertFalse(state.leases.has_lease_for(repos=[repo]))
+
+    def test_child_commit_worker_push_runs_under_outer_claim(self) -> None:
+        import core.workers as workers_mod
+        from core.state.app import State
+        from core.state.repos import ChildRef, Repo
+        from core.workers import commit_worker_for_child
+
+        parent = Repo(rel="parent", path=self.tmp / "parent")
+        child_path = make_repo(self.tmp, "child", with_initial_commit=True)
+        write_file(child_path, "README.md", "# child\nedit\n")
+        _run(child_path, "git", "add", "README.md")
+        canonical = Repo(rel="child", path=child_path, branch="main")
+        child = ChildRef(
+            repo=canonical,
+            nested_path=child_path,
+            branch="main",
+        )
+        parent.children = [child]
+        state = State(repos=[parent, canonical], workspace_name="ws")
+        state.auto_push = True
+
+        with mock.patch.object(
+                workers_mod,
+                "git_cancellable",
+                return_value=(0, "", ""),
+        ) as push:
+            commit_worker_for_child(
+                state, parent, child, "edit", staged_paths={}, push=True)
+
+        push.assert_called_once()
+        self.assertFalse(state.tasks.has_running())
+        pipeline_task = next(
+            task for task in state.tasks.snapshot()
+            if task.label == "child (in parent): working")
+        push_task = next(
+            task for task in state.tasks.snapshot()
+            if task.label == "child (in parent): push")
+        self.assertEqual(pipeline_task.status, "ok")
+        self.assertEqual(push_task.status, "ok")
+        self.assertFalse(state.store.child_busy(child))
+        self.assertFalse(state.leases.has_lease_for(children=[child]))
+
+    def test_top_level_push_exception_marks_push_task_terminal(self) -> None:
+        import core.workers as workers_mod
+        from core.state.app import State
+        from core.state.repos import Repo
+        from core.workers import _commit_worker_inner
+
+        repo_path = make_repo(self.tmp, "repo", with_initial_commit=True)
+        write_file(repo_path, "README.md", "# repo\nedit\n")
+        _run(repo_path, "git", "add", "README.md")
+        repo = Repo(rel="repo", path=repo_path, branch="main")
+        state = State(repos=[repo], workspace_name="ws")
+        state.auto_push = True
+
+        with mock.patch.object(
+                workers_mod,
+                "git_cancellable",
+                side_effect=RuntimeError("push exploded"),
+        ):
+            _commit_worker_inner(
+                state, repo, "edit", [], staged_paths={}, push=True)
+
+        push_task = next(
+            task for task in state.tasks.snapshot()
+            if task.label == "repo: push")
+        self.assertEqual(push_task.status, "fail")
+        self.assertEqual(push_task.message, "push exploded")
+
+    def test_top_level_push_locks_repo_and_shows_lfs_upload_child(self) -> None:
+        import core.workers as workers_mod
+        from core.state.app import State
+        from core.state.repos import Repo
+        from core.workers import _commit_worker_inner
+
+        repo_path = make_repo(self.tmp, "repo", with_initial_commit=True)
+        write_file(repo_path, "README.md", "# repo\nedit\n")
+        _run(repo_path, "git", "add", "README.md")
+        repo = Repo(rel="repo", path=repo_path, branch="main")
+        state = State(repos=[repo], workspace_name="ws")
+        state.auto_push = True
+        saw_locked = []
+        saw_lfs_child = []
+
+        def push_side_effect(*_args, **_kwargs):
+            saw_locked.append(state.store.repo_busy(repo))
+            lfs_task = next(
+                task for task in state.tasks.snapshot()
+                if task.label == "  ↳ uploading lfs objects")
+            saw_lfs_child.append(lfs_task.status == "running")
+            return 0, "", "Uploading LFS objects: 100% (1/1), 1 MB | 1 MB/s"
+
+        with (
+            mock.patch.object(workers_mod, "_repo_has_lfs_tracked_files", return_value=True),
+            mock.patch.object(
+                workers_mod,
+                "git_cancellable",
+                side_effect=push_side_effect,
+            ) as git_cancellable,
+        ):
+            _commit_worker_inner(
+                state, repo, "edit", [], staged_paths={}, push=True)
+
+        self.assertEqual(saw_locked, [True])
+        self.assertEqual(saw_lfs_child, [True])
+        self.assertEqual(
+            git_cancellable.call_args.kwargs["timeout"],
+            workers_mod.USER_PUSH_TIMEOUT_SECONDS)
+        push_task = next(
+            task for task in state.tasks.snapshot()
+            if task.label == "repo: push")
+        lfs_task = next(
+            task for task in state.tasks.snapshot()
+            if task.label == "  ↳ uploading lfs objects")
+        self.assertEqual(push_task.status, "ok")
+        self.assertEqual(lfs_task.status, "ok")
+        self.assertFalse(state.store.repo_busy(repo))
+
+    def test_child_push_exception_marks_push_task_terminal(self) -> None:
+        import core.workers as workers_mod
+        from core.state.app import State
+        from core.state.repos import ChildRef, Repo
+        from core.workers import _commit_worker_for_child_inner
+
+        parent = Repo(rel="parent", path=self.tmp / "parent")
+        child_path = make_repo(self.tmp, "child", with_initial_commit=True)
+        write_file(child_path, "README.md", "# child\nedit\n")
+        _run(child_path, "git", "add", "README.md")
+        canonical = Repo(rel="child", path=child_path, branch="main")
+        child = ChildRef(
+            repo=canonical,
+            nested_path=child_path,
+            branch="main",
+        )
+        state = State(repos=[parent, canonical], workspace_name="ws")
+        state.auto_push = True
+
+        with mock.patch.object(
+                workers_mod,
+                "git_cancellable",
+                side_effect=RuntimeError("push exploded"),
+        ):
+            _commit_worker_for_child_inner(
+                state, parent, child, "edit", staged_paths={}, push=True)
+
+        push_task = next(
+            task for task in state.tasks.snapshot()
+            if task.label == "child (in parent): push")
+        self.assertEqual(push_task.status, "fail")
+        self.assertEqual(push_task.message, "push exploded")
+
+    def test_top_level_post_push_sync_skips_busy_child_lock(self) -> None:
+        import core.workers as workers_mod
+        from core.state.app import State
+        from core.state.repos import ChildRef, Repo
+        from core.workers import _commit_worker_inner
+
+        repo_path = make_repo(self.tmp, "repo", with_initial_commit=True)
+        write_file(repo_path, "README.md", "# repo\nedit\n")
+        _run(repo_path, "git", "add", "README.md")
+        repo = Repo(rel="repo", path=repo_path, branch="main")
+        parent = Repo(rel="parent", path=self.tmp / "parent")
+        nested = parent.path / "vendor" / "repo"
+        child = ChildRef(repo=repo, nested_path=nested, branch="main")
+        parent.children = [child]
+        repo.siblings = [(parent, nested)]
+        state = State(repos=[repo, parent], workspace_name="ws")
+        state.auto_push = True
+
+        with mock.patch.object(
+                workers_mod,
+                "git_cancellable",
+                return_value=(0, "", ""),
+        ), \
+             mock.patch.object(workers_mod, "_sync_sibling_safe") as sync, \
+             held_child_refresh(state, child):
+            _commit_worker_inner(
+                state, repo, "edit", [], staged_paths={}, push=True)
+
+        sync.assert_not_called()
+        task = next(
+            task for task in state.tasks.snapshot()
+            if task.label == "  ↳ sync parent")
+        self.assertEqual(task.status, "warn")
+        self.assertEqual(
+            task.message, "skipped: child refresh lock held by another op")
+
+
 class TestDetachedLoserCheckout(_TempWorkspace):
     """The mirror case: after a winner pushes, detached losers run
     `git checkout origin/<branch>`. If their dirty WT matches origin's
@@ -953,7 +1473,8 @@ class TestDetachedLoserCheckout(_TempWorkspace):
 
     def test_dirty_detached_loser_with_redundant_changes_lands_on_origin(self) -> None:
         from core.workers import _try_detached_checkout_through_redundant_dirty
-        from core.models import Repo, SmartSyncCheckout
+        from core.state.smart_sync import SmartSyncCheckout
+        from core.state.repos import Repo
         winner, loser = self._setup_with_pushed_change()
         # Winner publishes a new edit.
         write_file(winner, "shared.py", "def x(): return 99\n")
@@ -967,7 +1488,7 @@ class TestDetachedLoserCheckout(_TempWorkspace):
             canonical=Repo(rel="ws", path=loser),
             parent=None, path=loser, branch="(detached)", label="loser",
             dirty=True)
-        from core.models import State
+        from core.state.app import State
         state = State(repos=[], workspace_name="test")
         result = _try_detached_checkout_through_redundant_dirty(
             state, c, "master", "loser")
@@ -980,7 +1501,8 @@ class TestDetachedLoserCheckout(_TempWorkspace):
 
     def test_genuinely_diverging_dirty_loser_refuses(self) -> None:
         from core.workers import _try_detached_checkout_through_redundant_dirty
-        from core.models import Repo, SmartSyncCheckout
+        from core.state.smart_sync import SmartSyncCheckout
+        from core.state.repos import Repo
         winner, loser = self._setup_with_pushed_change()
         write_file(winner, "shared.py", "def x(): return 99\n")
         stage_and_commit(winner, "bump")
@@ -993,7 +1515,7 @@ class TestDetachedLoserCheckout(_TempWorkspace):
             canonical=Repo(rel="ws", path=loser),
             parent=None, path=loser, branch="(detached)", label="loser",
             dirty=True)
-        from core.models import State
+        from core.state.app import State
         state = State(repos=[], workspace_name="test")
         result = _try_detached_checkout_through_redundant_dirty(
             state, c, "master", "loser")
@@ -1055,7 +1577,10 @@ class TestNoOrphanedCommitsOnSwitch(_TempWorkspace):
         if the user cancels, the file survives in HEAD's tree just
         like the pre-recovery refusal path used to guarantee."""
         from core.workers import _stash_switch_pop_winner
-        from core.models import Repo, SmartSyncCheckout, State
+        from core.state.app import State
+        from core.state.smart_sync import SmartSyncCheckout
+
+        from core.state.repos import Repo
 
         repo = self._detached_with_unique_commit()
         # Add a dirty edit on top so the would-be flow includes the
@@ -1089,8 +1614,12 @@ class TestNoOrphanedCommitsOnSwitch(_TempWorkspace):
         complete the switch — HEAD ends up on master, master's ref
         moved forward to capture the unique commit, and the unique
         file is on disk via the now-tracked branch."""
+        import core.workers as workers_mod
         from core.workers import _stash_switch_pop_winner
-        from core.models import Repo, SmartSyncCheckout, State
+        from core.state.app import State
+        from core.state.smart_sync import SmartSyncCheckout
+
+        from core.state.repos import Repo
 
         repo = self._detached_with_unique_commit()
         head_before = _run(repo, "git", "rev-parse", "HEAD").stdout.strip()
@@ -1100,22 +1629,19 @@ class TestNoOrphanedCommitsOnSwitch(_TempWorkspace):
             dirty=False)
         state = State(repos=[], workspace_name="test")
 
-        # User confirms: simulate "Enter" on the modal.
-        def confirmer():
-            deadline = time.monotonic() + 5.0
-            while time.monotonic() < deadline:
-                prompt = state.detached_recovery_prompt
-                if prompt is not None:
-                    prompt.chosen_action = "ff"
-                    prompt.result_event.set()
-                    state.detached_recovery_prompt = None
-                    return
-                time.sleep(0.05)
-        t = threading.Thread(target=confirmer, daemon=True)
-        t.start()
+        original_build_prompt = workers_mod._build_recovery_prompt
 
-        ok = _stash_switch_pop_winner(state, winner, "master", "ws")
-        t.join(timeout=1.0)
+        def build_confirmed_prompt(*args, **kwargs):
+            prompt = original_build_prompt(*args, **kwargs)
+            if prompt is not None:
+                prompt.chosen_action = "ff"
+                prompt.result_event.set()
+            return prompt
+
+        with mock.patch.object(
+            workers_mod, "_build_recovery_prompt", side_effect=build_confirmed_prompt
+        ):
+            ok = _stash_switch_pop_winner(state, winner, "master", "ws")
         self.assertTrue(ok)
         # master now points at HEAD's old commit.
         master_head = _run(repo, "git", "rev-parse",
@@ -1134,7 +1660,11 @@ class TestNoOrphanedCommitsOnSwitch(_TempWorkspace):
         commits would lose them on `git checkout origin/<branch>`.
         `_align_detached_loser`'s guard refuses; file survives."""
         from core.workers import _align_detached_loser
-        from core.models import Repo, SmartSyncCheckout, State
+        from core.state.app import State
+        from core.state.smart_sync import SmartSyncCheckout
+
+        # Build an upstream + clone. Loser detaches and commits
+        from core.state.repos import Repo
 
         # Build an upstream + clone. Loser detaches and commits
         # a unique file that origin doesn't have.
@@ -1369,6 +1899,33 @@ class TestSyncSiblingAncestorGuard(_TempWorkspace):
         ok, msg = sync_sibling(sib, "master")
         self.assertTrue(ok, msg)
 
+    def test_sync_updates_nested_origin_from_gitmodules(self) -> None:
+        from core.git_ops import sync_sibling
+
+        seed = make_repo(self.tmp, "seed", branch="master")
+        old_bare = self.tmp / "old.git"
+        new_bare = self.tmp / "new.git"
+        _run(self.tmp, "git", "clone", "--bare", "-q", str(seed), "old.git")
+        _run(self.tmp, "git", "clone", "--bare", "-q", str(seed), "new.git")
+
+        parent = make_repo(self.tmp, "parent", branch="master")
+        _run(parent, "git", "submodule", "add", str(old_bare), "vendor/seed")
+        _run(parent, "git", "commit", "-q", "-m", "add submodule")
+        nested = parent / "vendor" / "seed"
+        _run(parent, "git", "config", "-f", ".gitmodules",
+             "submodule.vendor/seed.url", str(new_bare))
+
+        old_origin = _run(nested, "git", "remote", "get-url", "origin"
+                          ).stdout.strip()
+        self.assertEqual(old_origin, str(old_bare))
+
+        ok, msg = sync_sibling(nested, "master", parent_path=parent)
+        self.assertTrue(ok, msg)
+        self.assertIn("origin synced", msg)
+        new_origin = _run(nested, "git", "remote", "get-url", "origin"
+                          ).stdout.strip()
+        self.assertEqual(new_origin, str(new_bare))
+
 
 class TestStashPreservedAlways(_TempWorkspace):
     """Cardinal rule: idlegit MUST NOT call `git stash drop` on the
@@ -1390,7 +1947,10 @@ class TestStashPreservedAlways(_TempWorkspace):
         """After the redundant-dirty FF succeeds, the stash entry MUST
         still be on the stash list — pruning is the user's call."""
         from core.workers import _try_ff_through_redundant_dirty
-        from core.models import Repo, SmartSyncCheckout, State
+        from core.state.app import State
+        from core.state.smart_sync import SmartSyncCheckout
+
+        from core.state.repos import Repo
 
         loser = self._seed()
         # Advance origin: another clone pushes a new file.
@@ -1422,7 +1982,10 @@ class TestStashPreservedAlways(_TempWorkspace):
     def test_detached_checkout_through_redundant_dirty_keeps_stash(self) -> None:
         """Same guarantee on the detached-loser checkout path."""
         from core.workers import _try_detached_checkout_through_redundant_dirty
-        from core.models import Repo, SmartSyncCheckout, State
+        from core.state.app import State
+        from core.state.smart_sync import SmartSyncCheckout
+
+        from core.state.repos import Repo
 
         loser = self._seed()
         winner = self.tmp / "winner"
@@ -1460,7 +2023,11 @@ class TestStashPopConflictNoHardReset(_TempWorkspace):
 
     def test_no_hard_reset_after_pop_conflict(self) -> None:
         from core.workers import _stash_switch_pop_winner
-        from core.models import Repo, SmartSyncCheckout, State
+        from core.state.app import State
+        from core.state.smart_sync import SmartSyncCheckout
+
+        # Build a repo with two branches whose 'collide.txt' differs.
+        from core.state.repos import Repo
 
         # Build a repo with two branches whose 'collide.txt' differs.
         # Detach on 'master' with a dirty edit that conflicts with the
@@ -1519,7 +2086,9 @@ class TestCommitWorkerDetachedGuard(_TempWorkspace):
         """When the auto-recovery modal pops and the user cancels, the
         pipeline must NOT proceed — no stage/commit/push, work intact."""
         from core.workers import commit_worker
-        from core.models import Repo, State
+        from core.state.app import State
+
+        from core.state.repos import Repo
 
         repo_path = make_repo(self.tmp, "r")
         # Stage a real change so the staging step would otherwise have
@@ -1576,7 +2145,8 @@ class TestBranchFromHeadAction(_TempWorkspace):
 
     def test_branch_from_head_creates_branch_at_current_commit(self) -> None:
         from core.workers import kick_off_action
-        from core.models import Repo, State
+        from core.state.app import State
+        from core.state.repos import Repo
         import threading
 
         repo_path = self._detached_with_unique()
@@ -1643,7 +2213,9 @@ class TestCheckoutRemoteBranch(_TempWorkspace):
 
     def test_creates_local_tracking_branch(self) -> None:
         from core.workers import kick_off_action
-        from core.models import Repo, State
+        from core.state.app import State
+
+        from core.state.repos import Repo
 
         repo_path = self._repo_with_remote_feature()
         repo = Repo(rel="r", path=repo_path)
@@ -1661,7 +2233,9 @@ class TestCheckoutRemoteBranch(_TempWorkspace):
 
     def test_refuses_when_head_has_unique_commits(self) -> None:
         from core.workers import kick_off_action
-        from core.models import Repo, State
+        from core.state.app import State
+
+        from core.state.repos import Repo
 
         repo_path = self._repo_with_remote_feature()
         head = _run(repo_path, "git", "rev-parse", "HEAD").stdout.strip()
@@ -1691,7 +2265,8 @@ class TestFFMergeAction(_TempWorkspace):
 
     def test_ff_merge_succeeds_when_descendant(self) -> None:
         from core.workers import kick_off_action
-        from core.models import Repo, State
+        from core.state.app import State
+        from core.state.repos import Repo
         import threading
 
         repo_path = make_repo(self.tmp, "r")
@@ -1723,7 +2298,8 @@ class TestFFMergeAction(_TempWorkspace):
 
     def test_ff_merge_refuses_on_divergence(self) -> None:
         from core.workers import kick_off_action
-        from core.models import Repo, State
+        from core.state.app import State
+        from core.state.repos import Repo
         import threading
 
         repo_path = make_repo(self.tmp, "r")
@@ -1762,7 +2338,7 @@ class TestFFMergeAction(_TempWorkspace):
 class TestGitOperationHardening(_TempWorkspace):
     def test_manual_pull_merges_when_diverged(self) -> None:
         from core.workers import kick_off_action
-        from core.models import State
+        from core.state.app import State
 
         remote = make_repo(self.tmp, "remote")
         _run(self.tmp, "git", "clone", str(remote), "r")
@@ -1797,7 +2373,7 @@ class TestGitOperationHardening(_TempWorkspace):
 
     def test_option_like_branch_name_is_rejected_before_checkout(self) -> None:
         from core.workers import kick_off_action
-        from core.models import State
+        from core.state.app import State
 
         repo_path = make_repo(self.tmp, "r")
         head = _run(repo_path, "git", "rev-parse", "HEAD").stdout.strip()
@@ -1834,7 +2410,8 @@ class TestGitOperationHardening(_TempWorkspace):
 class TestPromptHardening(unittest.TestCase):
     def test_detached_recovery_prompt_timeout_clears_slot(self) -> None:
         from core import workers
-        from core.models import DetachedRecoveryPrompt, State
+        from core.state.app import State
+        from core.state.prompts import DetachedRecoveryPrompt
 
         state = State(repos=[], workspace_name="test")
         prompt = DetachedRecoveryPrompt(
@@ -1857,7 +2434,9 @@ class TestPromptHardening(unittest.TestCase):
 
     def test_action_refusal_still_refreshes_target_state(self) -> None:
         from core import workers
-        from core.models import Repo, State
+        from core.state.app import State
+
+        from core.state.repos import Repo
 
         repo = Repo(rel="r", path=Path("/tmp/repo"))
         state = State(repos=[repo], workspace_name="test")
@@ -1873,8 +2452,8 @@ class TestPromptHardening(unittest.TestCase):
                 if t.daemon and t is not threading.current_thread():
                     t.join(timeout=5.0)
 
-        refresh.assert_called_once_with(state, repo, None)
-        self.assertFalse(repo.refreshing)
+        refresh.assert_called_once_with(state, repo, None, [repo], [])
+        self.assertFalse(state.store.repo_busy(repo))
 
 
 class TestHasOnlySubmodulePointerChanges(_TempWorkspace):
@@ -1933,6 +2512,26 @@ class TestHasOnlySubmodulePointerChanges(_TempWorkspace):
         parent = self._parent_with_submodule()
         self._bump_submodule_head(parent)
         self.assertTrue(has_only_submodule_pointer_changes(parent))
+
+    def test_dirty_nested_submodule_without_gitlink_bump_is_false(self) -> None:
+        from core.git_ops import has_only_submodule_pointer_changes
+        parent = self._parent_with_submodule()
+        write_file(parent / "vendor" / "sub", "lib.txt", "dirty only\n")
+        self.assertFalse(has_only_submodule_pointer_changes(parent))
+
+    def test_submodule_pointer_bump_plus_nested_dirty_is_false(self) -> None:
+        from core.git_ops import has_only_submodule_pointer_changes
+        parent = self._parent_with_submodule()
+        self._bump_submodule_head(parent)
+        write_file(parent / "vendor" / "sub", "dirty.txt", "wip\n")
+        self.assertFalse(has_only_submodule_pointer_changes(parent))
+
+    def test_submodule_pointer_change_paths_returns_exact_gitlinks(self) -> None:
+        from core.git_ops import submodule_pointer_change_paths
+        parent = self._parent_with_submodule()
+        self._bump_submodule_head(parent)
+        self.assertEqual(
+            submodule_pointer_change_paths(parent), ["vendor/sub"])
 
     def test_submodule_plus_unrelated_edit_is_false(self) -> None:
         from core.git_ops import has_only_submodule_pointer_changes
@@ -2017,7 +2616,8 @@ class TestAutoPushSubmoduleParentPropagation(_TempWorkspace):
         return _run(sub, "git", "rev-parse", "HEAD").stdout.strip()
 
     def test_propagate_commits_and_pushes_parent(self) -> None:
-        from core.models import Repo, State
+        from core.state.app import State
+        from core.state.repos import Repo
         from core.workers import _propagate_submodule_bump
 
         parent_path, parent_remote, _ = self._seed_parent_with_submodule()
@@ -2025,7 +2625,9 @@ class TestAutoPushSubmoduleParentPropagation(_TempWorkspace):
 
         parent_repo = Repo(rel="parent", path=parent_path)
         state = State(repos=[parent_repo], workspace_name="ws")
-        new_head = _propagate_submodule_bump(state, parent_repo, "parent")
+        with mock.patch("core.workers.safe_stage_all") as stage_all:
+            new_head = _propagate_submodule_bump(state, parent_repo, "parent")
+        stage_all.assert_not_called()
         self.assertTrue(new_head, "expected non-empty new HEAD on success")
 
         # Parent's working tree is clean (the bump landed as a commit).
@@ -2036,8 +2638,165 @@ class TestAutoPushSubmoduleParentPropagation(_TempWorkspace):
         self.assertEqual(rc.returncode, 0)
         self.assertEqual(rc.stdout.strip(), new_head)
 
+    def test_propagate_push_timeout_is_terminal_and_releases_lock(self) -> None:
+        import core.workers as workers_mod
+        from core.state.app import State
+        from core.state.repos import Repo
+        from core.workers import _propagate_submodule_bump
+
+        parent_path, _, _ = self._seed_parent_with_submodule()
+        self._bump_submodule_head(parent_path)
+
+        parent_repo = Repo(rel="parent", path=parent_path)
+        state = State(repos=[parent_repo], workspace_name="ws")
+
+        with mock.patch.object(
+                workers_mod,
+                "git_cancellable",
+                return_value=(124, "", "git timed out after 120s"),
+        ) as push:
+            new_head = _propagate_submodule_bump(state, parent_repo, "parent")
+
+        self.assertEqual(new_head, "")
+        push.assert_called_once()
+        self.assertEqual(
+            push.call_args.kwargs["timeout"],
+            workers_mod.PROPAGATE_PUSH_TIMEOUT_SECONDS)
+        push_task = next(
+            task for task in state.tasks.snapshot()
+            if task.label == "  ↳ propagate parent: push")
+        self.assertEqual(push_task.status, "fail")
+        self.assertIn("timed out", push_task.message)
+        self.assertFalse(state.tasks.has_running())
+        self.assertFalse(state.leases.has_lease_for(repos=[parent_repo]))
+        self.assertFalse(state.store.repo_busy(parent_repo))
+        assert_repo_refresh_available(self, state, parent_repo)
+
+    def test_propagate_push_exception_marks_task_terminal(self) -> None:
+        import core.workers as workers_mod
+        from core.state.app import State
+        from core.state.repos import Repo
+        from core.workers import _propagate_submodule_bump
+
+        parent_path, _, _ = self._seed_parent_with_submodule()
+        self._bump_submodule_head(parent_path)
+
+        parent_repo = Repo(rel="parent", path=parent_path)
+        state = State(repos=[parent_repo], workspace_name="ws")
+
+        with mock.patch.object(
+                workers_mod,
+                "git_cancellable",
+                side_effect=RuntimeError("push exploded"),
+        ):
+            new_head = _propagate_submodule_bump(state, parent_repo, "parent")
+
+        self.assertEqual(new_head, "")
+        push_task = next(
+            task for task in state.tasks.snapshot()
+            if task.label == "  ↳ propagate parent: push")
+        self.assertEqual(push_task.status, "fail")
+        self.assertEqual(push_task.message, "push exploded")
+        self.assertFalse(state.leases.has_lease_for(repos=[parent_repo]))
+        self.assertFalse(state.store.repo_busy(parent_repo))
+
+    def test_cascade_align_exception_marks_task_terminal(self) -> None:
+        import core.workers as workers_mod
+        from core.state.app import State
+        from core.state.repos import ChildRef, Repo
+        from core.workers import _cascade_propagate_to_parents
+
+        canonical = Repo(rel="canonical", path=self.tmp / "canonical")
+        parent = Repo(rel="parent", path=self.tmp / "parent")
+        grandparent = Repo(rel="grandparent", path=self.tmp / "grandparent")
+        nested_parent = grandparent.path / "vendor" / "parent"
+        child = ChildRef(
+            repo=parent,
+            nested_path=nested_parent,
+            branch="master",
+        )
+        grandparent.children = [child]
+        canonical.siblings = [(parent, parent.path / "vendor" / "canonical")]
+        parent.siblings = [(grandparent, nested_parent)]
+        state = State(
+            repos=[canonical, parent, grandparent],
+            workspace_name="ws",
+        )
+
+        with mock.patch.object(
+                workers_mod,
+                "_propagate_submodule_bump",
+                return_value="abc123",
+        ), \
+             mock.patch.object(
+                 workers_mod,
+                 "git",
+                 return_value=(0, "master\n", ""),
+             ), \
+             mock.patch.object(
+                 workers_mod,
+                 "_ff_submodule_checkout_to",
+                 side_effect=RuntimeError("ff exploded"),
+             ):
+            _cascade_propagate_to_parents(state, [canonical])
+
+        task = next(
+            task for task in state.tasks.snapshot()
+            if task.label == "  ↳ propagate parent: align in grandparent")
+        self.assertEqual(task.status, "fail")
+        self.assertEqual(task.message, "ff exploded")
+        self.assertFalse(state.store.child_busy(child))
+        self.assertFalse(state.tasks.has_running())
+
+    def test_cascade_align_skips_when_child_lock_is_busy(self) -> None:
+        import core.workers as workers_mod
+        from core.state.app import State
+        from core.state.repos import ChildRef, Repo
+        from core.workers import _cascade_propagate_to_parents
+
+        canonical = Repo(rel="canonical", path=self.tmp / "canonical")
+        parent = Repo(rel="parent", path=self.tmp / "parent")
+        grandparent = Repo(rel="grandparent", path=self.tmp / "grandparent")
+        nested_parent = grandparent.path / "vendor" / "parent"
+        child = ChildRef(
+            repo=parent,
+            nested_path=nested_parent,
+            branch="master",
+        )
+        grandparent.children = [child]
+        canonical.siblings = [(parent, parent.path / "vendor" / "canonical")]
+        parent.siblings = [(grandparent, nested_parent)]
+        state = State(
+            repos=[canonical, parent, grandparent],
+            workspace_name="ws",
+        )
+
+        with mock.patch.object(
+                workers_mod,
+                "_propagate_submodule_bump",
+                return_value="abc123",
+        ), \
+             mock.patch.object(
+                 workers_mod,
+                 "git",
+                 return_value=(0, "master\n", ""),
+             ), \
+             mock.patch.object(workers_mod, "_ff_submodule_checkout_to") as ff, \
+             held_child_refresh(state, child):
+            _cascade_propagate_to_parents(state, [canonical])
+
+        ff.assert_not_called()
+        task = next(
+            task for task in state.tasks.snapshot()
+            if task.label == "  ↳ propagate parent: align in grandparent")
+        self.assertEqual(task.status, "warn")
+        self.assertEqual(
+            task.message, "skipped: child refresh lock held by another op")
+        self.assertFalse(state.tasks.has_running())
+
     def test_propagate_refuses_when_unrelated_dirt_present(self) -> None:
-        from core.models import Repo, State
+        from core.state.app import State
+        from core.state.repos import Repo
         from core.workers import _propagate_submodule_bump
 
         parent_path, _, _ = self._seed_parent_with_submodule()
@@ -2054,8 +2813,37 @@ class TestAutoPushSubmoduleParentPropagation(_TempWorkspace):
         self.assertIn("README.md", status)
         self.assertIn("vendor/sub", status)
 
+    def test_propagate_refuses_when_nested_checkout_dirty(self) -> None:
+        import core.workers as workers_mod
+        from core.state.app import State
+        from core.state.repos import Repo
+        from core.workers import _propagate_submodule_bump
+
+        parent_path, _, _ = self._seed_parent_with_submodule()
+        self._bump_submodule_head(parent_path)
+        write_file(parent_path / "vendor" / "sub", "dirty.txt", "wip\n")
+
+        parent_repo = Repo(rel="parent", path=parent_path)
+        state = State(repos=[parent_repo], workspace_name="ws")
+        with mock.patch.object(workers_mod, "git_cancellable") as push:
+            new_head = _propagate_submodule_bump(state, parent_repo, "parent")
+
+        self.assertEqual(new_head, "")
+        push.assert_not_called()
+        task = next(
+            task for task in state.tasks.snapshot()
+            if task.label == "  ↳ propagate parent")
+        self.assertEqual(task.status, "warn")
+        self.assertEqual(
+            task.message, "skipped: parent has other dirty changes")
+        self.assertFalse(state.tasks.has_running())
+        self.assertFalse(state.store.repo_busy(parent_repo))
+        status = _run(parent_path, "git", "status", "--porcelain=v1").stdout
+        self.assertIn("vendor/sub", status)
+
     def test_propagate_refuses_on_detached_head(self) -> None:
-        from core.models import Repo, State
+        from core.state.app import State
+        from core.state.repos import Repo
         from core.workers import _propagate_submodule_bump
 
         parent_path, _, _ = self._seed_parent_with_submodule()

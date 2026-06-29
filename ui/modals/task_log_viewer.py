@@ -9,11 +9,16 @@ since there's only one log per task."""
 from __future__ import annotations
 
 import curses
-import threading
 from typing import List
 
-from core.git_ops import fetch_run_log
-from core.models import State, Task, TaskLogViewer
+from core.state.app import State
+from features.task_log_viewer.actions import (
+    handle_task_log_viewer_key as handle_task_log_viewer_key_action,
+)
+from features.task_log_viewer.projection import (
+    task_log_viewer_hint_specs,
+    task_status_label,
+)
 
 from ..colors import (
     PAIR_DLG_CYAN, PAIR_DLG_ERR, PAIR_DLG_FG, PAIR_DLG_OK, PAIR_DLG_WARN,
@@ -22,7 +27,7 @@ from ..geometry import (
     draw_modal_fill, draw_scroll_overflow, end_truncate, modal_geometry,
     safe_addstr, wrap_label_value,
 )
-from ..hints import KEY_ESC, KEY_UP_DOWN, Hint, render_hints
+from ..hints import Hint, render_hints
 from ..sidebar import SPINNER_FRAMES
 
 
@@ -35,97 +40,24 @@ _STATUS_COLOURS = {
 }
 
 
-def _status_label(task: Task) -> str:
-    """Same glyph palette as task_detail._status_label — keep the two
-    in lockstep so the indicator reads identically in both modals."""
-    if task.status == "running":
-        return "running"
-    if task.status == "pending":
-        return "pending"
-    if task.status == "ok":
-        return "✓ ok"
-    if task.status == "fail":
-        return "✗ failed"
-    return "⚠ warn"
-
-
 def _spinner_glyph(state: State) -> str:
     return SPINNER_FRAMES[state.spinner_frame % len(SPINNER_FRAMES)]
-
-
-# ---------- Open ----------------------------------------------------------
-
-
-def open_task_log_viewer(state: State, task: Task) -> None:
-    """Install the viewer onto state and spawn the loader thread.
-
-    Caller is responsible for verifying the task has a `run_id`
-    (the action menu only surfaces `View log` when it does).
-    `only_failed` mirrors the focused task's status: failed runs get
-    the `--log-failed` short-form (matches what gh CLI users reach
-    for first), everything else gets the full `--log`. `job_id`
-    scopes the fetch to a single job when the focused task is a job
-    sub-task (Task metadata's `job_id` set by `_poll_run`)."""
-    meta = state.tasks.get_meta(task)
-    if meta is None or meta.run_id is None or not meta.slug:
-        return
-    only_failed = task.status == "fail"
-    viewer = TaskLogViewer(
-        task=task,
-        slug=meta.slug,
-        run_id=meta.run_id,
-        job_id=meta.job_id,
-        workflow_name=meta.workflow_name or "",
-        only_failed=only_failed,
-    )
-    state.task_log_viewer = viewer
-    threading.Thread(target=_load_log, args=(viewer,), daemon=True).start()
-
-
-def _load_log(viewer: TaskLogViewer) -> None:
-    """Background loader. Calls `fetch_run_log` and lands the result
-    on the viewer under its lock. Bails on `cancel_event` so a user
-    closing the modal mid-fetch doesn't stomp post-close state."""
-    try:
-        if viewer.cancel_event.is_set():
-            return
-        ok, lines, err = fetch_run_log(
-            viewer.slug, viewer.run_id,
-            job_id=viewer.job_id, only_failed=viewer.only_failed)
-        if viewer.cancel_event.is_set():
-            return
-        with viewer.lock:
-            if ok:
-                viewer.lines = lines if lines else ["(no log output yet)"]
-            else:
-                viewer.error = err or "fetch failed"
-                viewer.lines = []
-            viewer.loading = False
-    finally:
-        if viewer.loading:
-            with viewer.lock:
-                viewer.loading = False
 
 
 # ---------- Draw ----------------------------------------------------------
 
 
 def _hints() -> List[Hint]:
-    return [
-        Hint(KEY_UP_DOWN, "scroll"),
-        Hint(KEY_ESC, "close"),
-    ]
+    return [Hint(keys, action)
+            for keys, action in task_log_viewer_hint_specs()]
 
 
 def draw_task_log_viewer(stdscr, state: State, sidebar_x: int) -> None:
     viewer = state.task_log_viewer
     if viewer is None:
         return
-    with viewer.lock:
-        lines = list(viewer.lines)
-        loading = viewer.loading
-        error = viewer.error
-        scroll = viewer.scroll
+    lines, loading, error = state.view_loads.snapshot(viewer.load_id)
+    scroll = viewer.scroll
 
     h, w = stdscr.getmaxyx()
     target_w = min(120, max(40, w - 4))
@@ -166,7 +98,7 @@ def draw_task_log_viewer(stdscr, state: State, sidebar_x: int) -> None:
     # place (running → ok / fail).
     task = viewer.task
     status_pair = _STATUS_COLOURS.get(task.status, PAIR_DLG_FG)
-    status_text = f"State: {_status_label(task)}"
+    status_text = f"State: {task_status_label(task)}"
     if viewer.only_failed:
         status_text += "  ·  showing failed steps only"
     safe_addstr(stdscr, line, inner_x,
@@ -191,8 +123,7 @@ def draw_task_log_viewer(stdscr, state: State, sidebar_x: int) -> None:
             scroll = max_scroll
         if scroll < 0:
             scroll = 0
-        with viewer.lock:
-            viewer.scroll = scroll
+        viewer.scroll = scroll
         for i in range(body_h):
             idx = scroll + i
             if idx >= len(lines):
@@ -217,47 +148,10 @@ def draw_task_log_viewer(stdscr, state: State, sidebar_x: int) -> None:
 
 
 def handle_task_log_viewer_key(state: State, key: int) -> None:
-    viewer = state.task_log_viewer
-    if viewer is None:
-        return
-    # Enter / Esc / Tab all close — mirror diff_viewer's gesture set
-    # so muscle memory carries over between the two scrollable panes.
-    if key in (9, 10, 13, curses.KEY_ENTER, 27):
-        viewer.cancel_event.set()
-        state.task_log_viewer = None
-        return
-    with viewer.lock:
-        cur = viewer.scroll
-    if key == curses.KEY_UP:
-        _set_scroll(viewer, max(0, cur - 1))
-        return
-    if key == curses.KEY_DOWN:
-        # Clamped to max_scroll at draw time once body_h is known.
-        _set_scroll(viewer, cur + 1)
-        return
-    if key == curses.KEY_PPAGE:
-        _set_scroll(viewer, max(0, cur - 10))
-        return
-    if key == curses.KEY_NPAGE:
-        _set_scroll(viewer, cur + 10)
-        return
-    if key == curses.KEY_HOME:
-        _set_scroll(viewer, 0)
-        return
-    if key == curses.KEY_END:
-        with viewer.lock:
-            n = len(viewer.lines)
-        _set_scroll(viewer, n)
-        return
-
-
-def _set_scroll(viewer: TaskLogViewer, value: int) -> None:
-    with viewer.lock:
-        viewer.scroll = value
+    handle_task_log_viewer_key_action(state, key)
 
 
 __all__ = [
-    "open_task_log_viewer",
     "draw_task_log_viewer",
     "handle_task_log_viewer_key",
 ]

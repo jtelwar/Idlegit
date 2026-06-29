@@ -7,7 +7,8 @@ from __future__ import annotations
 
 import curses
 
-from core.models import DetachedRecoveryPrompt, State
+from core.state.app import State
+from core.state.prompts import DetachedRecoveryPrompt
 
 from ..colors import PAIR_DLG_CYAN, PAIR_DLG_FG
 from ..geometry import (

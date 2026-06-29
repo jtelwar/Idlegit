@@ -56,18 +56,28 @@ def read_key(stdscr) -> int:
       within one nonblocking poll) returns 27 as before. Any other
       Alt+<letter> falls back to bare ESC (the follower is dropped).
 
-    Briefly toggles ``nodelay(True)`` to peek for a follower. The
-    caller is assumed to re-assert ``timeout()`` on the next iteration
-    (main + review loops both do); plain blocking is fine for callers
-    that don't (e.g. the y/n confirm prompt)."""
+    Briefly switches to nonblocking input to peek for a follower, then
+    restores the window's previous delay. Restoring matters: forcing
+    ``nodelay(False)`` after Esc puts curses back into blocking mode,
+    which can freeze callers that read again before their next outer
+    timeout reset."""
     raw = stdscr.getch()
     if raw != 27:
         return _normalize_mouse(raw)
-    stdscr.nodelay(True)
+    previous_delay = None
+    if hasattr(stdscr, "getdelay"):
+        try:
+            previous_delay = stdscr.getdelay()
+        except curses.error:
+            previous_delay = None
+    stdscr.timeout(0)
     try:
         nxt = stdscr.getch()
     finally:
-        stdscr.nodelay(False)
+        if previous_delay is None or previous_delay < 0:
+            stdscr.timeout(100)
+        else:
+            stdscr.timeout(previous_delay)
     if nxt == -1:
         return 27
     if nxt == ord('s'):

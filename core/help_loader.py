@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import List
 
 from .config import TOOL_DIR
-from .models import HelpPage
+from .state.views import HelpPage
 
 # Where help pages live in both the dev-tree and post-install layouts.
 # Same anchor as `idlegit.default.conf` (`TOOL_DIR`), so a missing

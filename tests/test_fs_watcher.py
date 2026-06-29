@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -25,7 +26,17 @@ for _p in (str(_HERE.parent), str(_HERE)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+from _helpers import (  # noqa: E402
+    assert_child_refresh_available,
+    assert_child_refresh_blocked,
+    assert_repo_refresh_available,
+    assert_repo_refresh_blocked,
+    held_child_refresh,
+    held_repo_refresh,
+)
 from core import config, fs_watcher  # noqa: E402
+from core.git_ops import LinkSiblingsSnapshot  # noqa: E402
+from core.jobs import JobSpec, JobStatus  # noqa: E402
 from core.fs_watcher import (  # noqa: E402
     MIN_DEBOUNCE_SECONDS,
     RepoWatcher,
@@ -34,7 +45,9 @@ from core.fs_watcher import (  # noqa: E402
     _is_internal_git_path,
     _matches_ignore_spec,
 )
-from core.models import ChildRef, Repo, State, Workspace  # noqa: E402
+from core.state.app import State  # noqa: E402
+from core.state.repos import ChildRef, Repo  # noqa: E402
+from core.state.workspaces import Workspace  # noqa: E402
 
 
 def _make_repo(path: str) -> Repo:
@@ -44,10 +57,19 @@ def _make_repo(path: str) -> Repo:
     return Repo(rel=".", path=Path(path))
 
 
+def _empty_link_snapshot(repos):
+    return LinkSiblingsSnapshot(
+        repos=tuple(repos),
+        children_by_parent={id(repo): () for repo in repos},
+        siblings_by_repo={id(repo): () for repo in repos},
+        synthetic_by_url={},
+    )
+
+
 def _make_child_ref(path_suffix: str = "sub") -> ChildRef:
     """Bare ChildRef for mutex testing. Nests a fresh Repo under a
-    fake parent path so equality + the per-ChildRef lock work
-    independently of any tracked Repo."""
+    fake parent path so equality + the store-owned child lock work
+    independently of any tracked Repo object."""
     inner = _make_repo(f"/tmp/{path_suffix}/inner")
     return ChildRef(repo=inner, nested_path=Path(f"/tmp/{path_suffix}"))
 
@@ -142,6 +164,35 @@ class RepoWatcherDebounceTests(unittest.TestCase):
         # throttling under heavy fs event load).
         self.assertEqual(len(fires), 1)
 
+    def test_thread_start_failure_queues_for_later_drain(self):
+        class FailingThread:
+            daemon = False
+
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def is_alive(self):
+                return False
+
+            def start(self):
+                raise RuntimeError("thread start failed")
+
+        repo = _make_repo("/tmp/repo-thread-fail")
+        state = _make_state(debounce_ms=50, repos=[repo])
+        manager = WatcherManager()
+        watcher = RepoWatcher(
+            state, repo, manager=manager,
+            refresh_fn=lambda r: None)
+        manager._repos[repo.path] = watcher
+
+        with mock.patch("core.runtime.threads.threading.Thread", FailingThread):
+            watcher.on_event("/tmp/repo-thread-fail/source.py")
+
+        with watcher._lock:
+            self.assertIsNone(watcher._timer_thread)
+            self.assertGreater(watcher._fire_at, 0.0)
+        self.assertIn(repo.path, manager._pending)
+
     def test_min_debounce_clamp(self):
         # A pathological debounce_ms (e.g. 0) clamps to
         # MIN_DEBOUNCE_SECONDS so we don't busy-fire.
@@ -165,14 +216,13 @@ class RepoWatcherDebounceTests(unittest.TestCase):
 
 
 class SuppressionTests(unittest.TestCase):
-    """Suppression rules: skip when an action is already touching the
-    row (`repo.refreshing=True`); queue rather than fire when the
-    review sub-loop owns input (`state.in_review=True`)."""
+    """Suppression rules: skip when store-owned row busy state is active;
+    queue rather than fire when the review sub-loop owns input."""
 
-    def test_skip_when_repo_already_refreshing(self):
+    def test_skip_when_repo_row_is_store_busy(self):
         repo = _make_repo("/tmp/repo-D")
-        repo.refreshing = True  # an action holds this row
         state = _make_state(debounce_ms=20, repos=[repo])
+        state.store.set_repo_busy(repo, True)
         fires = []
         manager = WatcherManager()
         watcher = RepoWatcher(
@@ -181,6 +231,24 @@ class SuppressionTests(unittest.TestCase):
         manager._repos[repo.path] = watcher
         watcher._on_timer()  # bypass the debounce, hit the gate directly
         self.assertEqual(fires, [])
+        self.assertNotIn(repo.path, manager._pending)
+
+    def test_on_event_short_circuits_when_repo_row_is_store_busy(self):
+        repo = _make_repo("/tmp/repo-store-busy")
+        state = _make_state(debounce_ms=20, repos=[repo])
+        state.store.set_repo_busy(repo, True)
+        manager = WatcherManager()
+        watcher = RepoWatcher(
+            state, repo, manager=manager,
+            refresh_fn=lambda r: None)
+        manager._repos[repo.path] = watcher
+
+        watcher.on_event("/tmp/repo-store-busy/file.py")
+
+        with watcher._lock:
+            self.assertIsNone(watcher._timer_thread)
+            self.assertEqual(watcher._fire_at, 0.0)
+        self.assertTrue(state.store.repo_busy(repo))
         self.assertNotIn(repo.path, manager._pending)
 
     def test_queue_when_in_review(self):
@@ -203,26 +271,204 @@ class SuppressionTests(unittest.TestCase):
         repo_b = _make_repo("/tmp/repo-G")
         state = _make_state(debounce_ms=20, repos=[repo_a, repo_b])
         fires = []
+        drained = threading.Event()
+
+        def refresh(repo):
+            fires.append(repo.path)
+            if len(fires) == 2:
+                drained.set()
+
         manager = WatcherManager()
         for r in (repo_a, repo_b):
             w = RepoWatcher(
                 state, r, manager=manager,
-                refresh_fn=lambda rr: fires.append(rr.path))
+                refresh_fn=refresh)
             manager._repos[r.path] = w
         manager._pending.add(repo_a.path)
         manager._pending.add(repo_b.path)
         manager.drain_pending()
+        self.assertTrue(drained.wait(timeout=2.0))
         self.assertEqual(set(fires), {repo_a.path, repo_b.path})
         self.assertEqual(manager._pending, set())
+        jobs = state.job_registry.snapshot()
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0].spec.kind, "fs-watch-drain")
+        deadline = time.monotonic() + 2.0
+        while not jobs[0].terminal and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(jobs[0].status, JobStatus.OK)
+        self.assertFalse(jobs[0].spec.local_mutation)
+        self.assertEqual(
+            set(jobs[0].spec.repo_keys),
+            {str(repo_a.path), str(repo_b.path)},
+        )
 
-    def test_queue_when_tasks_running(self):
+    def test_drain_pending_thread_start_failure_requeues_paths(self):
+        class FailingThread:
+            daemon = False
+
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def start(self):
+                raise RuntimeError("thread start failed")
+
+        repo = _make_repo("/tmp/repo-drain-thread-fail")
+        state = _make_state(debounce_ms=20, repos=[repo])
+        manager = WatcherManager()
+        watcher = RepoWatcher(
+            state, repo, manager=manager,
+            refresh_fn=lambda _repo: None)
+        manager._repos[repo.path] = watcher
+        manager._pending.add(repo.path)
+
+        with mock.patch("core.runtime.threads.threading.Thread", FailingThread):
+            manager.drain_pending()
+
+        self.assertIn(repo.path, manager._pending)
+        jobs = state.job_registry.snapshot()
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0].spec.kind, "fs-watch-drain")
+        self.assertEqual(jobs[0].status, JobStatus.FAIL)
+
+    def test_drain_pending_refresh_failure_marks_job_warning(self):
+        repo = _make_repo("/tmp/repo-drain-refresh-fail")
+        state = _make_state(debounce_ms=20, repos=[repo])
+        manager = WatcherManager()
+
+        def refresh(_repo):
+            raise RuntimeError("refresh failed")
+
+        watcher = RepoWatcher(
+            state, repo, manager=manager,
+            refresh_fn=refresh)
+        manager._repos[repo.path] = watcher
+        manager._pending.add(repo.path)
+
+        manager.drain_pending()
+
+        jobs = state.job_registry.snapshot()
+        deadline = time.monotonic() + 2.0
+        while not jobs[0].terminal and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(jobs[0].status, JobStatus.WARN)
+        self.assertEqual(jobs[0].message, "1 refresh failed")
+        self.assertFalse(state.store.repo_busy(repo))
+
+    def test_drain_pending_link_failure_marks_job_warning(self):
+        repo = _make_repo("/tmp/repo-drain-link-fail")
+        state = _make_state(debounce_ms=20, repos=[repo])
+        manager = WatcherManager()
+        watcher = RepoWatcher(
+            state, repo, manager=manager,
+            refresh_fn=lambda _repo: None)
+        manager._repos[repo.path] = watcher
+        manager._pending.add(repo.path)
+
+        with mock.patch(
+                "core.fs_watcher.read_link_siblings_snapshot",
+                side_effect=RuntimeError("link failed")):
+            manager.drain_pending()
+
+        jobs = state.job_registry.snapshot()
+        deadline = time.monotonic() + 2.0
+        while not jobs[0].terminal and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(jobs[0].status, JobStatus.WARN)
+        self.assertEqual(jobs[0].message, "1 link failed")
+        self.assertFalse(state.store.repo_busy(repo))
+
+    def test_drain_pending_requeues_busy_repo(self):
+        repo = _make_repo("/tmp/repo-drain-busy")
+        state = _make_state(debounce_ms=20, repos=[repo])
+        manager = WatcherManager()
+        watcher = RepoWatcher(
+            state, repo, manager=manager,
+            refresh_fn=lambda _repo: None)
+        manager._repos[repo.path] = watcher
+        manager._pending.add(repo.path)
+
+        with held_repo_refresh(state, repo):
+            manager.drain_pending()
+
+            jobs = state.job_registry.snapshot()
+            deadline = time.monotonic() + 2.0
+            while not jobs[0].terminal and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(jobs[0].status, JobStatus.WARN)
+            self.assertEqual(jobs[0].message, "1 busy")
+            self.assertIn(repo.path, manager._pending)
+
+    def test_drain_pending_skips_relink_after_workspace_switch(self):
+        repo_a = _make_repo("/tmp/repo-drain-workspace-a")
+        repo_b = _make_repo("/tmp/repo-drain-workspace-b")
+        state = _make_state(debounce_ms=20, repos=[repo_a])
+        manager = WatcherManager()
+        refresh_entered = threading.Event()
+        allow_refresh_exit = threading.Event()
+        links = []
+
+        def refresh(_repo):
+            refresh_entered.set()
+            self.assertTrue(allow_refresh_exit.wait(timeout=2.0))
+
+        watcher = RepoWatcher(
+            state, repo_a, manager=manager,
+            refresh_fn=refresh)
+        manager._repos[repo_a.path] = watcher
+        manager._pending.add(repo_a.path)
+
+        with mock.patch(
+                "core.fs_watcher.read_link_siblings_snapshot",
+                side_effect=lambda repos, _subtrees, **_kwargs:
+                links.extend(repo.path for repo in repos) or
+                _empty_link_snapshot(repos)):
+            manager.drain_pending()
+            self.assertTrue(refresh_entered.wait(timeout=2.0))
+            state.workspace_name = "other"
+            state.repos = [repo_b]
+            allow_refresh_exit.set()
+
+            jobs = state.job_registry.snapshot()
+            deadline = time.monotonic() + 2.0
+            while not jobs[0].terminal and time.monotonic() < deadline:
+                time.sleep(0.01)
+
+        self.assertEqual(jobs[0].status, JobStatus.OK)
+        self.assertEqual(links, [])
+
+    def test_drain_pending_returns_without_waiting_for_refresh(self):
+        repo = _make_repo("/tmp/repo-async-drain")
+        state = _make_state(debounce_ms=20, repos=[repo])
+        entered = threading.Event()
+        release = threading.Event()
+
+        def refresh(_repo):
+            entered.set()
+            self.assertTrue(release.wait(timeout=2.0))
+
+        manager = WatcherManager()
+        watcher = RepoWatcher(
+            state, repo, manager=manager,
+            refresh_fn=refresh)
+        manager._repos[repo.path] = watcher
+        manager._pending.add(repo.path)
+        manager.drain_pending()
+        self.assertEqual(manager._pending, set())
+        self.assertTrue(entered.wait(timeout=2.0))
+        self.assertTrue(state.store.repo_busy(repo))
+        release.set()
+        assert_repo_refresh_available(self, state, repo, timeout=2.0)
+        self.assertFalse(state.store.repo_busy(repo))
+
+    def test_queue_when_local_mutation_job_running(self):
         # Multi-repo actions like smart-sync mutate the working tree
         # across siblings. Per-event refreshes during the action would
         # race the action and thrash the spinner; instead we queue
-        # everything and drain once `tasks.has_running` goes False.
+        # everything and drain once local mutation jobs finish.
         repo = _make_repo("/tmp/repo-tasks")
         state = _make_state(debounce_ms=20, repos=[repo])
-        state.tasks.add("syncing")  # leaves a running task in flight
+        state.leases.acquire(repo=repo)
         fires = []
         manager = WatcherManager()
         watcher = RepoWatcher(
@@ -232,15 +478,108 @@ class SuppressionTests(unittest.TestCase):
         watcher._on_timer()
         self.assertEqual(fires, [])
         # The repo path should be queued for the drain that runs when
-        # the main loop sees `has_running` transition False.
+        # the main loop sees local mutation jobs transition False.
         self.assertIn(repo.path, manager._pending)
+
+    def test_pending_task_without_mutation_owner_does_not_queue(self):
+        repo = _make_repo("/tmp/repo-pending-ui-only")
+        state = _make_state(debounce_ms=20, repos=[repo])
+        pending = state.tasks.add("workflow follow-up")
+        state.tasks.update(pending, "pending", "waiting")
+        fires = []
+        manager = WatcherManager()
+        watcher = RepoWatcher(
+            state, repo, manager=manager,
+            refresh_fn=lambda r: fires.append(r.path))
+        manager._repos[repo.path] = watcher
+        watcher._on_timer()
+        self.assertEqual(fires, [repo.path])
+        self.assertNotIn(repo.path, manager._pending)
+
+    def test_registry_mutation_job_queues_refresh(self):
+        repo = _make_repo("/tmp/repo-registry-job")
+        state = _make_state(debounce_ms=20, repos=[repo])
+        job = state.job_registry.start(
+            JobSpec(kind="commit", label="commit", local_mutation=True))
+        fires = []
+        manager = WatcherManager()
+        watcher = RepoWatcher(
+            state, repo, manager=manager,
+            refresh_fn=lambda r: fires.append(r.path))
+        manager._repos[repo.path] = watcher
+        watcher._on_timer()
+        self.assertEqual(fires, [])
+        self.assertIn(repo.path, manager._pending)
+
+        state.job_registry.finish(job, JobStatus.OK)
+        manager.drain_pending()
+        deadline = time.monotonic() + 2.0
+        while not fires and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(fires, [repo.path])
+
+    def test_unrelated_registry_mutation_job_does_not_queue_refresh(self):
+        repo = _make_repo("/tmp/repo-registry-unrelated")
+        state = _make_state(debounce_ms=20, repos=[repo])
+        state.job_registry.start(JobSpec(
+            kind="commit",
+            label="commit",
+            local_mutation=True,
+            repo_keys=("/tmp/other-repo",),
+        ))
+        fires = []
+        manager = WatcherManager()
+        watcher = RepoWatcher(
+            state, repo, manager=manager,
+            refresh_fn=lambda r: fires.append(r.path))
+        manager._repos[repo.path] = watcher
+        watcher._on_timer()
+        self.assertEqual(fires, [repo.path])
+        self.assertNotIn(repo.path, manager._pending)
+
+    def test_child_registry_mutation_job_queues_parent_refresh(self):
+        repo = _make_repo("/tmp/repo-registry-child")
+        child = ChildRef(repo=_make_repo("/tmp/canonical-child"),
+                         nested_path=repo.path / "vendor" / "sdk")
+        repo.children = [child]
+        state = _make_state(debounce_ms=20, repos=[repo])
+        state.job_registry.start(JobSpec(
+            kind="child-push",
+            label="child push",
+            local_mutation=True,
+            child_keys=(str(child.nested_path),),
+        ))
+        fires = []
+        manager = WatcherManager()
+        watcher = RepoWatcher(
+            state, repo, manager=manager,
+            refresh_fn=lambda r: fires.append(r.path))
+        manager._repos[repo.path] = watcher
+        watcher._on_timer()
+        self.assertEqual(fires, [])
+        self.assertIn(repo.path, manager._pending)
+
+    def test_unrelated_task_mutation_claim_does_not_queue_refresh(self):
+        repo = _make_repo("/tmp/repo-task-unrelated")
+        other = _make_repo("/tmp/other-task-repo")
+        state = _make_state(debounce_ms=20, repos=[repo, other])
+        state.leases.acquire(repo=other)
+        fires = []
+        manager = WatcherManager()
+        watcher = RepoWatcher(
+            state, repo, manager=manager,
+            refresh_fn=lambda r: fires.append(r.path))
+        manager._repos[repo.path] = watcher
+        watcher._on_timer()
+        self.assertEqual(fires, [repo.path])
+        self.assertNotIn(repo.path, manager._pending)
 
     def test_on_event_queues_even_when_repo_already_refreshing(self):
         # CRITICAL: when a commit pipeline holds the refresh lock, the
         # repo's `refreshing` flag is True AND a task is running. The
         # gate-order audit caught a bug here: an earlier version of
-        # `on_event` returned on `if self.repo.refreshing` BEFORE the
-        # `tasks.has_running` check, so user edits during a commit
+        # `on_event` returned on store-owned row busy state BEFORE the
+        # local-mutation check, so user edits during a commit
         # were dropped entirely (no post-task drain would fire). The
         # tasks gate now runs first so the event is queued.
         repo = _make_repo("/tmp/repo-gate-order")
@@ -248,9 +587,8 @@ class SuppressionTests(unittest.TestCase):
         # Simulate the commit pipeline: lock held + task running +
         # `refreshing` raised. All three are true at once during a
         # real commit.
-        self.assertTrue(repo.try_acquire_refresh())
-        try:
-            state.tasks.add("committing")  # leaves a running task
+        with held_repo_refresh(state, repo):
+            state.leases.acquire(repo=repo)
             manager = WatcherManager()
             watcher = RepoWatcher(
                 state, repo, manager=manager,
@@ -263,21 +601,18 @@ class SuppressionTests(unittest.TestCase):
                 self.assertIsNone(watcher._timer_thread)
                 self.assertEqual(watcher._fire_at, 0.0)
             self.assertIn(repo.path, manager._pending)
-        finally:
-            repo.release_refresh()
 
     def test_on_timer_queues_even_when_repo_already_refreshing(self):
         # Same gate-order check applied to `_on_timer` — exercises
         # the code path where a debounce thread settled BEFORE the
         # commit pipeline acquired the lock. By the time the timer
         # fires, the pipeline holds both `refreshing=True` and a
-        # running task. The event must end up in `_pending` (drained
-        # at has_running → idle), not dropped.
+        # local mutation job. The event must end up in `_pending` (drained
+        # at mutation-active → idle), not dropped.
         repo = _make_repo("/tmp/repo-timer-gate")
         state = _make_state(debounce_ms=20, repos=[repo])
-        self.assertTrue(repo.try_acquire_refresh())
-        try:
-            state.tasks.add("committing")
+        with held_repo_refresh(state, repo):
+            state.leases.acquire(repo=repo)
             manager = WatcherManager()
             watcher = RepoWatcher(
                 state, repo, manager=manager,
@@ -285,8 +620,6 @@ class SuppressionTests(unittest.TestCase):
             manager._repos[repo.path] = watcher
             watcher._on_timer()
             self.assertIn(repo.path, manager._pending)
-        finally:
-            repo.release_refresh()
 
     def test_on_event_short_circuits_when_tasks_running(self):
         # When tasks are running we shouldn't even start the debounce
@@ -294,7 +627,7 @@ class SuppressionTests(unittest.TestCase):
         # spinner-thrashing pathology before this gate.
         repo = _make_repo("/tmp/repo-fast-bail")
         state = _make_state(debounce_ms=200, repos=[repo])
-        state.tasks.add("syncing")
+        state.leases.acquire(repo=repo)
         manager = WatcherManager()
         watcher = RepoWatcher(
             state, repo, manager=manager,
@@ -317,36 +650,33 @@ class SuppressionTests(unittest.TestCase):
 
 
 class FireRefreshTests(unittest.TestCase):
-    """`fire_refresh` holds `repo.refreshing` for the duration of the
-    refresh call so the main loop's anim_running check picks up the
-    row's spinner. Idempotent against concurrent fires."""
+    """`fire_refresh` holds store-owned row busy state for the duration
+    of the refresh call. Idempotent against concurrent fires."""
 
-    def test_sets_refreshing_during_call(self):
+    def test_sets_store_busy_during_call(self):
         repo = _make_repo("/tmp/repo-H")
         state = _make_state(debounce_ms=20, repos=[repo])
-        saw_flag = []
+        saw_busy = []
 
         def recorder(r):
-            saw_flag.append(r.refreshing)
+            saw_busy.append(state.store.repo_busy(r))
 
         manager = WatcherManager()
         watcher = RepoWatcher(
             state, repo, manager=manager, refresh_fn=recorder)
         watcher.fire_refresh()
-        # Refresh should see refreshing=True; flag restored after.
-        self.assertEqual(saw_flag, [True])
-        self.assertFalse(repo.refreshing)
+        self.assertEqual(saw_busy, [True])
+        self.assertFalse(state.store.repo_busy(repo))
 
     def test_fire_skipped_when_lock_held_by_another_source(self):
-        # `try_acquire_refresh` is the real mutex now; just setting
-        # `refreshing=True` from the outside doesn't claim the lock.
+        # The store refresh mutex is the real mutex now; just setting
+        # store busy state from the outside doesn't claim the lock.
         # Simulate another source (Ctrl+R, action menu) holding the
         # slot by acquiring through the proper API, then assert that
         # fire_refresh bails without running git.
         repo = _make_repo("/tmp/repo-I")
-        self.assertTrue(repo.try_acquire_refresh())
-        try:
-            state = _make_state(debounce_ms=20, repos=[repo])
+        state = _make_state(debounce_ms=20, repos=[repo])
+        with held_repo_refresh(state, repo):
             fires = []
             manager = WatcherManager()
             watcher = RepoWatcher(
@@ -354,11 +684,7 @@ class FireRefreshTests(unittest.TestCase):
                 refresh_fn=lambda r: fires.append(r))
             watcher.fire_refresh()
             self.assertEqual(fires, [])
-            # The other source's claim is preserved — we did not
-            # touch its lock or the visible spinner flag.
-            self.assertTrue(repo.refreshing)
-        finally:
-            repo.release_refresh()
+            assert_repo_refresh_blocked(self, state, repo)
 
     def test_fire_refresh_bails_when_watcher_stopped(self):
         # `_stopped` is set by `detach()` (called by reconcile when a
@@ -377,14 +703,13 @@ class FireRefreshTests(unittest.TestCase):
         watcher._stopped = True  # simulate post-detach state
         watcher.fire_refresh()
         self.assertEqual(fires, [])
-        # The lock should never have been acquired — `_stopped` short-
-        # circuits before `try_acquire_refresh`.
-        self.assertFalse(repo.refreshing)
+        # The lock should never have been acquired because `_stopped`
+        # short-circuits before claiming the store mutex.
+        assert_repo_refresh_available(self, state, repo)
 
-    def test_refresh_error_restores_flag(self):
-        # If the injected refresh raises, `refreshing` must still flip
-        # back so a transient git error doesn't leave the row stuck
-        # spinning forever.
+    def test_refresh_error_restores_store_busy(self):
+        # If the injected refresh raises, store-owned busy state must still
+        # clear so a transient git error doesn't leave the row stuck busy.
         repo = _make_repo("/tmp/repo-J")
         state = _make_state(debounce_ms=20, repos=[repo])
         manager = WatcherManager()
@@ -396,7 +721,7 @@ class FireRefreshTests(unittest.TestCase):
             state, repo, manager=manager, refresh_fn=boom)
         with self.assertRaises(RuntimeError):
             watcher.fire_refresh()
-        self.assertFalse(repo.refreshing)
+        self.assertFalse(state.store.repo_busy(repo))
 
 
 class ReconcileTests(unittest.TestCase):
@@ -498,11 +823,24 @@ class ReconcileTests(unittest.TestCase):
             self.assertIsNone(manager._observer)
             self.assertEqual(manager._repos, {})
 
+    def test_disable_wakes_pending_debounce_threads(self):
+        repo = _make_repo("/tmp/repo-Q2")
+        state = _make_state(on=True, repos=[repo], debounce_ms=10_000)
+        manager = WatcherManager()
+        with self._patch_observer():
+            manager.reconcile(state)
+            watcher = manager._repos[repo.path]
+            watcher.on_event(str(repo.path / "changed.txt"))
+            thread = watcher._timer_thread
+            self.assertIsNotNone(thread)
+            state.auto_refresh_on_fs_change = False
+            manager.reconcile(state)
+            thread.join(timeout=1.0)
+            self.assertFalse(thread.is_alive())
+
 
 class ConfigRoundTripTests(unittest.TestCase):
-    """The two new conf keys (`auto_refresh_on_fs_change`,
-    `auto_refresh_debounce_ms`) round-trip cleanly through
-    `load_config()` and are clamped to safe ranges."""
+    """Auto-refresh conf keys round-trip through `load_config()`."""
 
     def setUp(self):
         # Stash + clear cached load_warnings; load_config clears them
@@ -511,8 +849,9 @@ class ConfigRoundTripTests(unittest.TestCase):
 
     def test_defaults_present_in_config(self):
         cfg = config.Config()
-        self.assertTrue(cfg.auto_refresh_on_fs_change)
+        self.assertFalse(cfg.auto_refresh_on_fs_change)
         self.assertEqual(cfg.auto_refresh_debounce_ms, 400)
+        self.assertEqual(cfg.periodic_refresh_seconds, 60)
 
     def test_load_config_picks_up_user_overrides(self):
         # Point CONFIG_FILE at a temp file with our two keys set
@@ -524,11 +863,13 @@ class ConfigRoundTripTests(unittest.TestCase):
                 "[idlegit]\n"
                 "auto_refresh_on_fs_change = false\n"
                 "auto_refresh_debounce_ms = 750\n"
+                "periodic_refresh_seconds = 30\n"
             )
             with mock.patch.object(config, "CONFIG_FILE", conf_path):
                 cfg = config.load_config()
         self.assertFalse(cfg.auto_refresh_on_fs_change)
         self.assertEqual(cfg.auto_refresh_debounce_ms, 750)
+        self.assertEqual(cfg.periodic_refresh_seconds, 30)
 
     def test_load_config_clamps_too_small_debounce(self):
         import tempfile
@@ -542,130 +883,76 @@ class ConfigRoundTripTests(unittest.TestCase):
         # editor saves (write tmp + rename pattern).
         self.assertEqual(cfg.auto_refresh_debounce_ms, 50)
 
+    def test_load_config_treats_periodic_refresh_below_one_as_off(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            conf_path = Path(td) / "idlegit.conf"
+            conf_path.write_text(
+                "[idlegit]\nperiodic_refresh_seconds = 0.5\n")
+            with mock.patch.object(config, "CONFIG_FILE", conf_path):
+                cfg = config.load_config()
+        self.assertEqual(cfg.periodic_refresh_seconds, 0)
+
 
 class RefreshMutexTests(unittest.TestCase):
-    """The `Repo.refresh_lock` mutex is the cross-source mutual-
-    exclusion primitive: fs_watcher, Ctrl+R, action menu, and the
-    commit pipeline all acquire it non-blocking and bail when another
-    source already holds it. These tests pin down the contract."""
+    """Store-owned refresh mutexes provide cross-source exclusion."""
 
-    def test_try_acquire_sets_refreshing_flag(self):
-        # The flag (used by the row spinner) and the lock (used by
-        # the mutex check) move together. Acquiring sets True;
-        # releasing sets False.
+    def test_repo_mutex_claims_until_release(self):
         repo = _make_repo("/tmp/mutex-A")
-        self.assertFalse(repo.refreshing)
-        self.assertTrue(repo.try_acquire_refresh())
-        self.assertTrue(repo.refreshing)
-        repo.release_refresh()
-        self.assertFalse(repo.refreshing)
-
-    def test_second_acquire_fails_while_held(self):
-        # Non-blocking — a second `try_acquire_refresh` while the
-        # first claim is live returns False without changing state.
-        repo = _make_repo("/tmp/mutex-B")
-        self.assertTrue(repo.try_acquire_refresh())
-        try:
-            self.assertFalse(repo.try_acquire_refresh())
-            self.assertTrue(repo.refreshing)
-        finally:
-            repo.release_refresh()
-        # After release, the slot is reclaimable.
-        self.assertTrue(repo.try_acquire_refresh())
-        repo.release_refresh()
+        state = _make_state(debounce_ms=20, repos=[repo])
+        acquired, repo_id = state.store.acquire_repo_refresh(repo)
+        self.assertTrue(acquired)
+        assert_repo_refresh_blocked(self, state, repo)
+        state.store.release_repo_refresh_by_id(repo_id)
+        assert_repo_refresh_available(self, state, repo)
 
     def test_release_is_idempotent_when_not_held(self):
-        # The `release_refresh` in a `finally` block can run on a
-        # path that bailed before acquiring. The method swallows the
-        # underlying lock's RuntimeError so over-release is safe.
         repo = _make_repo("/tmp/mutex-C")
-        repo.release_refresh()  # would raise RuntimeError without guard
-        # Flag stays whatever it was (False here) — we did NOT own
-        # the lock, so release leaves the flag alone (the actual
-        # holder, if any, would expect it to stay True).
-        self.assertFalse(repo.refreshing)
+        state = _make_state(debounce_ms=20, repos=[repo])
+        state.store.release_repo_refresh_by_id(state.store.repo_id_for(repo))
+        assert_repo_refresh_available(self, state, repo)
 
-    def test_release_does_not_clear_flag_when_lock_already_unlocked(self):
-        # The asymmetry `release_refresh` guards: if the lock is not
-        # held (caller's `finally` fired on a path that bailed before
-        # acquiring), the underlying `Lock.release()` raises
-        # RuntimeError and our guard catches it WITHOUT clearing
-        # `refreshing`. Without this, a buggy finally could silently
-        # flip the spinner off for some out-of-band flag setter (e.g.
-        # the legacy sibling-sync fan-out in commit_worker, which
-        # still uses raw `refreshing = True/False` for UI display).
+    def test_release_does_not_clear_store_busy_when_lock_already_unlocked(self):
         repo = _make_repo("/tmp/mutex-C2")
-        repo.refreshing = True  # out-of-band setter
-        repo.release_refresh()  # lock unlocked → release raises → caught
-        self.assertTrue(repo.refreshing,
-                        "release with unlocked lock must not touch flag")
-        # NOTE: cross-thread release WHEN THE LOCK IS HELD (by a
-        # different source) is NOT protected against — Python's
-        # threading.Lock doesn't track owner, so any thread can
-        # release. Every refresh-source call site in workers.py /
-        # fs_watcher.py only calls `release_refresh` after a matched
-        # `try_acquire_refresh` returned True, so the cross-thread
-        # misuse case is a hypothetical future-bug guard, not a
-        # current correctness requirement.
-        # Cleanup.
-        repo.refreshing = False
+        state = _make_state(debounce_ms=20, repos=[repo])
+        state.store.set_repo_busy(repo, True)
+        state.store.release_repo_refresh_by_id(state.store.repo_id_for(repo))
+        self.assertTrue(state.store.repo_busy(repo))
+        state.store.set_repo_busy(repo, False)
 
     def test_each_repo_has_independent_lock(self):
-        # Locks are per-Repo — holding one doesn't block another.
-        # Critical for kick_off_inline_refresh's parallel refresh pool.
         repo_a = _make_repo("/tmp/mutex-D")
         repo_b = _make_repo("/tmp/mutex-E")
-        self.assertTrue(repo_a.try_acquire_refresh())
-        try:
-            self.assertTrue(repo_b.try_acquire_refresh())
-            repo_b.release_refresh()
-        finally:
-            repo_a.release_refresh()
+        state = _make_state(debounce_ms=20, repos=[repo_a, repo_b])
+        with held_repo_refresh(state, repo_a):
+            assert_repo_refresh_available(self, state, repo_b)
 
     def test_child_ref_mutex_acquires_and_releases(self):
-        # ChildRef has its own independent lock from its parent Repo
-        # and from its `.repo` (the canonical). Acquiring on the
-        # ChildRef must not block on either of those — they're
-        # separate working-tree checkouts with separate git state.
         ref = _make_child_ref("mutex-child-A")
-        self.assertFalse(ref.refreshing)
-        self.assertTrue(ref.try_acquire_refresh())
-        self.assertTrue(ref.refreshing)
-        # Parent canonical's lock is still free — independent.
-        self.assertTrue(ref.repo.try_acquire_refresh())
-        ref.repo.release_refresh()
-        ref.release_refresh()
-        self.assertFalse(ref.refreshing)
+        parent = _make_repo("/tmp/child-parent-A")
+        parent.children = [ref]
+        state = _make_state(debounce_ms=20, repos=[parent, ref.repo])
+        acquired, child_id = state.store.acquire_child_refresh(ref)
+        self.assertTrue(acquired)
+        assert_child_refresh_blocked(self, state, ref)
+        assert_repo_refresh_available(self, state, ref.repo)
+        state.store.release_child_refresh_by_id(child_id)
+        assert_child_refresh_available(self, state, ref)
 
-    def test_child_ref_second_acquire_fails_while_held(self):
-        ref = _make_child_ref("mutex-child-B")
-        self.assertTrue(ref.try_acquire_refresh())
-        try:
-            self.assertFalse(ref.try_acquire_refresh())
-            self.assertTrue(ref.refreshing)
-        finally:
-            ref.release_refresh()
-
-    def test_child_ref_release_idempotent_when_unlocked(self):
-        # Same release-asymmetry contract as Repo: over-release on an
-        # unlocked ChildRef must not flip the flag, so a sibling-sync
-        # `finally` that bails before acquiring can't strand the
-        # in-flight lock holder's spinner.
+    def test_child_ref_release_does_not_clear_store_busy_when_unlocked(self):
         ref = _make_child_ref("mutex-child-C")
-        ref.refreshing = True  # out-of-band setter (e.g. legacy fan-out)
-        ref.release_refresh()
-        self.assertTrue(ref.refreshing,
-                        "unlocked release must not touch the flag")
-        ref.refreshing = False
+        parent = _make_repo("/tmp/child-parent-C")
+        parent.children = [ref]
+        state = _make_state(debounce_ms=20, repos=[parent, ref.repo])
+        state.store.set_child_busy(ref, True)
+        state.store.release_child_refresh_by_id(state.store.child_id_for(ref))
+        self.assertTrue(state.store.child_busy(ref))
+        state.store.set_child_busy(ref, False)
 
     def test_fs_watcher_skips_refresh_when_lock_held_elsewhere(self):
-        # Simulate Ctrl+R holding the lock; an fs event during that
-        # window should not run a second concurrent refresh on the
-        # same Repo's lists.
         repo = _make_repo("/tmp/mutex-F")
-        repo.try_acquire_refresh()  # pretend Ctrl+R is mid-refresh
-        try:
-            state = _make_state(debounce_ms=20, repos=[repo])
+        state = _make_state(debounce_ms=20, repos=[repo])
+        with held_repo_refresh(state, repo):
             fires = []
             manager = WatcherManager()
             watcher = RepoWatcher(
@@ -673,92 +960,92 @@ class RefreshMutexTests(unittest.TestCase):
                 refresh_fn=lambda r: fires.append(r.path))
             watcher.fire_refresh()
             self.assertEqual(fires, [])
-        finally:
-            repo.release_refresh()
 
 
 class BlockingAcquireTests(unittest.TestCase):
-    """`acquire_refresh(timeout=...)` is the blocking variant used by
-    commit-pipeline paths (cascade-to-parent submodule bump) that
-    MUST get the lock. The non-blocking `try_acquire_refresh` is
-    fine for opportunistic refresh sources but caused a regression
-    where a brief fs_watcher contention silently dropped the
-    propagation. These tests pin the timing-sensitive contract."""
+    """Store-owned refresh mutexes support bounded blocking acquisition."""
 
     def test_blocking_acquire_succeeds_when_free(self):
         repo = _make_repo("/tmp/blocking-A")
-        self.assertTrue(repo.acquire_refresh(timeout=0.5))
-        self.assertTrue(repo.refreshing)
-        repo.release_refresh()
+        state = _make_state(debounce_ms=20, repos=[repo])
+        acquired, repo_id = state.store.acquire_repo_refresh(
+            repo,
+            timeout=0.5,
+        )
+        self.assertTrue(acquired)
+        assert_repo_refresh_blocked(self, state, repo)
+        state.store.release_repo_refresh_by_id(repo_id)
 
     def test_blocking_acquire_waits_for_release(self):
-        # Hold the lock in a side thread for 100ms, then release.
-        # Blocking acquire should pick it up shortly after.
         repo = _make_repo("/tmp/blocking-B")
-        self.assertTrue(repo.try_acquire_refresh())
+        state = _make_state(debounce_ms=20, repos=[repo])
+        acquired, repo_id = state.store.acquire_repo_refresh(repo)
+        self.assertTrue(acquired)
 
         def release_after_delay() -> None:
             time.sleep(0.1)
-            repo.release_refresh()
+            state.store.release_repo_refresh_by_id(repo_id)
 
-        import threading
         threading.Thread(target=release_after_delay, daemon=True).start()
         before = time.monotonic()
-        self.assertTrue(repo.acquire_refresh(timeout=2.0))
+        acquired, reacquired_id = state.store.acquire_repo_refresh(
+            repo,
+            timeout=2.0,
+        )
         waited = time.monotonic() - before
-        # We should have waited ~100ms — but timing is fuzzy, so
-        # bound the assertion generously.
+        self.assertTrue(acquired)
         self.assertGreaterEqual(waited, 0.05)
         self.assertLess(waited, 1.0)
-        repo.release_refresh()
+        state.store.release_repo_refresh_by_id(reacquired_id)
 
     def test_blocking_acquire_times_out_when_held_forever(self):
-        # If the lock is genuinely stuck, blocking acquire must
-        # still give up rather than pin the pipeline forever.
         repo = _make_repo("/tmp/blocking-C")
-        self.assertTrue(repo.try_acquire_refresh())
-        try:
+        state = _make_state(debounce_ms=20, repos=[repo])
+        with held_repo_refresh(state, repo):
             before = time.monotonic()
-            self.assertFalse(repo.acquire_refresh(timeout=0.2))
+            acquired, _repo_id = state.store.acquire_repo_refresh(
+                repo,
+                timeout=0.2,
+            )
             waited = time.monotonic() - before
-            # We should have waited roughly 200ms.
+            self.assertFalse(acquired)
             self.assertGreaterEqual(waited, 0.15)
-        finally:
-            repo.release_refresh()
 
-    def test_blocking_acquire_sets_flag_on_success(self):
-        # Same flag-set behaviour as try_acquire_refresh on the
-        # success path, so the row spinner picks up the claim.
+    def test_blocking_acquire_claims_mutex_on_success(self):
         repo = _make_repo("/tmp/blocking-D")
-        self.assertFalse(repo.refreshing)
-        self.assertTrue(repo.acquire_refresh(timeout=0.1))
-        self.assertTrue(repo.refreshing)
-        repo.release_refresh()
+        state = _make_state(debounce_ms=20, repos=[repo])
+        acquired, repo_id = state.store.acquire_repo_refresh(
+            repo,
+            timeout=0.1,
+        )
+        self.assertTrue(acquired)
+        assert_repo_refresh_blocked(self, state, repo)
+        state.store.release_repo_refresh_by_id(repo_id)
 
-    def test_blocking_acquire_leaves_flag_alone_on_timeout(self):
-        # On timeout, neither the lock nor the flag move — leaving
-        # the current holder's spinner intact.
+    def test_blocking_acquire_leaves_current_lock_on_timeout(self):
         repo = _make_repo("/tmp/blocking-E")
-        self.assertTrue(repo.try_acquire_refresh())
-        # First holder has the flag True.
-        self.assertTrue(repo.refreshing)
-        try:
-            self.assertFalse(repo.acquire_refresh(timeout=0.1))
-            # First holder's claim is intact.
-            self.assertTrue(repo.refreshing)
-        finally:
-            repo.release_refresh()
+        state = _make_state(debounce_ms=20, repos=[repo])
+        with held_repo_refresh(state, repo):
+            acquired, _repo_id = state.store.acquire_repo_refresh(
+                repo,
+                timeout=0.1,
+            )
+            self.assertFalse(acquired)
+            assert_repo_refresh_blocked(self, state, repo)
 
     def test_child_ref_blocking_acquire_independent(self):
-        # ChildRef has its own blocking acquire and is independent
-        # of its parent Repo's lock.
         ref = _make_child_ref("blocking-child")
-        self.assertTrue(ref.acquire_refresh(timeout=0.5))
-        self.assertTrue(ref.refreshing)
-        # Parent Repo's lock is free.
-        self.assertTrue(ref.repo.acquire_refresh(timeout=0.1))
-        ref.repo.release_refresh()
-        ref.release_refresh()
+        parent = _make_repo("/tmp/blocking-child-parent")
+        parent.children = [ref]
+        state = _make_state(debounce_ms=20, repos=[parent, ref.repo])
+        acquired, child_id = state.store.acquire_child_refresh(
+            ref,
+            timeout=0.5,
+        )
+        self.assertTrue(acquired)
+        assert_child_refresh_blocked(self, state, ref)
+        assert_repo_refresh_available(self, state, ref.repo)
+        state.store.release_child_refresh_by_id(child_id)
 
 
 class IgnorePatternTests(unittest.TestCase):
@@ -905,14 +1192,11 @@ class KickOffActionContentionTests(unittest.TestCase):
         repo, state = self._make_repo_state()
         # Simulate fs_watcher / Ctrl+R holding the lock at action
         # dispatch time.
-        self.assertTrue(repo.try_acquire_refresh())
-        try:
+        with held_repo_refresh(state, repo):
             kick_off_action(
                 state, "fetch",
                 target_label="action-A", target_path=repo.path,
                 target_repo=repo, target_parent=None)
-        finally:
-            repo.release_refresh()
 
         # A "skipped" warn task lands; no worker thread runs git.
         snap = state.tasks.snapshot()
@@ -936,22 +1220,15 @@ class KickOffActionContentionTests(unittest.TestCase):
         state = State(repos=[parent], workspace_name="test")
 
         # Hold ONLY the child's lock — parent's is free.
-        self.assertTrue(child.try_acquire_refresh())
-        try:
+        with held_child_refresh(state, child):
             kick_off_action(
                 state, "fetch",
                 target_label="child",
                 target_path=child.nested_path,
                 target_repo=parent, target_parent=parent)
-        finally:
-            child.release_refresh()
 
-        # Parent's lock must be free again (kick_off_action acquired
-        # it, then released on the child-contention bail). If the
-        # release wasn't paired, `try_acquire_refresh` here would
-        # return False and the parent's row would stay stuck.
-        self.assertTrue(parent.try_acquire_refresh())
-        parent.release_refresh()
+        # Parent's store lock must be free again after child-contention bail.
+        assert_repo_refresh_available(self, state, parent)
 
 
 class FetchOnManualRefreshFlagTests(unittest.TestCase):
@@ -976,7 +1253,7 @@ class FetchOnManualRefreshFlagTests(unittest.TestCase):
         self.assertTrue(cfg.fetch_on_manual_refresh)
 
     def test_apply_workspace_overrides_propagates_to_state(self):
-        from core.models import Workspace
+        from core.state.workspaces import Workspace
         cfg = config.Config()
         ws = Workspace(
             name="W", folders=[Path("/tmp")],

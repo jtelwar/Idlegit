@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import curses
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 
 class TestNormalizeMouse(unittest.TestCase):
@@ -43,6 +43,7 @@ class TestReadKey(unittest.TestCase):
         """Mock stdscr whose getch() yields ``keys`` in order."""
         stdscr = MagicMock()
         stdscr.getch.side_effect = list(keys)
+        stdscr.getdelay.return_value = 100
         return stdscr
 
     def test_plain_key_passes_through(self) -> None:
@@ -55,11 +56,40 @@ class TestReadKey(unittest.TestCase):
         # ESC followed by -1 (no follower within the nonblocking peek)
         stdscr = self._stdscr(27, -1)
         self.assertEqual(read_key(stdscr), 27)
+        self.assertEqual(stdscr.timeout.call_args_list[-2:], [
+            call(0),
+            call(100),
+        ])
+        stdscr.nodelay.assert_not_called()
 
     def test_alt_s_detected(self) -> None:
         from ui.mouse import read_key, ALT_S
         stdscr = self._stdscr(27, ord('s'))
         self.assertEqual(read_key(stdscr), ALT_S)
+        self.assertEqual(stdscr.timeout.call_args_list[-2:], [
+            call(0),
+            call(100),
+        ])
+
+    def test_escape_does_not_restore_blocking_delay(self) -> None:
+        from ui.mouse import read_key
+        stdscr = self._stdscr(27, -1)
+        stdscr.getdelay.return_value = -1
+        self.assertEqual(read_key(stdscr), 27)
+        self.assertEqual(stdscr.timeout.call_args_list[-2:], [
+            call(0),
+            call(100),
+        ])
+
+    def test_escape_without_getdelay_restores_nonblocking_default(self) -> None:
+        from ui.mouse import read_key
+        stdscr = self._stdscr(27, -1)
+        del stdscr.getdelay
+        self.assertEqual(read_key(stdscr), 27)
+        self.assertEqual(stdscr.timeout.call_args_list[-2:], [
+            call(0),
+            call(100),
+        ])
 
     def test_alt_m_detected(self) -> None:
         from ui.mouse import read_key, ALT_M

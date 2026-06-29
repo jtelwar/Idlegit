@@ -16,7 +16,8 @@ import curses
 from typing import List, Tuple
 
 from core.config import APP_DISPLAY_NAME
-from core.models import ConflictFile, MergeSide, SafeMergeScreen, State
+from core.state.app import State
+from core.state.safe_merge import ConflictFile, MergeSide, SafeMergeScreen
 
 from .colors import (
     PAIR_BRANCH, PAIR_ERR, PAIR_HEADER, PAIR_OK,

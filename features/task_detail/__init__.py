@@ -1,0 +1,2 @@
+"""Task detail feature boundary."""
+

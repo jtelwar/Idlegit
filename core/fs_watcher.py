@@ -14,10 +14,10 @@ is intentionally narrow:
 
   - Only `refresh_repo` (the local, no-network refresh — no `gh workflow
     list`, no re-discovery). Full re-discovery still belongs to Ctrl+R.
-  - Suppressed while `repo.refreshing=True` (an action is already in
-    flight on that row) or `state.in_review=True` (the confirm sub-loop
-    owns input). In-review events are queued per repo and drained on
-    review exit so the review pane never shifts under the user.
+  - Suppressed while store-owned row busy state says a read-only refresh is
+    already in flight, or while `state.in_review=True` (the confirm sub-loop
+    owns input). In-review events are queued per repo and drained on review
+    exit so the review pane never shifts under the user.
   - `.git/objects/` and `.git/index.lock` churn is filtered out before
     the debounce timer resets, so normal git internals don't trigger a
     refresh.
@@ -33,21 +33,157 @@ from __future__ import annotations
 
 import threading
 import time
+from enum import Enum
+from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
-import pathspec
-from watchdog.events import FileSystemEvent, FileSystemEventHandler
-from watchdog.observers import Observer
+try:
+    import pathspec
+except ModuleNotFoundError:  # pragma: no cover - depends on optional install
+    pathspec = None
 
-from .git_ops import refresh_repo
-from .models import Repo, State
+from .runtime.jobs import Job, JobSpec, JobStatus, submit_job
+from .runtime.threads import create_daemon_thread, create_job_thread
+from .git_ops import (
+    MAX_PARALLEL_GIT_JOBS,
+    apply_link_siblings_snapshot,
+    apply_repo_refresh_snapshot,
+    read_link_siblings_snapshot,
+    read_repo_refresh_snapshot,
+    refresh_repo,
+)
+from .runtime.claims import RefreshClaim
+from core.state.app import State
+from core.state.store import ChildStatusSnapshot, ChildTopologySnapshot
+from .state.repos import ChildRef, Repo
+from .state.workspaces import SubtreeSpec
+from .reconcile import reconcile_repos_bounded
+from .refresh_scope import WorkspaceRefreshScope
+from .state.selectors import (
+    local_mutation_active_for,
+    read_only_child_busy_predicate,
+    read_only_row_busy_active,
+)
+
+Observer = None
+
+
+def _refresh_repo_snapshot_into_state(state: State, repo: Repo) -> None:
+    """Refresh one watched repo through a typed store snapshot."""
+    snapshot = read_repo_refresh_snapshot(
+        repo,
+        message=state.store.row_message(repo),
+    )
+    state.store.publish_repo_status_snapshot(repo, snapshot.status_snapshot())
+    apply_repo_refresh_snapshot(repo, snapshot)
+
+
+def _publish_link_snapshot(
+        state: State,
+        repos: List[Repo],
+        subtrees: Optional[List[SubtreeSpec]],
+) -> None:
+    """Publish watcher relink topology through the StateStore first."""
+    snapshot = read_link_siblings_snapshot(
+        repos,
+        subtrees,
+        busy_child_predicate=read_only_child_busy_predicate(state),
+        child_message_lookup=state.store.row_message,
+    )
+    workspace = state.active_workspace
+    name = workspace.name if workspace is not None else state.workspace_name
+    folders = workspace.folders if workspace is not None else state.active_folders
+    state.store.replace_workspace_topology(
+        name=name,
+        folders=folders,
+        repos=repos,
+        children=[
+            _child_topology_snapshot(parent, child)
+            for parent, child in snapshot.parent_child_pairs()
+        ],
+        activate=True,
+    )
+    apply_link_siblings_snapshot(snapshot)
+
+
+def _child_topology_snapshot(
+        parent: Repo,
+        child: ChildRef,
+) -> ChildTopologySnapshot:
+    return ChildTopologySnapshot(
+        parent_repo=parent,
+        child=child,
+        status=ChildStatusSnapshot(
+            kind=child.kind,
+            branch=child.branch,
+            head=child.head,
+            upstream=child.upstream,
+            ahead=child.ahead,
+            behind=child.behind,
+            dirty=child.dirty,
+            message=child.message,
+            error=child.error,
+            merging=child.merging,
+            in_sync=child.in_sync,
+        ),
+    )
 
 
 # Minimum debounce — anything shorter risks `git status` racing the
 # editor's atomic-replace write pattern (write tmp + rename) so we'd see
 # the file vanish, refresh, see it reappear, refresh again.
 MIN_DEBOUNCE_SECONDS = 0.05
+
+
+class _FallbackIgnoreSpec:
+    """Small gitignore matcher used when optional pathspec is unavailable."""
+
+    def __init__(self, patterns: List[str]) -> None:
+        self._patterns = [
+            pattern.strip()
+            for pattern in patterns
+            if isinstance(pattern, str) and pattern.strip()
+        ]
+
+    def match_file(self, rel_path: str) -> bool:
+        rel = rel_path.replace("\\", "/").strip("/")
+        ignored = False
+        for raw in self._patterns:
+            negated = raw.startswith("!")
+            pattern = raw[1:] if negated else raw
+            if not pattern:
+                continue
+            if _fallback_pattern_matches(pattern, rel):
+                ignored = not negated
+        return ignored
+
+
+def _fallback_pattern_matches(pattern: str, rel_path: str) -> bool:
+    anchored = pattern.startswith("/")
+    pat = pattern.lstrip("/")
+    if not pat:
+        return False
+    if pat.endswith("/"):
+        pat = pat.rstrip("/")
+        return rel_path == pat or rel_path.startswith(pat + "/")
+    if pat.endswith("/**"):
+        prefix = pat[:-3].rstrip("/")
+        return rel_path == prefix or rel_path.startswith(prefix + "/")
+    if anchored:
+        return rel_path == pat or rel_path.startswith(pat + "/")
+    if "/" in pat:
+        return fnmatchcase(rel_path, pat)
+    parts = rel_path.split("/")
+    return any(fnmatchcase(part, pat) for part in parts)
+
+
+class FireRefreshResult(str, Enum):
+    """Outcome of one watcher-triggered repo refresh attempt."""
+
+    REFRESHED = "refreshed"
+    BUSY = "busy"
+    STOPPED = "stopped"
 
 
 def _is_internal_git_path(path: str) -> bool:
@@ -73,7 +209,7 @@ def _is_internal_git_path(path: str) -> bool:
 
 
 def _compile_ignore_spec(
-        patterns: List[str]) -> Optional[pathspec.PathSpec]:
+        patterns: List[str]) -> Optional[object]:
     """Compile gitignore patterns into a `PathSpec` for matching, or
     return None for an empty pattern list so callers can short-circuit
     the relative-path computation in the hot path. `GitWildMatch` is
@@ -81,6 +217,8 @@ def _compile_ignore_spec(
     leading `/` anchors, trailing `/` directory-only, `!` negation)."""
     if not patterns:
         return None
+    if pathspec is None:
+        return _FallbackIgnoreSpec(patterns)
     try:
         # `gitignore` is the modern parser name in pathspec 0.12+;
         # `gitwildmatch` was the original alias and is deprecated.
@@ -95,7 +233,7 @@ def _compile_ignore_spec(
         return None
 
 
-def _matches_ignore_spec(spec: Optional[pathspec.PathSpec],
+def _matches_ignore_spec(spec: Optional[object],
                         repo_path: Path, event_path: str) -> bool:
     """True when `event_path` matches `spec`, with the path normalised
     relative to `repo_path` and using forward-slash separators (the
@@ -111,16 +249,18 @@ def _matches_ignore_spec(spec: Optional[pathspec.PathSpec],
     return spec.match_file(rel.as_posix())
 
 
-class _RepoEventHandler(FileSystemEventHandler):
+class _RepoEventHandler:
     """Watchdog handler that forwards every non-internal event to its
     parent `RepoWatcher`. One handler per watch — the parent owns the
     debounce timer and the suppression checks."""
 
     def __init__(self, watcher: "RepoWatcher"):
-        super().__init__()
         self._watcher = watcher
 
-    def on_any_event(self, event: FileSystemEvent) -> None:
+    def dispatch(self, event) -> None:
+        self.on_any_event(event)
+
+    def on_any_event(self, event) -> None:
         # `event.src_path` is set on every event type we care about;
         # moves also have `dest_path` which we don't need to inspect
         # separately — the rename within the watched tree fires both
@@ -153,9 +293,10 @@ class RepoWatcher:
         # the debounce window expires, manifesting as kernel-level
         # memory pressure (kernel_task throttling). With the single-
         # thread approach below, `on_event` just bumps `_fire_at`; the
-        # already-running thread loops on `time.sleep(remaining)` and
-        # only fires when the window truly settles.
+        # already-running thread waits on a condition until the
+        # deadline changes, the watcher stops, or the window settles.
         self._lock = threading.Lock()
+        self._changed = threading.Condition(self._lock)
         self._fire_at: float = 0.0  # monotonic deadline; 0 = no pending
         self._timer_thread: Optional[threading.Thread] = None
         self._stopped = False
@@ -166,12 +307,12 @@ class RepoWatcher:
         # changes (workspace switch, modal edit) the next event
         # recompiles. Tuple rather than list so the equality check is
         # cheap and we don't rely on identity.
-        self._ignore_spec: Optional[pathspec.PathSpec] = None
+        self._ignore_spec: Optional[object] = None
         self._ignore_patterns: Tuple[str, ...] = ()
 
     # ---------- watchdog wiring ----------
 
-    def attach(self, observer: Observer) -> None:
+    def attach(self, observer) -> None:
         """Register a recursive schedule for this repo's working tree.
         Watching the whole tree is the cheap path — the alternative
         (separate schedules for working tree + `.git/HEAD` + `.git/refs/`
@@ -183,7 +324,7 @@ class RepoWatcher:
         self._watch = observer.schedule(
             handler, str(self.repo.path), recursive=True)
 
-    def detach(self, observer: Observer) -> None:
+    def detach(self, observer) -> None:
         """Unschedule from `observer` and signal the debounce thread
         to exit on its next iteration. Safe to call when nothing is
         registered (e.g. failed-attach paths) — the unschedule + stop
@@ -196,11 +337,8 @@ class RepoWatcher:
             self._watch = None
         with self._lock:
             self._stopped = True
-            # Wake the sleeping thread (if any) by zeroing fire_at —
-            # next loop iteration sees `_stopped` and returns. We
-            # don't join() the thread; it's a daemon, exits promptly,
-            # and the caller (reconcile/stop_all) shouldn't block.
             self._fire_at = 0.0
+            self._changed.notify_all()
 
     # ---------- debounce + fire ----------
 
@@ -209,32 +347,35 @@ class RepoWatcher:
         thread (one thread per Observer); a single per-watcher debounce
         thread (lazily created here) handles the actual sleep + fire.
 
-        Skipped while `repo.refreshing` is True so events the refresh
-        itself triggers (e.g. atomic writes to working-tree files that
-        a hook touches) don't keep retriggering us. The `.git/` filter
-        in the handler already absorbs the common case (git's own
-        index/stat-cache write); this is defence-in-depth.
+        Skipped while store-owned row busy state says a read-only refresh is
+        already active, so events the refresh itself triggers (e.g. atomic
+        writes to working-tree files that a hook touches) don't keep
+        retriggering us. The `.git/` filter in the handler already absorbs the
+        common case (git's own index/stat-cache write); this is
+        defence-in-depth.
 
         Also skipped when `event_path` matches the workspace's
         gitignore-style ignore list — `self._ignore_spec` compiled
         from `state.fs_watch_ignore`, recompiled on demand when the
         patterns tuple changes.
 
-        Queued (not fired) while any action task is running. Multi-
-        repo actions like smart-sync mutate the working tree across
-        every sibling — firing per-event refreshes during that would
-        race the action and thrash the spinner. Instead the main loop
-        calls `drain_pending_refreshes()` on the transition where
-        `has_running` flips from True to False, so each affected repo
+        Queued (not fired) while a local mutation job is running. Multi-repo
+        actions like smart-sync mutate the working tree across every sibling;
+        firing per-event refreshes during that would race the action and thrash
+        the spinner. Instead the main loop calls `drain_pending_refreshes()` on
+        the transition where local mutation jobs drain, so each affected repo
         gets exactly one refresh after the action settles.
 
-        Gate order matters: `tasks.has_running()` is checked BEFORE
-        `repo.refreshing` so that a commit pipeline (which both
-        creates a task AND holds the refresh lock) routes the event
-        to the queue rather than dropping it. Reversed, a user edit
-        landing during a commit would be lost entirely — the lock
-        would short-circuit the queue path."""
-        if self.state.tasks.has_running():
+        Gate order matters: local mutation ownership is checked BEFORE
+        read-only row busy state so that a commit pipeline (which creates an
+        owned mutation claim and may also hold the primitive lock) routes the
+        event to the queue rather than dropping it. Reversed, a user edit
+        landing during a commit would be lost entirely — the read-only busy
+        path would short-circuit the queue path."""
+        if local_mutation_active_for(
+                self.state,
+                repos=[self.repo],
+                include_repo_children=True):
             # Don't even bother starting the debounce — mark this
             # repo for drain when tasks clear. Cheaper than spinning
             # up the debounce thread to discover the same gate at
@@ -242,10 +383,10 @@ class RepoWatcher:
             # on every event during a sync flood.
             self._manager.mark_pending(self.repo.path)
             return
-        if self.repo.refreshing:
-            # Another fs_watcher / Ctrl+R refresh is in flight on
-            # this repo (no task involved). It'll leave the state
-            # consistent — no need to queue or schedule a new fire.
+        if read_only_row_busy_active(self.state, [self.repo]):
+            # Another fs_watcher / Ctrl+R refresh is in flight on this repo
+            # (no local mutation involved). It'll leave the state consistent;
+            # no need to queue or schedule a new fire.
             return
         patterns = tuple(self.state.fs_watch_ignore)
         if patterns != self._ignore_patterns:
@@ -261,11 +402,18 @@ class RepoWatcher:
             if self._stopped:
                 return
             self._fire_at = now + delay
+            self._changed.notify_all()
             if (self._timer_thread is None
                     or not self._timer_thread.is_alive()):
-                self._timer_thread = threading.Thread(
-                    target=self._debounce_loop, daemon=True)
-                self._timer_thread.start()
+                self._timer_thread = create_daemon_thread(
+                    self._debounce_loop,
+                    "idlegit-fs-watch-debounce",
+                )
+                try:
+                    self._timer_thread.start()
+                except Exception:  # noqa: BLE001
+                    self._timer_thread = None
+                    self._manager.mark_pending(self.repo.path)
 
     def _debounce_loop(self) -> None:
         """Persistent debounce thread. Sleeps until `_fire_at`, then
@@ -285,10 +433,7 @@ class RepoWatcher:
                     # through to fire outside the lock.
                     self._timer_thread = None
                     break
-            # Cap each sleep at 60s so a stale `_fire_at` (e.g. the
-            # process is asleep / debugger paused) doesn't pin this
-            # thread forever — when we wake we re-check and adjust.
-            time.sleep(min(remaining, 60.0))
+                self._changed.wait(timeout=min(remaining, 60.0))
         self._on_timer()
 
     def _on_timer(self) -> None:
@@ -297,47 +442,54 @@ class RepoWatcher:
         logic synchronously without standing up a real debounce thread.
         Called once per debounce settle in production.
 
-        Two queue-not-fire gates here: in_review / in_safe_merge (each
-        drained after its sub-loop exits) and tasks.has_running (drained
-        on the has-running → idle transition in the main loop). Either one
-        latches the repo into `_pending` so a single refresh fires
-        once the blocker clears.
+        Two queue-not-fire gates here: in_review / in_safe_merge (each drained
+        after its sub-loop exits) and local mutation jobs (drained on the
+        mutation-active → idle transition in the main loop). Either one latches
+        the repo into `_pending` so a single refresh fires once the blocker
+        clears.
 
-        Both queue gates are checked BEFORE `repo.refreshing` so that
-        a commit pipeline holding the refresh lock (which also raises
-        `refreshing=True`) doesn't drop the event — its task running
-        signal routes the event to the queue and the post-task drain
-        catches it."""
+        Both queue gates are checked BEFORE read-only row busy state so that
+        a commit pipeline holding row ownership doesn't drop the event — its
+        local mutation ownership routes the event to the queue and the
+        post-task drain catches it."""
         if self.state.in_review or self.state.in_safe_merge:
             self._manager.mark_pending(self.repo.path)
             return
-        if self.state.tasks.has_running():
+        if local_mutation_active_for(
+                self.state,
+                repos=[self.repo],
+                include_repo_children=True):
             self._manager.mark_pending(self.repo.path)
             return
-        if self.repo.refreshing:
+        if read_only_row_busy_active(self.state, [self.repo]):
             return
         self.fire_refresh()
 
-    def fire_refresh(self) -> None:
-        """Run the per-repo refresh. Acquires `repo.refresh_lock`
-        non-blocking — if any other source (Ctrl+R, action menu,
-        commit pipeline) is already refreshing this repo, we bail
-        without running git calls. The lock-holder will leave the
-        Repo in a consistent state; we'd just be doing duplicate
-        work + interleaving writes on the same lists.
+    def fire_refresh(self) -> FireRefreshResult:
+        """Run the per-repo refresh through the Store-owned mutex.
+
+        If any other source (Ctrl+R, action menu, commit pipeline) is already
+        refreshing this repo, we bail without running git calls. The
+        lock-holder will leave the Repo in a consistent state; we'd just be
+        doing duplicate work + interleaving writes on the same lists.
 
         Bails when `self._stopped` is set so a `drain_pending` that
         fires after the manager tore the watcher down (workspace
         switch / stop_all race) doesn't run a refresh on a Repo the
         user no longer cares about."""
         if self._stopped:
-            return
-        if not self.repo.try_acquire_refresh():
-            return
+            return FireRefreshResult.STOPPED
+        claim = RefreshClaim(self.state, repo=self.repo)
+        if not claim.acquire():
+            return FireRefreshResult.BUSY
         try:
-            self._refresh_fn(self.repo)
+            if self._refresh_fn is refresh_repo:
+                _refresh_repo_snapshot_into_state(self.state, self.repo)
+            else:
+                self._refresh_fn(self.repo)
+            return FireRefreshResult.REFRESHED
         finally:
-            self.repo.release_refresh()
+            claim.release()
 
 
 class WatcherManager:
@@ -347,7 +499,7 @@ class WatcherManager:
     current repo set and the desired one, and observer lifecycle."""
 
     def __init__(self):
-        self._observer: Optional[Observer] = None
+        self._observer = None
         self._repos: Dict[Path, RepoWatcher] = {}
         self._lock = threading.Lock()
         self._pending: Set[Path] = set()
@@ -383,7 +535,7 @@ class WatcherManager:
             # reuse it. Observer.start() is idempotent-safe-ish only
             # before the first start(), so we gate on `_observer is None`.
             if self._observer is None:
-                self._observer = Observer()
+                self._observer = _new_observer()
                 self._observer.start()
             # Add watchers for new paths; refresh the stored Repo ref
             # for paths that already have a watcher (the Repo object
@@ -421,17 +573,108 @@ class WatcherManager:
 
     def drain_pending(self) -> None:
         """Fire any refreshes that were queued while `state.in_review`
-        was True. Call this right after the confirm sub-loop exits. Each
-        drained repo runs synchronously on the caller's thread — typical
-        is one or two repos per drain, well under a frame budget."""
+        was True. Call this right after the confirm sub-loop exits. The
+        caller only snapshots the queue; actual git refresh work runs on
+        a bounded background pool so the UI thread stays responsive."""
         with self._lock:
             paths = list(self._pending)
             self._pending.clear()
-            watchers = [self._repos[p] for p in paths if p in self._repos]
-        for w in watchers:
-            w.fire_refresh()
+        watchers = [self._repos[p] for p in paths if p in self._repos]
+        if not watchers:
+            return
+        state = watchers[0].state
+        refresh_scope = WorkspaceRefreshScope.capture(state)
+        repos_snapshot = list(state.repos)
+        subtrees_snapshot = list(state.subtrees)
+
+        def thread_factory(target, thread_name):
+            return create_job_thread(target, thread_name)
+
+        _job, thread = submit_job(
+            state.job_registry,
+            JobSpec(
+                kind="fs-watch-drain",
+                label="fs-watch drain",
+                local_mutation=False,
+                repo_keys=tuple(sorted(str(w.repo.path) for w in watchers)),
+            ),
+            lambda job: self._drain_watchers(
+                job,
+                watchers,
+                state,
+                refresh_scope,
+                repos_snapshot,
+                subtrees_snapshot,
+            ),
+            thread_factory=thread_factory,
+        )
+        if thread is None:
+            with self._lock:
+                for watcher in watchers:
+                    self._pending.add(watcher.repo.path)
+
+    def _drain_watchers(
+            self,
+            job: Job,
+            watchers: List[RepoWatcher],
+            state: State,
+            refresh_scope: WorkspaceRefreshScope,
+            repos_snapshot: List[Repo],
+            subtrees_snapshot: List[SubtreeSpec],
+    ) -> None:
+        by_path = {w.repo.path: w for w in watchers}
+        busy_paths: Set[Path] = set()
+        busy_lock = threading.Lock()
+
+        def refresh_watcher(repo: Repo) -> None:
+            result = by_path[repo.path].fire_refresh()
+            if result == FireRefreshResult.BUSY:
+                with busy_lock:
+                    busy_paths.add(repo.path)
+
+        result = reconcile_repos_bounded(
+            [w.repo for w in watchers],
+            subtrees_snapshot,
+            link_repos=repos_snapshot,
+            refresh_fn=refresh_watcher,
+            link_fn=lambda link_repos, link_subtrees: _publish_link_snapshot(
+                state, link_repos, link_subtrees),
+            max_workers=MAX_PARALLEL_GIT_JOBS,
+            should_link=lambda: self._drain_context_current(
+                watchers, state, refresh_scope),
+        )
+        if busy_paths:
+            with self._lock:
+                for path in busy_paths:
+                    if path in self._repos:
+                        self._pending.add(path)
+        if result.failed or busy_paths:
+            parts: List[str] = []
+            if busy_paths:
+                parts.append(f"{len(busy_paths)} busy")
+            if result.refresh.failed:
+                parts.append(f"{result.refresh.failed} refresh failed")
+            if result.link_error:
+                parts.append("1 link failed")
+            state.job_registry.finish(
+                job, JobStatus.WARN, ", ".join(parts))
 
     # ---------- internal ----------
+
+    def _drain_context_current(
+            self,
+            watchers: List[RepoWatcher],
+            state: State,
+            refresh_scope: WorkspaceRefreshScope,
+    ) -> bool:
+        if not refresh_scope.is_active_current(state):
+            return False
+        with self._lock:
+            return all(
+                self._repos.get(watcher.repo.path) is watcher
+                and not watcher._stopped
+                for watcher in watchers
+            )
 
     def mark_pending(self, path: Path) -> None:
         """Record that a debounce-timer fire was suppressed for `path`
@@ -460,6 +703,23 @@ class WatcherManager:
 # but don't reconcile).
 _manager: Optional[WatcherManager] = None
 _manager_lock = threading.Lock()
+
+
+def _new_observer():
+    """Construct the watchdog observer lazily.
+
+    Importing watchdog's platform observer can be surprisingly expensive on
+    some macOS/Python combinations. Keeping it lazy prevents import-time stalls
+    for callers that never enable filesystem watching.
+    """
+    if Observer is not None:
+        return Observer()
+    try:
+        from watchdog.observers import Observer as NativeObserver
+        return NativeObserver()
+    except ImportError:
+        from watchdog.observers.polling import PollingObserver
+        return PollingObserver()
 
 
 def get_manager() -> WatcherManager:

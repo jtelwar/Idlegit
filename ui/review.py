@@ -5,24 +5,28 @@ import curses
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
-from core.models import (
-    ChildRef,
-    FileEntry,
+from core.state.app import State
+from core.state.action_menu import FileEntry
+from core.state.review import (
     LFSCandidate,
-    Repo,
     ReviewBlock,
-    State,
     ThenRunSelector,
     WorkflowToggle,
 )
+from core.state.repos import ChildRef, Repo
 from core.config import APP_DISPLAY_NAME
 from core.git_ops import (
     find_lfs_warnings,
     gh_available,
+    merge_remote_workflow_states,
     parse_github_slug,
-    query_working_tree,
     would_run_on_push,
 )
+from core.state.selectors import (
+    active_workspace_child_rows,
+    active_workspace_repo_rows,
+)
+from core.state.review_drafts import ReviewDraftRecord
 from .colors import (
     PAIR_BRANCH,
     PAIR_ERR,
@@ -56,6 +60,20 @@ from .hints import (
 )
 from .sidebar import SPINNER_FRAMES
 
+
+def _hydrate_workflow_state_for_review(repo: Repo) -> None:
+    """Best-effort remote workflow-state hydration for workflow UI only."""
+    if repo.workflow_states_hydrated:
+        return
+    if not gh_available() or not repo.workflows:
+        return
+    slug = parse_github_slug(repo.remote_url_raw)
+    if not slug:
+        return
+    merge_remote_workflow_states(repo.workflows, slug)
+    repo.workflow_states_hydrated = True
+
+
 def _block_for_repo(state: State, repo: Repo) -> ReviewBlock:
     """Build the per-repo review block for a top-level commit target.
     Picks up its LFS warnings, workflow toggles, and then-run
@@ -63,22 +81,28 @@ def _block_for_repo(state: State, repo: Repo) -> ReviewBlock:
     — so the two-panel layout has all of them grouped under this
     repo's header instead of mixed with other repos'."""
     threshold_mb = state.lfs_warn_bytes // (1024 * 1024)
+    status = state.store.repo_status(repo)
+    if status is None:
+        raise RuntimeError("repo row is not registered in state store")
     block = ReviewBlock(
         label=repo.display_name,
-        branch=repo.branch,
+        branch=status.branch,
         target_path=repo.path,
+        draft_id=f"repo:{repo.path}",
         target_repo=repo,
-        message=repo.message.strip(),
-        merging=repo.merging,
+        merging=status.merging,
         conflict_paths=list(repo.conflict_paths),
         has_origin=bool(repo.remote_url),
-        upstream=repo.upstream,
+        upstream=status.upstream,
         siblings_summary=", ".join(s[0].display_name for s in repo.siblings),
         auto_stage=state.auto_stage,
-        push=state.auto_push,
         threshold_mb=threshold_mb,
     )
-    if not repo.merging:
+    draft = state.review_drafts.create(
+        block.draft_id, message=status.message.strip(), push=state.auto_push)
+    draft.workflow_toggles.clear()
+    draft.then_run_items.clear()
+    if not status.merging:
         warnings = find_lfs_warnings(
             repo, state.auto_stage, state.lfs_warn_bytes)
         for path, size in warnings:
@@ -93,6 +117,7 @@ def _block_for_repo(state: State, repo: Repo) -> ReviewBlock:
         # even when auto-push defaults off.
         if (gh_available() and repo.workflows
                 and parse_github_slug(repo.remote_url_raw)):
+            _hydrate_workflow_state_for_review(repo)
             dispatchable_options = [
                 w.name for w in repo.workflows
                 if w.dispatchable and not w.state.startswith("disabled")
@@ -102,16 +127,18 @@ def _block_for_repo(state: State, repo: Repo) -> ReviewBlock:
                     continue
                 if wf.state.startswith("disabled"):
                     continue
-                if wf.name not in repo.track_workflow:
-                    repo.track_workflow[wf.name] = state.track_actions_default
-                block.workflow_toggles.append(WorkflowToggle(
-                    repo=repo, workflow_name=wf.name))
+                if wf.name not in draft.track_workflow:
+                    draft.track_workflow[wf.name] = state.track_actions_default
+                draft.workflow_toggles.append(WorkflowToggle(
+                    repo=repo, workflow_name=wf.name,
+                    draft_id=block.draft_id))
                 if dispatchable_options:
-                    block.then_run_items.append(ThenRunSelector(
-                        repo=repo, after_workflow=wf.name))
+                    draft.then_run_items.append(ThenRunSelector(
+                        repo=repo, after_workflow=wf.name,
+                        draft_id=block.draft_id))
             if dispatchable_options:
-                block.then_run_items.append(ThenRunSelector(
-                    repo=repo, after_workflow=""))
+                draft.then_run_items.append(ThenRunSelector(
+                    repo=repo, after_workflow="", draft_id=block.draft_id))
     return block
 
 
@@ -121,19 +148,23 @@ def _block_for_child(state: State,
     commit target. Children don't carry their own workflow toggles —
     those live on the canonical's top-level row — so this block is a
     simpler header + message + push-summary shape."""
+    status = state.store.child_status(ref)
+    if status is None:
+        raise RuntimeError("child row is not registered in state store")
     label = f"↳ {ref.repo.display_name} in {parent.display_name}"
     block = ReviewBlock(
         label=label,
-        branch=ref.branch,
+        branch=status.branch,
         target_path=ref.nested_path,
+        draft_id=f"child:{ref.nested_path}",
         target_parent=parent,
         target_child=ref,
-        message=ref.message.strip(),
         is_child=True,
         auto_stage=state.auto_stage,
-        push=state.auto_push,
         threshold_mb=state.lfs_warn_bytes // (1024 * 1024),
     )
+    state.review_drafts.create(
+        block.draft_id, message=status.message.strip(), push=state.auto_push)
     # Sibling-sync targets are computed unconditionally; the left pane
     # only renders the "sync:" line when this block's push toggle is on
     # (a nested commit fans out to its siblings only when it's pushed).
@@ -149,53 +180,27 @@ def _block_for_child(state: State,
 def build_review_blocks(state: State) -> List[ReviewBlock]:
     """Per-repo / per-child review blocks for the two-panel review
     screen. Top-level repos with a queued message come first (in
-    state.repos order), then submodule children (parent-by-parent).
+    active workspace order), then submodule children (parent-by-parent).
     Empty when nothing has a message — the caller treats that as
     "nothing to review, just bail"."""
     blocks: List[ReviewBlock] = []
-    for repo in state.repos:
-        if repo.message.strip():
+    for repo in active_workspace_repo_rows(state):
+        status = state.store.repo_status(repo)
+        if status is not None and status.message.strip():
             blocks.append(_block_for_repo(state, repo))
-    for parent in state.repos:
-        for ref in parent.children:
-            if ref.kind == "submodule" and ref.message.strip():
-                blocks.append(_block_for_child(state, parent, ref))
+    for parent, ref in active_workspace_child_rows(state):
+        status = state.store.child_status(ref)
+        if (
+            status is not None
+            and status.kind == "submodule"
+            and status.message.strip()
+        ):
+            blocks.append(_block_for_child(state, parent, ref))
     return blocks
 
 
-def kick_off_review_files_load(blocks: List[ReviewBlock]) -> None:
-    """Spawn one daemon thread per block to populate `block.files`
-    via `query_working_tree`. Non-blocking — the review screen draws
-    immediately with `files_loading=True` placeholders, and each pane
-    fills in as its worker completes. Each worker checks
-    `block.cancel_event` before mutating so closing the review
-    mid-load drops the result on the floor."""
-    import threading
-
-    def loader(block: ReviewBlock) -> None:
-        try:
-            if block.cancel_event.is_set():
-                return
-            files: List[FileEntry] = query_working_tree(block.target_path)
-            if block.cancel_event.is_set():
-                return
-            block.files = files
-            # Seed per-file checkbox state. auto_stage on the block was
-            # captured from state at build time; True checks every
-            # change, False only checks files already staged at the
-            # index (x != " "). User can override with Space afterward.
-            if block.auto_stage:
-                block.staged_paths = {fe.path: True for fe in files}
-            else:
-                block.staged_paths = {
-                    fe.path: (fe.x != " " and not fe.untracked)
-                    for fe in files
-                }
-        finally:
-            block.files_loading = False
-
-    for block in blocks:
-        threading.Thread(target=loader, args=(block,), daemon=True).start()
+def _draft_for_block(state: State, block: ReviewBlock) -> ReviewDraftRecord:
+    return state.review_drafts.get_or_create(block.draft_id)
 
 
 # Sentinel for the "add tag" then-run option. Stored in the same
@@ -244,25 +249,18 @@ def _then_run_label(value: str) -> str:
     return value or "(none)"
 
 
-def _then_run_current(selector: ThenRunSelector) -> str:
-    """Read the current then-run selection from the repo's memory dict."""
+def _then_run_current(state: State, selector: ThenRunSelector) -> str:
+    """Read the current then-run selection from the review draft."""
+    draft = state.review_drafts.get_or_create(selector.draft_id)
     if selector.after_workflow:
-        return selector.repo.then_run_after_workflow.get(
-            selector.after_workflow, "")
-    return selector.repo.then_run_after_push
+        return draft.then_run_after_workflow.get(selector.after_workflow, "")
+    return draft.then_run_after_push
 
 
-def _then_run_set(selector: ThenRunSelector, value: str) -> None:
+def _then_run_set(state: State, selector: ThenRunSelector, value: str) -> None:
     """Persist a then-run selection. Empty string means '(none)'."""
-    if selector.after_workflow:
-        if value:
-            selector.repo.then_run_after_workflow[
-                selector.after_workflow] = value
-        else:
-            selector.repo.then_run_after_workflow.pop(
-                selector.after_workflow, None)
-    else:
-        selector.repo.then_run_after_push = value
+    state.review_drafts.set_then_run(
+        selector.draft_id, selector.after_workflow, value)
 
 
 # ---------- Then-run parameter pattern -----------------------------------
@@ -274,7 +272,7 @@ def _then_run_set(selector: ThenRunSelector, value: str) -> None:
 # back workflow_dispatch inputs (each input becomes a ParamSpec the
 # review pane can render and the dispatch site can read).
 #
-# Storage is a generic two-level dict on Repo:
+# Storage is a generic two-level dict on ReviewDraftRecord:
 #   * after-push:   then_run_params_after_push[<param>] = value
 #   * after-<wf>:   then_run_params_after_workflow[<wf>][<param>] = value
 
@@ -331,40 +329,31 @@ def _then_run_param_specs(value: str,
     return []
 
 
-def _then_run_param_value(selector: ThenRunSelector,
+def _then_run_param_value(state: State,
+                          selector: ThenRunSelector,
                           param_name: str) -> str:
     """Read one parameter's buffered value for the selector's slot.
     Empty string when never set."""
+    draft = state.review_drafts.get_or_create(selector.draft_id)
     if selector.after_workflow:
-        return (selector.repo.then_run_params_after_workflow
+        return (draft.then_run_params_after_workflow
                 .get(selector.after_workflow, {})
                 .get(param_name, ""))
-    return selector.repo.then_run_params_after_push.get(param_name, "")
+    return draft.then_run_params_after_push.get(param_name, "")
 
 
-def _set_then_run_param_value(selector: ThenRunSelector,
+def _set_then_run_param_value(state: State,
+                              selector: ThenRunSelector,
                               param_name: str, value: str) -> None:
     """Persist one parameter's buffered value. Empty value clears
     the entry (and prunes the per-workflow inner dict so empty
     chains don't leave dead keys around)."""
-    if selector.after_workflow:
-        wf = selector.after_workflow
-        repo = selector.repo
-        bucket = repo.then_run_params_after_workflow.setdefault(wf, {})
-        if value:
-            bucket[param_name] = value
-        else:
-            bucket.pop(param_name, None)
-            if not bucket:
-                repo.then_run_params_after_workflow.pop(wf, None)
-        return
-    if value:
-        selector.repo.then_run_params_after_push[param_name] = value
-    else:
-        selector.repo.then_run_params_after_push.pop(param_name, None)
+    state.review_drafts.set_then_run_param(
+        selector.draft_id, selector.after_workflow, param_name, value)
 
 
-def _find_param_spec(selector: ThenRunSelector,
+def _find_param_spec(state: State,
+                     selector: ThenRunSelector,
                      param_name: str) -> "ThenRunParamSpec | None":
     """Lookup helper used by the inline-edit handler to grab the
     spec (and its `valid_chars` / leading-dash rule) for the
@@ -372,29 +361,32 @@ def _find_param_spec(selector: ThenRunSelector,
     cycled away from its parameterised value before the edit
     landed."""
     for spec in _then_run_param_specs(
-            _then_run_current(selector), selector.repo):
+            _then_run_current(state, selector), selector.repo):
         if spec.name == param_name:
             return spec
     return None
 
 
-def _then_run_selector_for(block: ReviewBlock,
+def _then_run_selector_for(state: State,
+                           block: ReviewBlock,
                            after_workflow: str) -> ThenRunSelector:
     """Return the selector pinned to `after_workflow` on this block,
-    creating it (and caching it on `block.then_run_items`) when none
+    creating it (and caching it on the review draft) when none
     exists. Stable identity matters — focus comparisons rely on
     object identity, so the same key always returns the same
     selector instance even after a chain extends."""
-    for sel in block.then_run_items:
+    draft = _draft_for_block(state, block)
+    for sel in draft.then_run_items:
         if sel.after_workflow == after_workflow:
             return sel
     sel = ThenRunSelector(repo=block.target_repo,
-                          after_workflow=after_workflow)
-    block.then_run_items.append(sel)
+                          after_workflow=after_workflow,
+                          draft_id=block.draft_id)
+    draft.then_run_items.append(sel)
     return sel
 
 
-def _walk_then_run_chain(block: ReviewBlock, start_workflow: str):
+def _walk_then_run_chain(state: State, block: ReviewBlock, start_workflow: str):
     """Yield `(selector, depth)` along the chain rooted at
     `start_workflow` (`""` for after-push). `depth` starts at 0 for
     the root selector and increments by 1 per chained step. The
@@ -406,16 +398,17 @@ def _walk_then_run_chain(block: ReviewBlock, start_workflow: str):
     depth = 0
     while cur is not None and cur not in seen:
         seen.add(cur)
-        sel = _then_run_selector_for(block, cur)
+        sel = _then_run_selector_for(state, block, cur)
         yield sel, depth
-        value = _then_run_current(sel)
+        value = _then_run_current(state, sel)
         if value == "" or value == ADD_TAG_VALUE:
             break
         cur = value
         depth += 1
 
 
-def cycle_then_run(selector: ThenRunSelector, direction: int) -> None:
+def cycle_then_run(state: State, selector: ThenRunSelector,
+                   direction: int) -> None:
     """Cycle the selector's choice through the repo's dispatchable
     workflows + a '(none)' slot + the "add tag" sentinel. The same
     wheel is offered for after-push and per-workflow chains —
@@ -423,16 +416,16 @@ def cycle_then_run(selector: ThenRunSelector, direction: int) -> None:
     pushed; mark the commit a CI build covered)."""
     options = _then_run_options(selector.repo)
     if not options:
-        _then_run_set(selector, "")
+        _then_run_set(state, selector, "")
         return
     wheel = [""] + options
-    current = _then_run_current(selector)
+    current = _then_run_current(state, selector)
     try:
         i = wheel.index(current)
     except ValueError:
         i = 0
     i = (i + direction) % len(wheel)
-    _then_run_set(selector, wheel[i])
+    _then_run_set(state, selector, wheel[i])
 
 
 # ---------- Two-panel review screen --------------------------------------
@@ -463,6 +456,7 @@ def _review_spinner(state: State) -> str:
 
 
 def _collect_review_focusables(
+    state: State,
     blocks: List[ReviewBlock],
 ) -> List[Tuple[int, str, object]]:
     """Flatten every block's interactive items into one ordered list
@@ -486,9 +480,9 @@ def _collect_review_focusables(
     out: List[Tuple[int, str, object]] = []
 
     def emit_chain(block, start_workflow):
-        for sel, _depth in _walk_then_run_chain(block, start_workflow):
+        for sel, _depth in _walk_then_run_chain(state, block, start_workflow):
             out.append((block_index, "then_run", sel))
-            current = _then_run_current(sel)
+            current = _then_run_current(state, sel)
             for spec in _then_run_param_specs(current, sel.repo):
                 out.append((block_index, "param_input",
                             (sel, spec.name)))
@@ -508,14 +502,15 @@ def _collect_review_focusables(
         # Workflow tracking + then-run chains only ever run on push, so
         # they are focusable only while this block's push toggle is on —
         # rendered indented beneath the toggle.
-        if block.push:
-            for tog in block.workflow_toggles:
+        draft = _draft_for_block(state, block)
+        if draft.push:
+            for tog in draft.workflow_toggles:
                 out.append((block_index, "toggle", tog))
                 # The "then run after <workflow>" chain only makes sense
                 # while that action is tracked — there's nothing to run
                 # "after" an untracked workflow — so it's focusable only
                 # when the toggle is on.
-                if tog.repo.track_workflow.get(tog.workflow_name, False):
+                if draft.track_workflow.get(tog.workflow_name, False):
                     emit_chain(block, tog.workflow_name)
             # Child (nested-submodule) blocks have no target_repo and no
             # workflow toggles, so they get no after-push then-run chain
@@ -634,13 +629,16 @@ def _block_left_rows(
     suggest_focused = (panel_focus == "left" and focus >= 0
                        and focusables[focus] == (block_idx, "suggest", block))
     suggest_attr = (curses.A_REVERSE if suggest_focused else 0)
-    if block.suggesting and not block.message:
+    draft = _draft_for_block(state, block) if state is not None else None
+    draft_message = draft.message if draft is not None else ""
+    suggesting = bool(draft is not None and draft.suggesting)
+    if suggesting and not draft_message:
         spinner = (_review_spinner(state) if state is not None
                    else SPINNER_FRAMES[0])
         rows.append((f"  message: {spinner} generating…",
                      suggest_attr | curses.A_DIM, suggest_focused))
-    elif block.message:
-        wrapped = _wrap_message_lines(block.message, message_cap, inner_w)
+    elif draft_message:
+        wrapped = _wrap_message_lines(draft_message, message_cap, inner_w)
         for i, line in enumerate(wrapped):
             rows.append((line, suggest_attr,
                          suggest_focused and i == 0))
@@ -677,7 +675,7 @@ def _block_left_rows(
         indent = " " * indent_cols
         label = ("then run after push:" if sel.after_workflow == ""
                  else "then run:")
-        current = _then_run_current(sel)
+        current = _then_run_current(state, sel)
         text = f"{indent}{label} ‹ {_then_run_label(current)} ›"
         if is_focused:
             attr = curses.color_pair(PAIR_BRANCH) | curses.A_BOLD
@@ -686,7 +684,7 @@ def _block_left_rows(
         rows.append((text, attr, is_focused))
         # When the action `current` resolves to declares parameters,
         # drop one indented editable row per parameter beneath. The
-        # buffer lives on the repo's `then_run_params_*` dicts
+        # buffer lives on the draft's `then_run_params_*` dicts
         # (keyed by selector slot then by param name); typing while
         # the param_input focusable is selected modifies it, the
         # dispatch site reads the slot's params on completion of
@@ -697,7 +695,7 @@ def _block_left_rows(
                              and focusables[focus]
                              == (block_idx, "param_input",
                                  (sel, spec.name)))
-            value = _then_run_param_value(sel, spec.name)
+            value = _then_run_param_value(state, sel, spec.name)
             cursor = "_" if param_focused else ""
             param_text = (f"{param_indent}{spec.label} "
                           f"{value}{cursor}")
@@ -716,8 +714,10 @@ def _block_left_rows(
     # will set on first push; child blocks fan out to their siblings.
     push_focused = (panel_focus == "left" and focus >= 0
                     and focusables[focus] == (block_idx, "push", block))
-    check = "[x]" if block.push else "[ ]"
-    if not block.push:
+    push_enabled = (
+        _draft_for_block(state, block).push if state is not None else True)
+    check = "[x]" if push_enabled else "[ ]"
+    if not push_enabled:
         push_label = "push"
     elif block.is_child:
         push_label = "push (from nested checkout)"
@@ -725,7 +725,7 @@ def _block_left_rows(
         push_label = f"push → {block.upstream}"
     else:
         push_label = f"push (sets upstream → origin/{block.branch})"
-    push_attr = (curses.color_pair(PAIR_OK) if block.push
+    push_attr = (curses.color_pair(PAIR_OK) if push_enabled
                  else curses.color_pair(PAIR_HEADER) | curses.A_DIM)
     if push_focused:
         push_attr |= curses.A_REVERSE
@@ -734,7 +734,7 @@ def _block_left_rows(
     # Everything below is an on-push action, indented beneath the toggle
     # and rendered only while push is on — matching the focusables gate
     # in `_collect_review_focusables`.
-    if block.push:
+    if push_enabled:
         # Sibling-sync line — informational; describes the push's fan-out.
         if block.siblings_summary:
             val_attr = curses.color_pair(PAIR_BRANCH) | curses.A_DIM
@@ -742,10 +742,11 @@ def _block_left_rows(
                 ("    sync: ", curses.A_DIM),
                 (block.siblings_summary, val_attr),
             ], curses.A_DIM, False))
-        for tog in block.workflow_toggles:
+        draft = _draft_for_block(state, block)
+        for tog in draft.workflow_toggles:
             is_focused = (panel_focus == "left" and focus >= 0
                           and focusables[focus] == (block_idx, "toggle", tog))
-            on = tog.repo.track_workflow.get(tog.workflow_name, False)
+            on = draft.track_workflow.get(tog.workflow_name, False)
             check = "[x]" if on else "[ ]"
             text = f"    {check}  track action: {tog.workflow_name}"
             if on:
@@ -760,7 +761,7 @@ def _block_left_rows(
             # indent of 6 cols nests its then-runs two columns under the
             # toggle (at column 4); each chained step adds 2 cols.
             if on:
-                for sel, depth in _walk_then_run_chain(block,
+                for sel, depth in _walk_then_run_chain(state, block,
                                                        tog.workflow_name):
                     append_then_run(sel, indent_cols=6 + 2 * depth)
 
@@ -770,7 +771,7 @@ def _block_left_rows(
         # carry no target_repo and aren't offered a then-run row,
         # matching _collect_review_focusables.
         if block.target_repo is not None:
-            for sel, depth in _walk_then_run_chain(block, ""):
+            for sel, depth in _walk_then_run_chain(state, block, ""):
                 append_then_run(sel, indent_cols=4 + 2 * depth)
     return rows
 
@@ -829,11 +830,9 @@ def _render_review_file_row(stdscr, y: int, x: int, w: int,
                             checked: bool,
                             pane_focused: bool = False) -> None:
     """Render one right-pane row: checkbox + status code + path +
-    ins/del counts. The checkbox reflects this file's `staged_paths`
-    bit — Space toggles it; the commit pipeline reads it to decide
-    what lands in the index. Unchecked rows render dim so the user
-    can see at a glance which files would be left out of the
-    commit."""
+    ins/del counts. The checkbox reflects this file's review draft
+    staged bit. Unchecked rows render dim so the user can see at a
+    glance which files would be left out of the commit."""
     p_green = PAIR_PASTEL_GREEN_ACTIVE if pane_focused else PAIR_PASTEL_GREEN
     p_red   = PAIR_PASTEL_RED_ACTIVE   if pane_focused else PAIR_PASTEL_RED
     code = "??" if fe.untracked else f"{fe.x}{fe.y}"
@@ -899,24 +898,23 @@ def is_toolbar_toggle(button_id: int) -> bool:
     return False
 
 
-def fire_toolbar_action(block: ReviewBlock, button_id: int) -> bool:
+def fire_toolbar_action(state: State, block: ReviewBlock, button_id: int) -> bool:
     """Apply the toolbar action to `block`. Returns True when state
     changed (caller can use this as a redraw cue), False when the
     button was a no-op (already-staged → stage-all, no unpushed
     commit → amend, etc.). Public so `main_loop` can dispatch the
     Space/Enter key without us re-importing the predicates."""
-    if not _toolbar_available(block, button_id):
+    if not _toolbar_available(state, block, button_id):
         return False
     if button_id == 0:  # stage all
-        for fe in block.files:
-            block.staged_paths[fe.path] = True
+        state.review_drafts.set_all_staged(block.draft_id, True)
         return True
     if button_id == 1:  # unstage all
-        for fe in block.files:
-            block.staged_paths[fe.path] = False
+        state.review_drafts.set_all_staged(block.draft_id, False)
         return True
     if button_id == TOOLBAR_BUTTON_AMEND:
-        block.amend = not block.amend
+        draft = _draft_for_block(state, block)
+        state.review_drafts.set_amend(block.draft_id, not draft.amend)
         return True
     return False
 
@@ -936,7 +934,8 @@ def _block_unpushed_commits(block: Optional[ReviewBlock]) -> int:
     return 0
 
 
-def _toolbar_available(block: Optional[ReviewBlock], button_id: int) -> bool:
+def _toolbar_available(state: State, block: Optional[ReviewBlock],
+                       button_id: int) -> bool:
     """`stage all` is available when at least one file is unchecked;
     `unstage all` is available when at least one file is checked;
     `amend` is available when the target has at least one local
@@ -946,16 +945,17 @@ def _toolbar_available(block: Optional[ReviewBlock], button_id: int) -> bool:
     working-tree state."""
     if block is None:
         return False
+    draft = _draft_for_block(state, block)
     if button_id == 0:  # stage all
-        if not block.files:
+        if not draft.files:
             return False
-        return any(not block.staged_paths.get(fe.path, False)
-                   for fe in block.files)
+        return any(not draft.staged_paths.get(fe.path, False)
+                   for fe in draft.files)
     if button_id == 1:  # unstage all
-        if not block.files:
+        if not draft.files:
             return False
-        return any(block.staged_paths.get(fe.path, False)
-                   for fe in block.files)
+        return any(draft.staged_paths.get(fe.path, False)
+                   for fe in draft.files)
     if button_id == TOOLBAR_BUTTON_AMEND:
         return _block_unpushed_commits(block) > 0
     return False
@@ -972,6 +972,7 @@ def _format_toolbar_button(label: str, kind: str,
 
 
 def _draw_right_toolbar(stdscr, y: int, x: int, w: int,
+                        state: State,
                         block: Optional[ReviewBlock],
                         pane_focused: bool, sb: int) -> None:
     """Right-align the toolbar at the trailing edge of the right pane
@@ -983,10 +984,11 @@ def _draw_right_toolbar(stdscr, y: int, x: int, w: int,
     if block is None or w <= 0:
         return
     pieces: "list[tuple[int, str]]" = []
+    draft = _draft_for_block(state, block)
     for bid, label, kind in _TOOLBAR_BUTTONS:
         on = (kind == TOOLBAR_KIND_TOGGLE
               and bid == TOOLBAR_BUTTON_AMEND
-              and block.amend)
+              and draft.amend)
         pieces.append((bid, _format_toolbar_button(label, kind, on)))
     total = sum(len(p) for _, p in pieces) + max(0, len(pieces) - 1)
     if total > w:
@@ -994,7 +996,7 @@ def _draw_right_toolbar(stdscr, y: int, x: int, w: int,
     cur_x = x + w - total
     toolbar_focused = pane_focused and block.toolbar_focus >= 0
     for i, (bid, text) in enumerate(pieces):
-        available = _toolbar_available(block, bid)
+        available = _toolbar_available(state, block, bid)
         is_focused = (toolbar_focused
                       and block.toolbar_focus == bid)
         if is_focused:
@@ -1017,6 +1019,7 @@ def _draw_right_pane(stdscr, x: int, y: int, w: int, h: int,
     the user can see at a glance which side ↑/↓ steers."""
     if block is None or w <= 0 or h <= 0:
         return
+    draft = _draft_for_block(state, block)
     pane_focused = panel_focus == "right"
     fill_pair = PAIR_SB_FG_ACTIVE if pane_focused else PAIR_SB_FG
     fill_attr = curses.color_pair(fill_pair)
@@ -1029,10 +1032,10 @@ def _draw_right_pane(stdscr, x: int, y: int, w: int, h: int,
         header_attr = curses.color_pair(PAIR_SB_CYAN_ACTIVE) | curses.A_BOLD
     else:
         header_attr = fill_attr | curses.A_BOLD | curses.A_DIM
-    if block.files_loading and not block.files:
+    if draft.files_loading and not draft.files:
         count_str = _review_spinner(state)
     else:
-        count_str = str(len(block.files))
+        count_str = str(len(draft.files))
     header = f"{block.label}: {count_str} file(s)"
     safe_addstr(stdscr, y, x, header[:w], header_attr)
 
@@ -1041,39 +1044,40 @@ def _draw_right_pane(stdscr, x: int, y: int, w: int, h: int,
     if list_h <= 0:
         return
 
-    if block.files_loading and not block.files:
+    if draft.files_loading and not draft.files:
         safe_addstr(stdscr, line, x + 2,
                     f"{_review_spinner(state)} loading files…",
                     dim_attr)
         return
-    if not block.files:
+    if not draft.files:
         safe_addstr(stdscr, line, x + 2, "(no changes)", dim_attr)
         return
 
     sel = block.file_selected
     block.file_scroll = clamp_scroll(
-        sel, block.file_scroll, len(block.files), list_h)
+        sel, block.file_scroll, len(draft.files), list_h)
 
     for slot in range(list_h):
         idx = block.file_scroll + slot
-        if idx >= len(block.files):
+        if idx >= len(draft.files):
             break
-        fe = block.files[idx]
+        fe = draft.files[idx]
         focused = pane_focused and idx == sel
-        checked = block.staged_paths.get(fe.path, False)
+        checked = draft.staged_paths.get(fe.path, False)
         _render_review_file_row(stdscr, line + slot, x, w, fe, focused,
                                 checked, pane_focused)
     if block.file_scroll > 0:
         draw_scroll_overflow(stdscr, line, x, w,
                              block.file_scroll, "up", dim_attr)
-    end = min(len(block.files), block.file_scroll + list_h)
-    if end < len(block.files):
-        below = len(block.files) - end
+    end = min(len(draft.files), block.file_scroll + list_h)
+    if end < len(draft.files):
+        below = len(draft.files) - end
         draw_scroll_overflow(stdscr, line + list_h - 1, x, w,
                              below, "down", dim_attr)
 
 
-def _review_hints(focusables: List[Tuple[int, str, object]],
+def _review_hints(state: State,
+                  focusables: List[Tuple[int, str, object]],
                   focus: int, panel_focus: str,
                   blocks: Optional[List[ReviewBlock]] = None) -> List[Hint]:
     hints: List[Hint] = []
@@ -1082,9 +1086,10 @@ def _review_hints(focusables: List[Tuple[int, str, object]],
         if 0 <= focus < len(focusables):
             _, kind, obj = focusables[focus]
             if kind == "push":
+                draft = state.review_drafts.get_or_create(obj.draft_id)
                 hints.append(Hint(
                     KEY_SPACE,
-                    "don't push this commit" if obj.push
+                    "don't push this commit" if draft.push
                     else "push this commit"))
             elif kind == "suggest":
                 hints.append(Hint("←", "suggest message (staged)"))
@@ -1093,7 +1098,8 @@ def _review_hints(focusables: List[Tuple[int, str, object]],
                     KEY_SPACE,
                     "stop tracking" if obj.track else "track with LFS"))
             elif kind == "toggle":
-                on = obj.repo.track_workflow.get(obj.workflow_name, False)
+                draft = state.review_drafts.get_or_create(obj.draft_id)
+                on = draft.track_workflow.get(obj.workflow_name, False)
                 hints.append(Hint(
                     KEY_SPACE,
                     "untrack workflow" if on else "track workflow"))
@@ -1102,7 +1108,7 @@ def _review_hints(focusables: List[Tuple[int, str, object]],
                 # spec so the hint mentions which parameter is in
                 # focus and what character class is allowed.
                 sel, param_name = obj
-                spec = _find_param_spec(sel, param_name)
+                spec = _find_param_spec(state, sel, param_name)
                 if spec is not None:
                     hints.append(Hint(
                         "a-z, 0-9, /-_.",
@@ -1116,7 +1122,9 @@ def _review_hints(focusables: List[Tuple[int, str, object]],
         # Only advertise Enter once every block has finished its file
         # load — pressing it earlier would race the staging step and
         # fail with "nothing staged". Matches the gate in main_loop.
-        if blocks is not None and not any(b.files_loading for b in blocks):
+        if blocks is not None and not any(
+                state.review_drafts.get_or_create(b.draft_id).files_loading
+                for b in blocks):
             hints.append(Hint(KEY_ENTER, "execute commits"))
     else:  # right
         # Pull the focused block once so we can swap hints between
@@ -1133,7 +1141,8 @@ def _review_hints(focusables: List[Tuple[int, str, object]],
             # buttons (amend) accept Space + Enter; action buttons
             # (stage all / unstage all) accept Enter only.
             if block.toolbar_focus == TOOLBAR_BUTTON_AMEND:
-                verb = "uncheck amend" if block.amend else "check amend"
+                draft = state.review_drafts.get_or_create(block.draft_id)
+                verb = "uncheck amend" if draft.amend else "check amend"
                 hints.append(Hint(f"{KEY_SPACE} / {KEY_ENTER}", verb))
             elif block.toolbar_focus == 0:
                 hints.append(Hint(KEY_ENTER, "stage all"))
@@ -1147,10 +1156,12 @@ def _review_hints(focusables: List[Tuple[int, str, object]],
             # when we know the block; falls back to a neutral
             # "stage / unstage" otherwise.
             space_label = "toggle stage"
-            if block is not None and 0 <= block.file_selected < len(block.files):
-                fe = block.files[block.file_selected]
-                on = block.staged_paths.get(fe.path, False)
-                space_label = "unstage" if on else "stage"
+            if block is not None:
+                draft = state.review_drafts.get_or_create(block.draft_id)
+                if 0 <= block.file_selected < len(draft.files):
+                    fe = draft.files[block.file_selected]
+                    on = draft.staged_paths.get(fe.path, False)
+                    space_label = "unstage" if on else "stage"
             hints.append(Hint(KEY_SPACE, space_label))
             hints.append(Hint(KEY_TAB, "view diff"))
             hints.append(Hint(KEY_SHIFT_TAB, "back to repos"))
@@ -1158,29 +1169,24 @@ def _review_hints(focusables: List[Tuple[int, str, object]],
     # after-workflow chains + workflow-tracking opt-ins). Only
     # advertised when there's something to clear, so a workspace
     # with no chains set doesn't carry a redundant hint.
-    if blocks is not None and _any_then_runs_set(blocks):
+    if blocks is not None and _any_then_runs_set(state, blocks):
         hints.append(Hint(KEY_CTRL_K, "clear chains"))
     hints.append(Hint(KEY_ESC, "back"))
     return hints
 
 
-def _any_then_runs_set(blocks: List[ReviewBlock]) -> bool:
-    """True iff any review block's target repo has a then-run target,
+def _any_then_runs_set(state: State, blocks: List[ReviewBlock]) -> bool:
+    """True iff any review block's draft has a then-run target,
     workflow tracking opt-in, or chained after-workflow target
     currently set. Drives the conditional `Ctrl+K clear chains` hint
     — no signal to clear → no hint."""
-    seen: "set[int]" = set()
     for b in blocks:
-        repo = b.target_repo if b.target_repo is not None else (
-            b.target_child.repo if b.target_child is not None else None)
-        if repo is None or id(repo) in seen:
-            continue
-        seen.add(id(repo))
-        if repo.then_run_after_push:
+        draft = state.review_drafts.get_or_create(b.draft_id)
+        if draft.then_run_after_push:
             return True
-        if repo.then_run_after_workflow:
+        if draft.then_run_after_workflow:
             return True
-        if any(repo.track_workflow.values()):
+        if any(draft.track_workflow.values()):
             return True
     return False
 
@@ -1252,7 +1258,7 @@ def draw_review(stdscr, state: State, blocks: List[ReviewBlock],
     sb_attr = curses.color_pair(
         PAIR_SB_FG_ACTIVE if right_focused else PAIR_SB_FG)
     _draw_right_toolbar(stdscr, 2, right_x + 1, right_w,
-                        right_block, right_focused, sb_attr)
+                        state, right_block, right_focused, sb_attr)
 
     rows, focused_row = _build_left_pane_rows(
         blocks, focusables, focus, panel_focus, left_w,
@@ -1274,7 +1280,7 @@ def draw_review(stdscr, state: State, blocks: List[ReviewBlock],
                      block, panel_focus, state)
 
     render_hints(stdscr, h - 1, 0, max(0, w - 1),
-                 _review_hints(focusables, focus, panel_focus,
+                 _review_hints(state, focusables, focus, panel_focus,
                                blocks=blocks),
                  attr=curses.A_DIM)
     curses.curs_set(0)

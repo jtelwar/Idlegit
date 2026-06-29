@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Optional
 
 from .config import user_state_dir
-from .models import Task
+from .runtime.tasks import Task
 
 # Default filename inside `user_state_dir()` when `task_log_path` in the
 # conf is left empty. Kept here (not in config.py) so `resolve_task_log_path`

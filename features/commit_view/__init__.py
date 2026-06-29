@@ -1,0 +1,2 @@
+"""Commit view feature boundary."""
+

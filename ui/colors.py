@@ -8,8 +8,6 @@ from __future__ import annotations
 import curses
 from typing import Optional, Tuple
 
-from core.models import ChildRef, Repo
-
 
 # Foreground-on-default-bg pairs, used across the main panel.
 PAIR_BRANCH = 1
@@ -298,20 +296,13 @@ def _state_color(*, error: str, merging: bool, ahead: int, behind: int,
     return "clean", curses.color_pair(PAIR_OK)
 
 
-def state_color(repo: Repo) -> Tuple[str, int]:
-    """Return (state-label, attr) for the dot showing this repo's state."""
+def status_state_color(status: object) -> Tuple[str, int]:
+    """Return (state-label, attr) for a store-owned row status snapshot."""
     return _state_color(
-        error=repo.error, merging=repo.merging,
-        ahead=repo.ahead, behind=repo.behind,
-        dirty=repo.is_dirty, upstream=repo.upstream,
-    )
-
-
-def child_state_color(child: ChildRef) -> Tuple[str, int]:
-    """Same dot palette as `state_color`, but reading from a ChildRef
-    (which exposes the same fields independently of the canonical Repo)."""
-    return _state_color(
-        error=child.error, merging=child.merging,
-        ahead=child.ahead, behind=child.behind,
-        dirty=child.dirty, upstream=child.upstream,
+        error=str(getattr(status, "error", "")),
+        merging=bool(getattr(status, "merging", False)),
+        ahead=int(getattr(status, "ahead", 0) or 0),
+        behind=int(getattr(status, "behind", 0) or 0),
+        dirty=bool(getattr(status, "dirty", False)),
+        upstream=getattr(status, "upstream", None),
     )

@@ -20,16 +20,22 @@ for _p in (str(_HERE.parent), str(_HERE)):
 # the platform doesn't ship it (same gate as test_workspaces).
 try:
     import curses  # noqa: F401
-    from ui.modals.commit_msg_editor import (  # noqa: E402
+    from features.commit_msg_editor.actions import (  # noqa: E402
+        handle_commit_msg_editor_key,
+    )
+    from features.commit_msg_editor.projection import (  # noqa: E402
         _cursor_to_row_col, _row_col_to_cursor,
-        handle_commit_msg_editor_key, open_commit_msg_editor,
+    )
+    from features.commit_msg_editor.session import (  # noqa: E402
+        open_commit_msg_editor,
     )
     UI_AVAILABLE = True
 except Exception:
     UI_AVAILABLE = False
 
 from _helpers import make_repo_model as _make_repo, make_state as _state  # noqa: E402
-from core.models import ChildRef, CommitMsgEditor  # noqa: E402
+from core.state.edit_buffers import CommitMsgEditor  # noqa: E402
+from core.state.repos import ChildRef  # noqa: E402
 
 
 @unittest.skipUnless(UI_AVAILABLE, "curses unavailable")
@@ -98,8 +104,8 @@ class TestOpenGating(unittest.TestCase):
         # Clean working tree but a draft message — still worth opening
         # so the user can edit the draft in the large editor.
         repo = _make_repo("a")
-        repo.message = "draft"
         s = self._state_on_repo(repo)
+        s.store.set_row_message(repo, "draft")
         self.assertTrue(open_commit_msg_editor(s))
 
     def test_refuses_on_clean_repo(self) -> None:
@@ -108,11 +114,11 @@ class TestOpenGating(unittest.TestCase):
         self.assertFalse(open_commit_msg_editor(s))
         self.assertIsNone(s.commit_msg_editor)
 
-    def test_refuses_while_refreshing(self) -> None:
+    def test_refuses_while_busy(self) -> None:
         repo = _make_repo("a")
         repo.staged = [("M", "foo.py")]
-        repo.refreshing = True
         s = self._state_on_repo(repo)
+        s.store.set_repo_busy(repo, True)
         self.assertFalse(open_commit_msg_editor(s))
 
     def test_refuses_on_title_or_workspace_rows(self) -> None:
@@ -128,24 +134,23 @@ class TestOpenGating(unittest.TestCase):
     def test_cursor_lands_at_end_of_existing_message(self) -> None:
         repo = _make_repo("a")
         repo.staged = [("M", "x")]
-        repo.message = "draft text"
         s = self._state_on_repo(repo)
+        s.store.set_row_message(repo, "draft text")
         open_commit_msg_editor(s)
         self.assertEqual(s.commit_msg_editor.cursor, len("draft text"))
 
 
 @unittest.skipUnless(UI_AVAILABLE, "curses unavailable")
 class TestKeyDispatch(unittest.TestCase):
-    """The editor binds directly to `holder.message`; every keystroke
-    mutates the holder in place. These tests build a Repo + editor by
+    """The editor binds to the store-owned row message. These tests build a Repo + editor by
     hand (without exercising the curses screen path), drive keys
     through `handle_commit_msg_editor_key`, and assert on the resulting
-    holder state."""
+    store state."""
 
     def _editor_for(self, msg: str = "", cursor: int = 0) -> "tuple":
         repo = _make_repo("a")
-        repo.message = msg
         s = _state(repo)
+        s.store.set_row_message(repo, msg)
         s.commit_msg_editor = CommitMsgEditor(
             holder=repo, parent=None, label="a", branch="main",
             cursor=cursor, scroll=0,
@@ -179,25 +184,25 @@ class TestKeyDispatch(unittest.TestCase):
     def test_printable_insert_updates_holder(self) -> None:
         s, repo = self._editor_for("ello", 0)
         handle_commit_msg_editor_key(s, ord("H"))
-        self.assertEqual(repo.message, "Hello")
+        self.assertEqual(s.store.row_message(repo), "Hello")
         self.assertEqual(s.commit_msg_editor.cursor, 1)
 
     def test_backspace_at_end(self) -> None:
         s, repo = self._editor_for("hello", 5)
         handle_commit_msg_editor_key(s, curses.KEY_BACKSPACE)
-        self.assertEqual(repo.message, "hell")
+        self.assertEqual(s.store.row_message(repo), "hell")
         self.assertEqual(s.commit_msg_editor.cursor, 4)
 
     def test_backspace_at_zero_is_noop(self) -> None:
         s, repo = self._editor_for("hello", 0)
         handle_commit_msg_editor_key(s, curses.KEY_BACKSPACE)
-        self.assertEqual(repo.message, "hello")
+        self.assertEqual(s.store.row_message(repo), "hello")
         self.assertEqual(s.commit_msg_editor.cursor, 0)
 
     def test_delete_at_cursor(self) -> None:
         s, repo = self._editor_for("hello", 2)
         handle_commit_msg_editor_key(s, curses.KEY_DC)
-        self.assertEqual(repo.message, "helo")
+        self.assertEqual(s.store.row_message(repo), "helo")
         self.assertEqual(s.commit_msg_editor.cursor, 2)
 
     def test_left_right_moves_cursor(self) -> None:
@@ -223,10 +228,10 @@ class TestKeyDispatch(unittest.TestCase):
         handle_commit_msg_editor_key(s, curses.KEY_UP)
         # Up to row 0, col 2 → "ab|c" → cursor index 2.
         self.assertEqual(_cursor_to_row_col(
-            s.repos[0].message, s.commit_msg_editor.cursor), (0, 2))
+            s.store.row_message(s.repos[0]), s.commit_msg_editor.cursor), (0, 2))
         handle_commit_msg_editor_key(s, curses.KEY_DOWN)
         self.assertEqual(_cursor_to_row_col(
-            s.repos[0].message, s.commit_msg_editor.cursor), (1, 2))
+            s.store.row_message(s.repos[0]), s.commit_msg_editor.cursor), (1, 2))
 
     def test_up_at_top_lands_at_start(self) -> None:
         s, _ = self._editor_for("abc", 2)

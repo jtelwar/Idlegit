@@ -20,7 +20,7 @@ from .colors import (  # noqa: F401  (re-exported public API)
     PAIR_SB_CYAN, PAIR_SB_CYAN_ACTIVE, PAIR_SB_ERR, PAIR_SB_FG,
     PAIR_SB_FG_ACTIVE,
     PAIR_SB_OK, PAIR_SB_WARN, PAIR_TOGGLE_OFF, PAIR_TOGGLE_ON, PAIR_WARN,
-    _state_color, child_state_color, init_colors, state_color,
+    _state_color, init_colors, status_state_color,
 )
 from .geometry import (  # noqa: F401  (re-exported public API)
     SIDEBAR_W, SIDEBAR_W_NARROW, clamp_scroll, draw_modal_fill,
@@ -89,8 +89,8 @@ from .review import (  # noqa: F401  (re-exported for callers who need review pi
     build_review_blocks,
     cycle_then_run,
     draw_review,
-    kick_off_review_files_load,
 )
+from core.workers import kick_off_review_files_load  # noqa: F401
 from .main_loop import (  # noqa: F401  (re-exported public API)
     confirm_quit,
     ensure_cursor_visible,

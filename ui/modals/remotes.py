@@ -9,7 +9,8 @@ from __future__ import annotations
 import curses
 from typing import List
 
-from core.models import RemotesModal, RemoteRow, State
+from core.state.app import State
+from core.state.remotes import RemoteRow, RemotesModal
 from core.git_ops import list_remotes
 from core.workers import _compute_remote_ops, kick_off_remote_changes
 

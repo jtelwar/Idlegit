@@ -1,0 +1,95 @@
+## Current Task
+- [ ] Ground-up foundation rewrite: replace trunk ownership with SSOT state, runtime jobs/leases, typed git gateway, and app-shell coordinator before rewriting individual features.
+
+## Completed
+- [x] Re-read AGENTS.md and confirmed the no-destructive-git and Research -> Plan -> Implement constraints.
+- [x] Stopped the modal/import cleanup track as the next slice.
+- [x] Audited the current trunk files and confirmed `core.models`, `core.workers`, `core.git_ops`, and `idlegit.py` still own state, runtime, git, and coordination.
+- [x] Updated `AGENTS/FOUNDATION_REWRITE_PLAN.md` with the no-allowlist ground-up rewrite contract.
+- [x] Added explicit Phase 1A, 2A, 3A, 4A, 5A, and 6A owner-boundary replacement gates.
+- [x] Folded SSOT audit findings into the plan: store mirroring, row-object lifecycle mutation, refresh/link mutation, task-row identity, split workflow intent, and raw feature projection reads.
+- [x] Phase 1A: created `core.state.app` for root `State` and moved remaining modal/session records into state-owned modules.
+- [x] Phase 1A: reduced `core.models` to temporary re-exports and routed production imports to owning `core.state.*` modules.
+- [x] Phase 1A: added architecture guards blocking class/function definitions in `core.models` and production imports from `core.models`.
+- [x] Phase 1A: validated moved imports with py_compile, architecture guards, focused feature tests, and `git diff --check`.
+- [x] Phase 1B: added typed repo and child refresh snapshots plus explicit store snapshot publishers.
+- [x] Phase 1B: routed inline/post-action repo refresh publication through typed snapshots before temporary projection updates.
+- [x] Phase 1B: guarded migrated worker refresh paths against live row status publication.
+- [x] Phase 1B: made filesystem watcher ignore matching robust when optional `pathspec` is unavailable.
+- [x] Phase 1B: validated refresh snapshots, inline refresh, watcher fallback, state store, architecture guards, production compile, and `git diff --check`.
+- [x] Phase 1B: split relink into explicit topology snapshots plus projection application.
+- [x] Phase 1B: routed worker, smart-sync cleanup, and filesystem watcher relink through store-first topology publication.
+- [x] Phase 1B: fixed stale-workspace topology publication so captured workspaces do not steal active store state.
+- [x] Phase 1B: made canonical tree claims release captured child ids after workspace switches.
+- [x] Phase 1B: validated relink topology with 255 focused tests, architecture guards, production compile, and `git diff --check`.
+- [x] Phase 1B: kept commit-message buffers in store-owned row status across refresh, relink, and workspace-switch paths.
+- [x] Phase 1B: validated store-owned messages with 92 focused tests, 355 UI/key/workspace tests, architecture guards, production compile, and `git diff --check`.
+- [x] Phase 1B: moved queued workflow intent to store-owned snapshots and kept live workflow follow-up edits in `WorkflowFollowupRegistry`.
+- [x] Phase 1B: guarded workers and task-detail actions against raw repo workflow-intent reads/writes.
+- [x] Phase 1B: validated workflow-intent ownership with 59 focused tests, architecture guards, production compile, and `git diff --check`.
+- [x] Phase 1B: routed live post-action refreshes through store-publishing refresh snapshot helpers.
+- [x] Phase 1B: guarded live worker reconcile paths against raw `refresh_repo` injection.
+- [x] Phase 1B: validated post-action refresh publication with 42 focused tests, architecture guards, production compile, and `git diff --check`.
+- [x] Phase 1B: moved worker and refresh claim mutex ownership from row projections into store-owned stable ids.
+- [x] Phase 1B: guarded production code against direct row-owned refresh-lock calls.
+- [x] Phase 1B: validated store-owned refresh locks with 46 focused tests, production compile, and `git diff --check`.
+- [x] Phase 1B: deleted legacy refresh locks from `Repo` and `ChildRef` projections.
+- [x] Phase 1B: rewrote remaining row-lock tests around store-owned refresh mutexes.
+- [x] Phase 1B: validated row-lock removal with 193 affected tests, production compile, and `git diff --check`.
+- [x] Phase 1B: deleted workflow intent fields from `Repo` projections and kept intent in store snapshots, review drafts, and followup records.
+- [x] Phase 1B: broadened workflow-intent guards across production code.
+- [x] Phase 1B: validated workflow-intent ownership with 121 focused tests, production compile, and `git diff --check`.
+- [x] Replaced `AGENTS/FOUNDATION_REWRITE_PLAN.md` with a no-allowlist ground-up rewrite plan.
+- [x] Incorporated parallel audit findings for SSOT leaks, UI-thread blockers, smart-sync cancellation/result gaps, lease exclusivity, and git safety boundaries.
+- [x] Phase 2A: created `core.runtime` as the owner for job and mutation-lease primitives.
+- [x] Phase 2A: converted `core.jobs` and `core.state.leases` into temporary compatibility export shells.
+- [x] Phase 2A: made local mutation lease acquisition exclusive and updated `WorkerClaim` cleanup on conflicts.
+- [x] Phase 2A: moved branch prompt, SSH keygen, task detail, and action-menu loader jobs to import runtime jobs directly.
+- [x] Phase 2A: moved all production job imports from `core.jobs` to `core.runtime.jobs`.
+- [x] Phase 2A: guarded production code against importing the old `core.jobs` compatibility shell.
+- [x] Phase 2A: validated runtime ownership with focused compile, 132 unit tests, architecture guards, and `git diff --check`.
+- [x] Phase 2A: moved worker, refresh, and canonical-tree claims into `core.runtime.claims`.
+- [x] Phase 2A: converted `core.leases` into a temporary compatibility export shell.
+- [x] Phase 2A: guarded production code against importing the old `core.leases` compatibility shell.
+- [x] Phase 2A: validated runtime claim ownership with focused compile, 149 unit tests, architecture guards, and `git diff --check`.
+- [x] Phase 2A: moved `ThreadGroup` into `core.runtime.threads`.
+- [x] Phase 2A: converted `core.thread_group` into a temporary compatibility export shell.
+- [x] Phase 2A: guarded production code against importing the old `core.thread_group` compatibility shell.
+- [x] Phase 2A: validated runtime thread-helper ownership with focused compile, 25 unit tests, architecture guards, and `git diff --check`.
+- [x] Phase 2A: routed migrated job thread factories through `core.runtime.threads`.
+- [x] Phase 2A: removed direct job-thread construction from `core.workers` and migrated feature job modules.
+- [x] Phase 2A: guarded migrated job paths against direct `threading.Thread` construction.
+- [x] Phase 2A: validated runtime thread factories with focused compile, 166 unit tests, architecture guards, and `git diff --check`.
+- [x] Phase 2A: routed filesystem watcher debounce thread creation through `core.runtime.threads`.
+- [x] Phase 2A: guarded production code so `threading.Thread` construction is owned only by `core.runtime.threads`.
+- [x] Phase 2A: validated runtime-owned thread construction with focused compile, 102 unit tests, architecture guards, and `git diff --check`.
+- [x] Phase 2A: moved task projection rows into `core.runtime.tasks`.
+- [x] Phase 2A: converted `core.state.tasks` into a temporary compatibility export shell.
+- [x] Phase 2A: guarded production code against importing the old `core.state.tasks` compatibility shell.
+- [x] Phase 2A: validated runtime task projection ownership with focused compile, 164 unit tests, architecture guards, and `git diff --check`.
+- [x] Phase 2A: made `JobTaskBridge` bind task rows to owning runtime jobs.
+- [x] Phase 2A: routed smart-sync header, sentinel, and cleanup rows through bound runtime task projection.
+- [x] Phase 2A: guarded smart-sync cleanup against raw task-row publishing.
+- [x] Phase 2A: validated smart-sync task ownership with focused compile, 12 unit tests, architecture guards, and `git diff --check`.
+- [x] Phase 2A: added runtime task-action projection queries for task-detail and task-panel controls.
+- [x] Phase 2A: routed task-detail actions, task removal, and task-panel remove hints through runtime projection decisions.
+- [x] Phase 2A: guarded task action controls against raw task-status lifecycle reads.
+- [x] Phase 2A: validated task-action projection ownership with focused compile, 192 unit tests, architecture guards, and `git diff --check`.
+- [x] Phase 2A: linked workflow polling run, job, and pending follow-up rows to owning runtime jobs.
+- [x] Phase 2A: linked reused then-run dispatch rows to their active dispatch job owner.
+- [x] Phase 2A: made task-owner lookup prefer active jobs and then the latest terminal owner for reused rows.
+- [x] Phase 2A: validated workflow task ownership with focused compile, 67 unit tests, architecture guards, and `git diff --check`.
+- [x] Phase 2A: bound commit-batch worker task rows to the owning runtime job.
+- [x] Phase 2A: allowed bound bridges to attach failure rows after their own job terminalizes.
+- [x] Phase 2A: guarded commit-batch against unbound task bridge regression.
+- [x] Phase 2A: validated commit-batch task ownership with focused compile, 51 unit tests, architecture guards, and `git diff --check`.
+- [x] Phase 2A: bound action, app-menu, remote-edit, and safe-merge worker rows to owning runtime jobs.
+- [x] Phase 2B: added smart-sync lifecycle cancellation terminalization and cancellation checkpoints around canonical, propagation, and subtree phases.
+- [x] Phase 2B: routed smart-sync propagation rows through the owning runtime task bridge.
+- [x] Phase 2B: routed smart-sync canonical executor warning rows through the owning runtime task bridge.
+- [x] Phase 2B: validated smart-sync cancellation/canonical ownership and safe-merge task ownership with focused compile, focused unit tests, ruff, and `git diff --check`.
+
+## Next Steps
+- [ ] Continue Phase 2A/2B: route remaining direct worker task publishers through runtime-owned bridges.
+- [ ] Phase 4A implementation: move UI-thread discovery/preflight work into runtime intents.
+- [ ] Phase 3A implementation: split `core.git_ops` into typed `core.git` services with cancellation, timeout, progress, and destructive-command policy.

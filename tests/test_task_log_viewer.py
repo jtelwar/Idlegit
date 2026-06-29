@@ -2,10 +2,8 @@
 key handling, and the action-menu integration that surfaces the new
 `View log` item.
 
-UI module fragments are imported directly (`ui.modals.task_detail`,
-`ui.modals.task_log_viewer`) rather than via the `ui` top-level
-package, dodging the unrelated `_split_remaining_width` re-export gap
-that silently skips much of `test_keys.py` on this host."""
+Feature fragments are imported directly so tests exercise the ownership
+boundary that opens task-detail rows and dispatches browser/cancel jobs."""
 from __future__ import annotations
 
 import curses
@@ -20,13 +18,15 @@ for _p in (str(_HERE.parent), str(_HERE)):
         sys.path.insert(0, _p)
 
 from _helpers import make_repo_model as _make_repo, make_state as _state  # noqa: E402
+from core.jobs import JobSpec, JobStatus  # noqa: E402
 
-from ui.modals.task_detail import (  # noqa: E402
-    _dispatch_action, open_task_action_menu,
+from features.task_detail.actions import (  # noqa: E402
+    dispatch_action, open_in_browser,
 )
-from ui.modals.task_log_viewer import (  # noqa: E402
-    handle_task_log_viewer_key, open_task_log_viewer,
-)
+from features.task_detail.session import open_task_action_menu  # noqa: E402
+from ui.modals.task_detail import handle_task_action_menu_key  # noqa: E402
+from features.task_log_viewer.actions import handle_task_log_viewer_key  # noqa: E402
+from features.task_log_viewer.session import open_task_log_viewer  # noqa: E402
 
 
 def _running_run(s, label: str = "↗ a: Build", *,
@@ -35,12 +35,24 @@ def _running_run(s, label: str = "↗ a: Build", *,
                  job_id=None):
     """Helper: add a task with the metadata of an active workflow run."""
     t = s.tasks.add(label)
-    s.tasks.set_meta(
+    s.workflow_runs.create_for_task(
         t,
         repo=_make_repo("a"), slug=slug, run_id=run_id,
         workflow_name=workflow, run_url=url, job_id=job_id,
     )
     return t
+
+
+def _wait_load_finished(state, load_id: str) -> tuple:
+    import time
+    deadline = 50
+    while deadline > 0:
+        snapshot = state.view_loads.snapshot(load_id)
+        if not snapshot[1]:
+            return snapshot
+        time.sleep(0.01)
+        deadline -= 1
+    raise AssertionError("load did not finish")
 
 
 class TestViewLogMenuItem(unittest.TestCase):
@@ -76,10 +88,145 @@ class TestViewLogMenuItem(unittest.TestCase):
         # call below requires `--repo <slug>` to succeed.
         s = _state(_make_repo("a"))
         t = s.tasks.add("↗ a: Build")
-        s.tasks.set_meta(t, run_id=42, workflow_name="Build")
+        s.workflow_runs.create_for_task(t, run_id=42, workflow_name="Build")
         open_task_action_menu(s, t)
         ids = [it.id for it in s.task_action_menu.items]
         self.assertNotIn("view_log", ids)
+
+
+class TestTaskDetailActionJobs(unittest.TestCase):
+    def test_cancel_run_dispatch_uses_read_only_job(self) -> None:
+        s = _state(_make_repo("a"))
+        t = _running_run(s)
+        open_task_action_menu(s, t)
+
+        with mock.patch("features.task_detail.actions.cancel_run",
+                        return_value=(True, "cancelled")):
+            dispatch_action(s, "cancel_run")
+
+        deadline = 100
+        while deadline > 0:
+            import time
+            jobs = s.job_registry.snapshot()
+            if jobs and jobs[0].terminal:
+                break
+            time.sleep(0.01)
+            deadline -= 1
+
+        jobs = s.job_registry.snapshot()
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0].spec.kind, "workflow-cancel")
+        self.assertFalse(jobs[0].spec.local_mutation)
+        self.assertEqual(jobs[0].status, JobStatus.OK)
+        task = s.tasks.snapshot()[-1]
+        self.assertEqual(task.status, "ok")
+        self.assertEqual(task.message, "cancelled")
+
+    def test_cancel_run_thread_start_failure_adds_failed_task(self) -> None:
+        class FailingThread:
+            daemon = False
+
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def start(self):
+                raise RuntimeError("thread start failed")
+
+        s = _state(_make_repo("a"))
+        t = _running_run(s)
+        open_task_action_menu(s, t)
+
+        with mock.patch("core.runtime.threads.threading.Thread", FailingThread):
+            dispatch_action(s, "cancel_run")
+
+        jobs = s.job_registry.snapshot()
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0].status, JobStatus.FAIL)
+        task = s.tasks.snapshot()[-1]
+        self.assertEqual(task.status, "fail")
+        self.assertEqual(task.message, "thread start failed")
+
+    def test_cancel_pipeline_requests_owning_job_cancel(self) -> None:
+        s = _state(_make_repo("a"))
+        job = s.job_registry.start(JobSpec(
+            kind="commit-batch",
+            label="commit workers",
+            local_mutation=True,
+        ))
+        task = s.tasks.add("a: working")
+        s.job_registry.link_task(job, task)
+
+        open_task_action_menu(s, task)
+        ids = [it.id for it in s.task_action_menu.items]
+        self.assertIn("cancel_pipeline", ids)
+
+        dispatch_action(s, "cancel_pipeline")
+
+        self.assertTrue(job.cancel_event.is_set())
+        self.assertFalse(job.terminal)
+        self.assertIsNone(s.task_action_menu)
+
+    def test_terminal_cancel_job_hides_cancel_pipeline_action(self) -> None:
+        s = _state(_make_repo("a"))
+        job = s.job_registry.start(JobSpec(
+            kind="commit-batch",
+            label="commit workers",
+            local_mutation=True,
+        ))
+        s.job_registry.finish(job, JobStatus.OK)
+        task = s.tasks.add("a: working")
+        s.job_registry.link_task(job, task)
+
+        open_task_action_menu(s, task)
+
+        ids = [it.id for it in s.task_action_menu.items]
+        self.assertNotIn("cancel_pipeline", ids)
+
+    def test_open_browser_uses_read_only_job(self) -> None:
+        s = _state(_make_repo("a"))
+        with mock.patch("features.task_detail.actions.webbrowser.open",
+                        return_value=True):
+            open_in_browser(s, "https://example.test/run")
+
+        deadline = 100
+        while deadline > 0:
+            import time
+            jobs = s.job_registry.snapshot()
+            if jobs and jobs[0].terminal:
+                break
+            time.sleep(0.01)
+            deadline -= 1
+
+        jobs = s.job_registry.snapshot()
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0].spec.kind, "open-browser")
+        self.assertFalse(jobs[0].spec.local_mutation)
+        self.assertEqual(jobs[0].status, JobStatus.OK)
+        task = s.tasks.snapshot()[-1]
+        self.assertEqual(task.status, "ok")
+        self.assertEqual(task.message, "opened")
+
+    def test_open_browser_warning_marks_job_warning(self) -> None:
+        s = _state(_make_repo("a"))
+        with mock.patch("features.task_detail.actions.webbrowser.open",
+                        return_value=False):
+            open_in_browser(s, "https://example.test/run")
+
+        deadline = 100
+        while deadline > 0:
+            import time
+            jobs = s.job_registry.snapshot()
+            if jobs and jobs[0].terminal:
+                break
+            time.sleep(0.01)
+            deadline -= 1
+
+        jobs = s.job_registry.snapshot()
+        self.assertEqual(jobs[0].status, JobStatus.WARN)
+        self.assertEqual(jobs[0].message, "no browser available")
+        task = s.tasks.snapshot()[-1]
+        self.assertEqual(task.status, "warn")
+        self.assertEqual(task.message, "no browser available")
 
 
 class TestOpenTaskLogViewer(unittest.TestCase):
@@ -92,7 +239,7 @@ class TestOpenTaskLogViewer(unittest.TestCase):
         # Patch the loader so the daemon thread doesn't actually call
         # `gh` while the unit test runs.
         self._fetch_patcher = mock.patch(
-            "ui.modals.task_log_viewer.fetch_run_log",
+            "core.workers.fetch_run_log",
             return_value=(True, ["log line 1", "log line 2"], ""))
         self._fetch = self._fetch_patcher.start()
         self.addCleanup(self._fetch_patcher.stop)
@@ -109,6 +256,10 @@ class TestOpenTaskLogViewer(unittest.TestCase):
         self.assertEqual(viewer.slug, "o/a")
         self.assertEqual(viewer.workflow_name, "Build")
         self.assertEqual(viewer.job_id, 7)
+        jobs = s.job_registry.snapshot()
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0].spec.kind, "task-log-load")
+        self.assertFalse(jobs[0].spec.local_mutation)
 
     def test_open_uses_failed_filter_when_task_failed(self) -> None:
         s = _state(_make_repo("a"))
@@ -140,10 +291,40 @@ class TestOpenTaskLogViewer(unittest.TestCase):
         s = _state(_make_repo("a"))
         t = _running_run(s)
         open_task_action_menu(s, t)
-        _dispatch_action(s, "view_log")
+        for i, item in enumerate(s.task_action_menu.items):
+            if item.id == "view_log":
+                s.task_action_menu.selected = i
+                break
+        handle_task_action_menu_key(s, curses.KEY_ENTER)
         self.assertIsNotNone(s.task_log_viewer)
         # Detail modal stays open so dismissing the viewer reveals it.
         self.assertIsNotNone(s.task_action_menu)
+
+    def test_thread_start_failure_clears_loading(self) -> None:
+        class FailingThread:
+            daemon = False
+
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def start(self):
+                raise RuntimeError("thread start failed")
+
+        s = _state(_make_repo("a"))
+        t = _running_run(s)
+        with mock.patch("core.runtime.threads.threading.Thread", FailingThread):
+            open_task_log_viewer(s, t)
+
+        viewer = s.task_log_viewer
+        self.assertIsNotNone(viewer)
+        assert viewer is not None
+        lines, loading, error = s.view_loads.snapshot(viewer.load_id)
+        self.assertFalse(loading)
+        self.assertEqual(lines, [])
+        self.assertEqual(error, "thread start failed")
+        jobs = s.job_registry.snapshot()
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0].status, JobStatus.FAIL)
 
 
 class TestTaskLogViewerKeyHandler(unittest.TestCase):
@@ -153,18 +334,17 @@ class TestTaskLogViewerKeyHandler(unittest.TestCase):
 
     def setUp(self) -> None:
         self._fetch_patcher = mock.patch(
-            "ui.modals.task_log_viewer.fetch_run_log",
+            "core.workers.fetch_run_log",
             return_value=(True, [f"line {i}" for i in range(50)], ""))
         self._fetch_patcher.start()
         self.addCleanup(self._fetch_patcher.stop)
         self.s = _state(_make_repo("a"))
         t = _running_run(self.s)
         open_task_log_viewer(self.s, t)
-        # Drain the daemon thread's mutation so `lines` is populated
-        # before each scroll test reads it.
-        with self.s.task_log_viewer.lock:
-            self.s.task_log_viewer.loading = False
-            self.s.task_log_viewer.lines = [f"line {i}" for i in range(50)]
+        self.s.view_loads.finish(
+            self.s.task_log_viewer.load_id,
+            [f"line {i}" for i in range(50)],
+        )
 
     def test_esc_closes_viewer(self) -> None:
         handle_task_log_viewer_key(self.s, 27)
@@ -178,12 +358,11 @@ class TestTaskLogViewerKeyHandler(unittest.TestCase):
         handle_task_log_viewer_key(self.s, 9)
         self.assertIsNone(self.s.task_log_viewer)
 
-    def test_close_sets_cancel_event(self) -> None:
-        # The cancel_event must fire so any in-flight loader bails
-        # before mutating the (now-dangling) viewer.
+    def test_close_removes_view_load_record(self) -> None:
         viewer = self.s.task_log_viewer
         handle_task_log_viewer_key(self.s, 27)
-        self.assertTrue(viewer.cancel_event.is_set())
+        self.assertEqual(self.s.view_loads.snapshot(viewer.load_id),
+                         ([], True, ""))
 
     def test_down_arrow_scrolls(self) -> None:
         handle_task_log_viewer_key(self.s, curses.KEY_DOWN)
@@ -198,14 +377,12 @@ class TestTaskLogViewerKeyHandler(unittest.TestCase):
         self.assertEqual(self.s.task_log_viewer.scroll, 10)
 
     def test_pgup_clamps_at_zero(self) -> None:
-        with self.s.task_log_viewer.lock:
-            self.s.task_log_viewer.scroll = 3
+        self.s.task_log_viewer.scroll = 3
         handle_task_log_viewer_key(self.s, curses.KEY_PPAGE)
         self.assertEqual(self.s.task_log_viewer.scroll, 0)
 
     def test_home_jumps_to_start(self) -> None:
-        with self.s.task_log_viewer.lock:
-            self.s.task_log_viewer.scroll = 25
+        self.s.task_log_viewer.scroll = 25
         handle_task_log_viewer_key(self.s, curses.KEY_HOME)
         self.assertEqual(self.s.task_log_viewer.scroll, 0)
 
@@ -222,39 +399,29 @@ class TestLoaderErrorPath(unittest.TestCase):
 
     def test_fetch_failure_lands_error(self) -> None:
         with mock.patch(
-                "ui.modals.task_log_viewer.fetch_run_log",
+                "core.workers.fetch_run_log",
                 return_value=(False, [], "gh CLI not on PATH")):
             s = _state(_make_repo("a"))
             t = _running_run(s)
             open_task_log_viewer(s, t)
-        # The loader runs synchronously enough that the daemon thread
-        # finishes before this assert — but be defensive and join on
-        # the loading flag. cancel_event ensures we don't hang.
-        viewer = s.task_log_viewer
-        deadline = 50  # 50 * 10ms polls = 0.5s; loader is sync work
-        while viewer.loading and deadline > 0:
-            import time
-            time.sleep(0.01)
-            deadline -= 1
-        self.assertFalse(viewer.loading)
-        self.assertEqual(viewer.error, "gh CLI not on PATH")
-        self.assertEqual(viewer.lines, [])
+            viewer = s.task_log_viewer
+            lines, loading, error = _wait_load_finished(s, viewer.load_id)
+        self.assertFalse(loading)
+        self.assertEqual(error, "gh CLI not on PATH")
+        self.assertEqual(lines, [])
 
     def test_empty_log_lands_placeholder_text(self) -> None:
         with mock.patch(
-                "ui.modals.task_log_viewer.fetch_run_log",
+                "core.workers.fetch_run_log",
                 return_value=(True, [], "")):
             s = _state(_make_repo("a"))
             t = _running_run(s)
             open_task_log_viewer(s, t)
-        viewer = s.task_log_viewer
-        deadline = 50
-        while viewer.loading and deadline > 0:
-            import time
-            time.sleep(0.01)
-            deadline -= 1
-        self.assertFalse(viewer.loading)
-        self.assertEqual(viewer.lines, ["(no log output yet)"])
+            viewer = s.task_log_viewer
+            lines, loading, error = _wait_load_finished(s, viewer.load_id)
+        self.assertFalse(loading)
+        self.assertEqual(error, "")
+        self.assertEqual(lines, ["(no log output yet)"])
 
 
 if __name__ == "__main__":

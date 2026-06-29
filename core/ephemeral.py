@@ -18,7 +18,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import List, Optional
 
-from .models import Workspace
+from .state.workspaces import Workspace
 
 
 def find_git_repo_root(start: Optional[Path] = None) -> Optional[Path]:

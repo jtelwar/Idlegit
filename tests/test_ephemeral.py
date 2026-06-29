@@ -26,7 +26,7 @@ from core.ephemeral import (  # noqa: E402
     find_git_repo_root,
     repo_covered_by_workspace,
 )
-from core.models import Workspace  # noqa: E402
+from core.state.workspaces import Workspace  # noqa: E402
 
 
 class TestFindGitRepoRoot(unittest.TestCase):

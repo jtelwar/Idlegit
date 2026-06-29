@@ -16,7 +16,8 @@ from core.git_ops import (  # noqa: E402
     derive_lfs_pattern, first_line, format_size, format_time_ago,
     parse_github_slug, would_run_on_push,
 )
-from core.models import FileChange, WorkflowInfo  # noqa: E402
+from core.state.review import FileChange  # noqa: E402
+from core.state.repos import WorkflowInfo  # noqa: E402
 from core.workers import (  # noqa: E402
     _current_step_label, _format_job_label, _format_run_label,
     _gh_run_status_to_task,

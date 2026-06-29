@@ -1,0 +1,2 @@
+"""Workspace switcher feature boundary."""
+

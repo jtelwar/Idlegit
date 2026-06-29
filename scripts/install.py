@@ -198,7 +198,7 @@ def check_repo_layout(summary: "list[str]") -> None:
         if not (PROJECT_ROOT / name).is_file():
             die(f"missing \"{name}\" — run ./install from the "
                 f"idlegit repo root (got PROJECT_ROOT={PROJECT_ROOT})")
-    for pkg in ("core", "ui"):
+    for pkg in ("core", "features", "ui"):
         if not (PROJECT_ROOT / pkg).is_dir():
             die(f"missing {pkg}/ — run ./install from the idlegit repo root")
     ok("repo layout", str(PROJECT_ROOT))
@@ -265,14 +265,15 @@ def install_files(home: Path, summary: list) -> None:
         dst = home / (dst_name or Path(src_relpath).name)
         shutil.copy2(src, dst)
         os.chmod(dst, mode)
-    # Replace the core/ and ui/ trees wholesale so renames / removals
+    # Replace the package trees wholesale so renames / removals
     # propagate. core/ is the domain layer (config + models + git_ops
-    # + workers); ui/ is the curses surface; help/ is the bundled
+    # + workers); features/ owns modal/session workflows; ui/ is the
+    # curses surface; help/ is the bundled
     # markdown pages the in-app help browser reads from. Missing
     # `help/` in the source tree is non-fatal — the help screen falls
     # back to a "no help available" placeholder, but every release
     # should ship it.
-    for pkg in ("core", "ui", "help"):
+    for pkg in ("core", "features", "ui", "help"):
         src = PROJECT_ROOT / pkg
         if not src.exists():
             continue
@@ -280,7 +281,7 @@ def install_files(home: Path, summary: list) -> None:
         if dst.exists():
             shutil.rmtree(dst)
         shutil.copytree(src, dst)
-    ok("copied launcher + Python modules + ui/ + help/")
+    ok("copied launcher + Python modules + core/ + features/ + ui/ + help/")
     summary.append(f"Installed / refreshed app files in {home}")
 
     # Strip any __pycache__ left over from prior runs in the source

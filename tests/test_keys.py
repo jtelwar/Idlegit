@@ -6,6 +6,7 @@ from __future__ import annotations
 import curses
 import sys
 import unittest
+from unittest import mock
 from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
@@ -16,26 +17,40 @@ for _p in (str(_HERE.parent), str(_HERE)):
 from _helpers import (  # noqa: E402
     make_repo_model as _make_repo, make_state as _state,
 )
-from core.models import (  # noqa: E402
-    ActionMenu, ActionMenuItem, BranchNamePrompt, BranchPicker, CommitEntry,
-    FileEntry, ResetPrompt, State,
+from core.state.app import State  # noqa: E402
+from core.state.app_menu import AppMenu  # noqa: E402
+from core.state.action_menu import (  # noqa: E402
+    ActionMenu, ActionMenuItem, CommitEntry, FileEntry,
 )
+from core.state.pickers import BranchPicker  # noqa: E402
+from core.state.prompts import BranchNamePrompt, ResetPrompt  # noqa: E402
+from core.state.workspaces import WorkspaceSwitcher  # noqa: E402
+from core.runtime.jobs import JobSpec, JobStatus  # noqa: E402
 
 
 # ui imports curses at module load. On non-tty hosts that fails; skip the
 # whole module under that condition rather than erroring out import.
 try:
     from ui import (  # noqa: E402
-        _split_remaining_width,
         handle_action_menu_key, handle_branch_name_prompt_key,
         handle_branch_picker_key, handle_main_key, handle_reset_prompt_key,
         handle_task_action_menu_key, handle_task_panel_key,
-        open_task_action_menu,
+        open_task_action_menu, confirm_quit,
     )
-    from ui.modals.task_detail import _is_safe_browser_url  # noqa: E402
+    from ui.main_screen import _body_height_for, _split_remaining_width  # noqa: E402
+    from ui.sidebar import FOOTER_H  # noqa: E402
+    from features.task_detail.projection import is_safe_browser_url  # noqa: E402
     UI_AVAILABLE = True
 except Exception:  # pragma: no cover
     UI_AVAILABLE = False
+
+
+def _set_message(state: State, row, message: str) -> None:
+    state.store.set_row_message(row, message)
+
+
+def _message(state: State, row) -> str:
+    return state.store.row_message(row)
 
 
 @unittest.skipUnless(UI_AVAILABLE, "ui module unavailable")
@@ -49,19 +64,20 @@ class TestNavigation(unittest.TestCase):
         self.assertEqual(s.selected, 0)
 
     def test_up_from_top_body_row_lands_on_workspace_row(self) -> None:
-        # Up from the first body row lands on the workspace title-row
-        # selector (selected = -1), not the bottom of the body.
-        # Pressing Up again from -1 wraps to the last body row.
+        # Up from the first body row lands on the workspace row, then the
+        # title row. Pressing Up again from the title wraps to the body.
         s = _state(_make_repo("a"), _make_repo("b"), selected=0)
         handle_main_key(s, curses.KEY_UP)
         self.assertEqual(s.selected, -1)
+        handle_main_key(s, curses.KEY_UP)
+        self.assertEqual(s.selected, -2)
         handle_main_key(s, curses.KEY_UP)
         self.assertEqual(s.selected, 1)  # last body row (2 repos → idx 1)
 
     def test_navigation_resets_field_cursor_to_message_end(self) -> None:
         a = _make_repo("a")
-        a.message = "hello"
         s = _state(a, selected=-1)  # start on workspace row
+        _set_message(s, a, "hello")
         s.field_cursor = 999
         handle_main_key(s, curses.KEY_DOWN)  # → first body row (a)
         self.assertEqual(s.selected, 0)
@@ -70,15 +86,86 @@ class TestNavigation(unittest.TestCase):
 
 @unittest.skipUnless(UI_AVAILABLE, "ui module unavailable")
 class TestResponsiveLayout(unittest.TestCase):
+    def test_body_height_reserves_full_width_footer(self) -> None:
+        s = _state(_make_repo("a"))
+        self.assertEqual(_body_height_for(s, 40), 40 - 4 - FOOTER_H)
+
     def test_remaining_width_splits_evenly_by_default(self) -> None:
-        self.assertEqual(_split_remaining_width(50, 0.2, 0.5), (25, 25))
+        self.assertEqual(_split_remaining_width(80, 30, 0.2, 0.5), (10, 40))
 
     def test_task_width_clamps_to_configured_max(self) -> None:
-        self.assertEqual(_split_remaining_width(50, 0.2, 0.3), (35, 15))
+        self.assertEqual(_split_remaining_width(80, 30, 0.2, 0.3), (26, 24))
 
     def test_task_width_keeps_one_cell_for_message_field(self) -> None:
-        self.assertEqual(_split_remaining_width(1, 0.2, 1.0), (1, 0))
-        self.assertEqual(_split_remaining_width(2, 0.9, 1.0), (1, 1))
+        self.assertEqual(_split_remaining_width(10, 9, 0.2, 1.0), (1, 0))
+        self.assertEqual(_split_remaining_width(10, 8, 0.9, 1.0), (1, 1))
+
+    def test_task_width_stays_stable_when_left_columns_grow(self) -> None:
+        narrow_message, tasks_w = _split_remaining_width(
+            120, 70, 0.2, 0.35)
+        wide_message, same_tasks_w = _split_remaining_width(
+            120, 55, 0.2, 0.35)
+        self.assertEqual(tasks_w, same_tasks_w)
+        self.assertLess(narrow_message, wide_message)
+
+    def test_app_menu_spans_full_width_but_switcher_stays_scoped(self) -> None:
+        import ui.main_screen as main_screen_mod
+
+        class FakeScreen:
+            def __init__(self, height: int, width: int) -> None:
+                self.height = height
+                self.width = width
+
+            def erase(self) -> None:
+                pass
+
+            def getmaxyx(self) -> tuple[int, int]:
+                return self.height, self.width
+
+            def addstr(self, *_args, **_kwargs) -> None:
+                pass
+
+            def refresh(self) -> None:
+                pass
+
+        repo = _make_repo("a")
+        s = _state(repo)
+        s.app_menu = AppMenu()
+        s.workspace_switcher = WorkspaceSwitcher()
+
+        draw_order = []
+
+        def note_sidebar(*_args, **_kwargs):
+            draw_order.append("sidebar")
+
+        def note_app_menu(*_args, **_kwargs):
+            draw_order.append("app_menu")
+
+        def note_workspace_switcher(*_args, **_kwargs):
+            draw_order.append("workspace_switcher")
+
+        with mock.patch.object(
+                main_screen_mod.curses, "color_pair", return_value=0), \
+             mock.patch.object(main_screen_mod.curses, "pair_number",
+                               return_value=0), \
+             mock.patch.object(main_screen_mod.curses, "curs_set"), \
+             mock.patch.object(main_screen_mod, "draw_sidebar",
+                               side_effect=note_sidebar) as sidebar, \
+             mock.patch.object(main_screen_mod, "draw_app_menu",
+                               side_effect=note_app_menu) as app_menu, \
+             mock.patch.object(
+                 main_screen_mod,
+                 "draw_workspace_switcher",
+                 side_effect=note_workspace_switcher) as workspace_switcher:
+            main_screen_mod.draw_main(FakeScreen(40, 120), s)
+
+        sidebar.assert_called_once()
+        app_menu.assert_called_once()
+        workspace_switcher.assert_called_once()
+        self.assertEqual(app_menu.call_args.args[2], 120)
+        self.assertLess(workspace_switcher.call_args.args[2], 120)
+        self.assertLess(draw_order.index("sidebar"),
+                        draw_order.index("app_menu"))
 
 
 @unittest.skipUnless(UI_AVAILABLE, "ui module unavailable")
@@ -89,8 +176,8 @@ class TestEnterReview(unittest.TestCase):
 
     def test_enter_with_message_returns_confirm(self) -> None:
         a = _make_repo("a")
-        a.message = "fix bug"
         s = _state(a)
+        _set_message(s, a, "fix bug")
         self.assertEqual(handle_main_key(s, 10), "confirm")
 
 
@@ -133,17 +220,100 @@ class TestEscBehavior(unittest.TestCase):
     def test_esc_with_other_messages_returns_confirm_quit(self) -> None:
         a = _make_repo("a")
         b = _make_repo("b")
-        b.message = "wip"
         s = _state(a, b, selected=0)  # focused on a (no message)
+        _set_message(s, b, "wip")
         self.assertEqual(handle_main_key(s, 27), "confirm-quit")
 
     def test_esc_clears_focused_message_first(self) -> None:
         a = _make_repo("a")
-        a.message = "wip"
         s = _state(a, selected=0)
+        _set_message(s, a, "wip")
         result = handle_main_key(s, 27)
         self.assertIsNone(result)
-        self.assertEqual(a.message, "")
+        self.assertEqual(_message(s, a), "")
+
+    def test_confirm_quit_uses_nonblocking_timeout(self) -> None:
+        class FakeScreen:
+            def __init__(self) -> None:
+                self.timeout_values = []
+                self.nodelay_values = []
+                self.keys = [27, -1]
+
+            def timeout(self, value: int) -> None:
+                self.timeout_values.append(value)
+
+            def getmaxyx(self):
+                return (20, 80)
+
+            def move(self, _y: int, _x: int) -> None:
+                return None
+
+            def clrtoeol(self) -> None:
+                return None
+
+            def refresh(self) -> None:
+                return None
+
+            def getch(self) -> int:
+                return self.keys.pop(0)
+
+            def nodelay(self, value: bool) -> None:
+                self.nodelay_values.append(value)
+
+        a = _make_repo("a")
+        s = _state(a)
+        _set_message(s, a, "wip")
+        screen = FakeScreen()
+
+        with mock.patch("ui.main_loop.draw_main"), \
+             mock.patch("ui.main_loop.safe_addstr"), \
+             mock.patch("ui.main_loop.curses.color_pair", return_value=0), \
+             mock.patch("ui.main_loop.curses.curs_set"):
+            self.assertFalse(confirm_quit(screen, s))
+
+        self.assertEqual(screen.timeout_values, [100, 0, 100])
+        self.assertEqual(screen.nodelay_values, [])
+
+
+@unittest.skipUnless(UI_AVAILABLE, "ui module unavailable")
+class TestBusyRowGating(unittest.TestCase):
+    def test_tab_does_not_open_action_menu_for_busy_row(self) -> None:
+        repo = _make_repo("a")
+        repo.staged = [("M", "x")]
+        s = _state(repo, selected=0)
+        s.store.set_repo_busy(repo, True)
+
+        with mock.patch("ui.main_loop.open_action_menu") as open_action_menu:
+            result = handle_main_key(s, 9)
+
+        self.assertIsNone(result)
+        open_action_menu.assert_not_called()
+
+    def test_typing_does_not_mutate_busy_row_message(self) -> None:
+        repo = _make_repo("a")
+        repo.staged = [("M", "x")]
+        s = _state(repo, selected=0)
+        _set_message(s, repo, "draft")
+        s.field_cursor = len(_message(s, repo))
+        s.store.set_repo_busy(repo, True)
+
+        result = handle_main_key(s, ord("!"))
+
+        self.assertIsNone(result)
+        self.assertEqual(_message(s, repo), "draft")
+        self.assertEqual(s.field_cursor, len("draft"))
+
+    def test_esc_keeps_busy_row_message_and_requests_quit(self) -> None:
+        repo = _make_repo("a")
+        repo.staged = [("M", "x")]
+        s = _state(repo, selected=0)
+        _set_message(s, repo, "draft")
+        s.store.set_repo_busy(repo, True)
+
+        result = handle_main_key(s, 27)
+
+        self.assertEqual(result, "confirm-quit")
+        self.assertEqual(_message(s, repo), "draft")
 
 
 @unittest.skipUnless(UI_AVAILABLE, "ui module unavailable")
@@ -154,44 +324,44 @@ class TestTypingAndCursor(unittest.TestCase):
         s = _state(a, selected=0)
         handle_main_key(s, ord("h"))
         handle_main_key(s, ord("i"))
-        self.assertEqual(a.message, "hi")
+        self.assertEqual(_message(s, a), "hi")
         self.assertEqual(s.field_cursor, 2)
 
     def test_typing_in_middle(self) -> None:
         a = _make_repo("a")
         a.staged = [("M", "x")]
-        a.message = "hllo"
         s = _state(a, selected=0)
+        _set_message(s, a, "hllo")
         s.field_cursor = 1  # between "h" and "l"
         handle_main_key(s, ord("e"))
-        self.assertEqual(a.message, "hello")
+        self.assertEqual(_message(s, a), "hello")
         self.assertEqual(s.field_cursor, 2)
 
     def test_backspace_deletes_before_cursor(self) -> None:
         a = _make_repo("a")
         a.staged = [("M", "x")]
-        a.message = "ab"
         s = _state(a, selected=0)
+        _set_message(s, a, "ab")
         s.field_cursor = 2
         handle_main_key(s, curses.KEY_BACKSPACE)
-        self.assertEqual(a.message, "a")
+        self.assertEqual(_message(s, a), "a")
         self.assertEqual(s.field_cursor, 1)
 
     def test_forward_delete_drops_char_under_cursor(self) -> None:
         a = _make_repo("a")
         a.staged = [("M", "x")]
-        a.message = "abc"
         s = _state(a, selected=0)
+        _set_message(s, a, "abc")
         s.field_cursor = 1
         handle_main_key(s, curses.KEY_DC)
-        self.assertEqual(a.message, "ac")
+        self.assertEqual(_message(s, a), "ac")
         self.assertEqual(s.field_cursor, 1)
 
     def test_left_with_message_moves_cursor(self) -> None:
         a = _make_repo("a")
         a.staged = [("M", "x")]
-        a.message = "hello"
         s = _state(a, selected=0)
+        _set_message(s, a, "hello")
         s.field_cursor = 3
         handle_main_key(s, curses.KEY_LEFT)
         self.assertEqual(s.field_cursor, 2)
@@ -199,8 +369,8 @@ class TestTypingAndCursor(unittest.TestCase):
     def test_right_clamps_at_end(self) -> None:
         a = _make_repo("a")
         a.staged = [("M", "x")]
-        a.message = "hi"
         s = _state(a, selected=0)
+        _set_message(s, a, "hi")
         s.field_cursor = 2
         handle_main_key(s, curses.KEY_RIGHT)
         self.assertEqual(s.field_cursor, 2)
@@ -208,8 +378,8 @@ class TestTypingAndCursor(unittest.TestCase):
     def test_home_jumps_to_zero(self) -> None:
         a = _make_repo("a")
         a.staged = [("M", "x")]
-        a.message = "hello"
         s = _state(a, selected=0)
+        _set_message(s, a, "hello")
         s.field_cursor = 4
         handle_main_key(s, curses.KEY_HOME)
         self.assertEqual(s.field_cursor, 0)
@@ -217,8 +387,8 @@ class TestTypingAndCursor(unittest.TestCase):
     def test_end_jumps_to_len(self) -> None:
         a = _make_repo("a")
         a.staged = [("M", "x")]
-        a.message = "hello"
         s = _state(a, selected=0)
+        _set_message(s, a, "hello")
         s.field_cursor = 0
         handle_main_key(s, curses.KEY_END)
         self.assertEqual(s.field_cursor, 5)
@@ -308,6 +478,15 @@ class TestTaskPanelKeyHandler(unittest.TestCase):
         handle_task_panel_key(s, 10)  # Enter on a running task
         labels = [t.label for t in s.tasks.snapshot()]
         self.assertEqual(labels, ["a", "b", "c"])  # unchanged
+
+    def test_enter_keeps_pending_task(self) -> None:
+        s = self._state_with_tasks("a", "b", "c")
+        items = s.tasks.snapshot()
+        s.tasks.update(items[1], "pending")
+        s.task_selected = 1
+        handle_task_panel_key(s, 10)
+        labels = [t.label for t in s.tasks.snapshot()]
+        self.assertEqual(labels, ["a", "b", "c"])
 
     def test_enter_clamps_selection_after_removal(self) -> None:
         s = self._state_with_tasks("a", "b", "c")
@@ -570,11 +749,13 @@ class TestResetPromptHandler(unittest.TestCase):
         s.action_menu = ActionMenu(target_label="x", target_path=Path("/tmp/x"))
         s.reset_prompt = self._prompt()
         s.reset_prompt.typed = "2"
-        handle_reset_prompt_key(s, 10)
-        # Both modals close. (The actual git work runs in a daemon thread
-        # against /tmp/x — it will fail silently, that's fine.)
+        with mock.patch("features.reset_prompt.actions.kick_off_action") as action:
+            handle_reset_prompt_key(s, 10)
         self.assertIsNone(s.reset_prompt)
         self.assertIsNone(s.action_menu)
+        action.assert_called_once()
+        self.assertEqual(action.call_args.args[1], "soft_reset")
+        self.assertEqual(action.call_args.kwargs["reset_count"], 2)
 
     def test_empty_enter_does_not_mean_reset_all(self) -> None:
         s = _state(_make_repo("a"))
@@ -612,29 +793,36 @@ class TestBranchNamePromptHandler(unittest.TestCase):
 
 @unittest.skipUnless(UI_AVAILABLE, "ui module unavailable")
 class TestBranchPickerHandler(unittest.TestCase):
-    def _picker(self, branches=None, selected=0) -> BranchPicker:
+    def _picker(
+            self,
+            state: State,
+            branches=None,
+            selected: int = 0) -> BranchPicker:
         branches = branches or ["main", "feature/x", "bugfix/y"]
-        return BranchPicker(
+        picker = BranchPicker(
             target_label="repo", target_path=Path("/tmp/repo"),
-            branches=branches, current="main", selected=selected,
+            load_id="branch-picker:test", selected=selected,
         )
+        state.view_loads.finish(
+            picker.load_id, list(branches), details={"current": "main"})
+        return picker
 
     def test_down_clamps_to_last(self) -> None:
         s = _state(_make_repo("a"))
-        s.branch_picker = self._picker(selected=3)  # already last
+        s.branch_picker = self._picker(s, selected=3)  # already last
         handle_branch_picker_key(s, curses.KEY_DOWN)
         self.assertEqual(s.branch_picker.selected, 2)
 
     def test_up_clamps_to_zero(self) -> None:
         s = _state(_make_repo("a"))
-        s.branch_picker = self._picker(selected=0)
+        s.branch_picker = self._picker(s, selected=0)
         handle_branch_picker_key(s, curses.KEY_UP)
-        self.assertEqual(s.branch_picker.selected, 0)
+        self.assertEqual(s.branch_picker.selected, -1)
 
     def test_esc_closes_picker_only(self) -> None:
         s = _state(_make_repo("a"))
         s.action_menu = ActionMenu(target_label="x", target_path=Path("/tmp/x"))
-        s.branch_picker = self._picker()
+        s.branch_picker = self._picker(s)
         handle_branch_picker_key(s, 27)
         self.assertIsNone(s.branch_picker)
         self.assertIsNotNone(s.action_menu)
@@ -673,8 +861,8 @@ class TestTaskActionMenu(unittest.TestCase):
         s = self._state()
         repo = _make_repo("a")
         t = s.tasks.add("↗ a: Build")
-        s.tasks.set_meta(t, repo=repo, slug="o/a", run_id=42,
-                         workflow_name="Build")
+        s.workflow_runs.create_for_task(t, repo=repo, slug="o/a", run_id=42,
+                                        workflow_name="Build")
         open_task_action_menu(s, t)
         self.assertEqual(self._ids(s), ["cancel_run", "view_log", "close"])
 
@@ -682,19 +870,24 @@ class TestTaskActionMenu(unittest.TestCase):
         s = self._state()
         repo = _make_repo("a")
         t = s.tasks.add("↗ a: Build")
-        s.tasks.set_meta(t, repo=repo, slug="o/a", run_id=42,
-                         workflow_name="Build",
-                         run_url="https://example/runs/42")
+        s.workflow_runs.create_for_task(
+            t,
+            repo=repo,
+            slug="o/a",
+            run_id=42,
+            workflow_name="Build",
+            run_url="https://example/runs/42",
+        )
         open_task_action_menu(s, t)
         self.assertEqual(
             self._ids(s),
             ["cancel_run", "view_log", "open_in_browser", "close"])
 
     def test_browser_open_allows_http_urls_only(self) -> None:
-        self.assertTrue(_is_safe_browser_url("https://example.com/runs/1"))
-        self.assertTrue(_is_safe_browser_url("http://example.com/runs/1"))
-        self.assertFalse(_is_safe_browser_url("file:///tmp/x"))
-        self.assertFalse(_is_safe_browser_url("javascript:alert(1)"))
+        self.assertTrue(is_safe_browser_url("https://example.com/runs/1"))
+        self.assertTrue(is_safe_browser_url("http://example.com/runs/1"))
+        self.assertFalse(is_safe_browser_url("file:///tmp/x"))
+        self.assertFalse(is_safe_browser_url("javascript:alert(1)"))
 
     def test_running_run_with_pending_then_run_child(self) -> None:
         # Parent run task has a pending placeholder child — the modal
@@ -702,13 +895,12 @@ class TestTaskActionMenu(unittest.TestCase):
         s = self._state()
         repo = _make_repo("a")
         parent = s.tasks.add("↗ a: Build")
-        s.tasks.set_meta(parent, repo=repo, slug="o/a", run_id=42,
-                         workflow_name="Build")
+        s.workflow_runs.create_for_task(parent, repo=repo, slug="o/a", run_id=42,
+                                        workflow_name="Build")
         child = s.tasks.add("  ↪ then run: Deploy", parent=parent)
         s.tasks.update(child, "pending")
-        s.tasks.set_meta(child, repo=repo,
-                         pending_after_workflow="Build",
-                         pending_target="Deploy")
+        s.workflow_followups.create_for_task(
+            child, repo=repo, parent_workflow="Build", target="Deploy")
         open_task_action_menu(s, parent)
         self.assertEqual(
             self._ids(s),
@@ -720,13 +912,12 @@ class TestTaskActionMenu(unittest.TestCase):
         s = self._state()
         repo = _make_repo("a")
         parent = s.tasks.add("↗ a: Build")
-        s.tasks.set_meta(parent, repo=repo, slug="o/a", run_id=42,
-                         workflow_name="Build")
+        s.workflow_runs.create_for_task(parent, repo=repo, slug="o/a", run_id=42,
+                                        workflow_name="Build")
         child = s.tasks.add("  ↪ then run: Deploy", parent=parent)
         s.tasks.update(child, "pending")
-        s.tasks.set_meta(child, repo=repo,
-                         pending_after_workflow="Build",
-                         pending_target="Deploy")
+        s.workflow_followups.create_for_task(
+            child, repo=repo, parent_workflow="Build", target="Deploy")
         open_task_action_menu(s, child)
         # Placeholder itself: no cancel_run (no run_id of its own),
         # but Change/Cancel-then-run + Close.
@@ -741,8 +932,8 @@ class TestTaskActionMenu(unittest.TestCase):
         s = self._state()
         repo = _make_repo("a")
         t = s.tasks.add("↗ a: Build")
-        s.tasks.set_meta(t, repo=repo, slug="o/a", run_id=42,
-                         workflow_name="Build")
+        s.workflow_runs.create_for_task(t, repo=repo, slug="o/a", run_id=42,
+                                        workflow_name="Build")
         s.tasks.update(t, "ok")
         open_task_action_menu(s, t)
         ids = self._ids(s)
@@ -752,14 +943,45 @@ class TestTaskActionMenu(unittest.TestCase):
                       if it.id == "cancel_run")
         self.assertFalse(cancel.enabled)
 
+    def test_active_runtime_job_controls_terminal_looking_task(self) -> None:
+        s = self._state()
+        t = s.tasks.add("a: working")
+        s.tasks.update(t, "ok")
+        job = s.job_registry.start(JobSpec(
+            kind="commit-batch",
+            label="commit workers",
+            local_mutation=True,
+        ))
+        s.job_registry.link_task(job, t)
+
+        open_task_action_menu(s, t)
+
+        self.assertEqual(self._ids(s), ["cancel_pipeline", "close"])
+
+    def test_finished_runtime_job_allows_terminal_task_removal(self) -> None:
+        s = self._state()
+        t = s.tasks.add("a: working")
+        s.tasks.update(t, "ok")
+        job = s.job_registry.start(JobSpec(
+            kind="commit-batch",
+            label="commit workers",
+            local_mutation=True,
+        ))
+        s.job_registry.link_task(job, t)
+        s.job_registry.finish(job, JobStatus.OK)
+
+        open_task_action_menu(s, t)
+
+        self.assertEqual(self._ids(s), ["remove", "close"])
+
     def test_open_initial_selection_skips_disabled(self) -> None:
         # When the leading items are disabled, the cursor should land
         # on the first enabled one rather than parking on a no-op row.
         s = self._state()
         repo = _make_repo("a")
         t = s.tasks.add("↗ a: Build")
-        s.tasks.set_meta(t, repo=repo, slug="o/a", run_id=42,
-                         workflow_name="Build")
+        s.workflow_runs.create_for_task(t, repo=repo, slug="o/a", run_id=42,
+                                        workflow_name="Build")
         s.tasks.update(t, "ok")  # makes cancel_run disabled
         open_task_action_menu(s, t)
         first_enabled = next(

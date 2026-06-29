@@ -6,10 +6,13 @@ workspace and closes the dialog; Esc closes without switching."""
 from __future__ import annotations
 
 import curses
-from typing import Optional
 
-from core.models import State, WorkspaceSwitcher
-from core.workers import switch_workspace
+from core.state.app import State
+from core.state.workspaces import WorkspaceSwitcher
+from features.workspace_switcher.actions import (
+    handle_workspace_switcher_key as handle_workspace_switcher_key_action,
+)
+from features.workspace_switcher.projection import workspace_switcher_hint_specs
 
 from .app_menu import _draw_workspace_row
 from ..colors import PAIR_DLG_CYAN, PAIR_DLG_FG
@@ -17,7 +20,7 @@ from ..geometry import (
     clamp_scroll, draw_modal_fill, draw_scroll_overflow, end_truncate,
     modal_geometry, safe_addstr,
 )
-from ..hints import KEY_ENTER, KEY_ESC, KEY_UP_DOWN, Hint, render_hints
+from ..hints import Hint, render_hints
 
 _PAD_TOP = 1
 _PAD_BOTTOM = 1
@@ -26,25 +29,9 @@ _MODAL_W = 70
 _BODY_TARGET_ROWS = 14
 
 
-def open_workspace_switcher(state: State) -> None:
-    """Install the picker with the cursor on the active workspace."""
-    if not state.workspaces:
-        return
-    idx = max(0, min(state.active_workspace_index, len(state.workspaces) - 1))
-    state.workspace_switcher = WorkspaceSwitcher(selected=idx)
-
-
 def _hints(state: State, switcher: WorkspaceSwitcher) -> list:
-    hints = [Hint(KEY_UP_DOWN, "select")]
-    n = len(state.workspaces)
-    if 0 <= switcher.selected < n:
-        ws = state.workspaces[switcher.selected]
-        if switcher.selected == state.active_workspace_index:
-            hints.append(Hint(KEY_ENTER, "stay (already active)"))
-        else:
-            hints.append(Hint(KEY_ENTER, f"switch to {ws.display_name}"))
-    hints.append(Hint(KEY_ESC, "close"))
-    return hints
+    return [Hint(keys, action)
+            for keys, action in workspace_switcher_hint_specs(state, switcher)]
 
 
 def draw_workspace_switcher(stdscr, state: State, sidebar_x: int) -> None:
@@ -124,44 +111,6 @@ def draw_workspace_switcher(stdscr, state: State, sidebar_x: int) -> None:
                  _hints(state, switcher), attr=sb | curses.A_DIM)
 
 
-def handle_workspace_switcher_key(state: State, key: int) -> Optional[str]:
+def handle_workspace_switcher_key(state: State, key: int) -> str | None:
     """Returns ``switch-workspace`` when Enter lands on a new workspace."""
-    switcher = state.workspace_switcher
-    if switcher is None:
-        return None
-    if key == 27:  # Esc
-        state.workspace_switcher = None
-        return None
-
-    n = len(state.workspaces)
-    if n == 0:
-        state.workspace_switcher = None
-        return None
-
-    if key == curses.KEY_UP:
-        switcher.selected = max(0, switcher.selected - 1)
-        return None
-    if key == curses.KEY_DOWN:
-        switcher.selected = min(n - 1, switcher.selected + 1)
-        return None
-    if key == curses.KEY_PPAGE:
-        switcher.selected = max(0, switcher.selected - 10)
-        return None
-    if key == curses.KEY_NPAGE:
-        switcher.selected = min(n - 1, switcher.selected + 10)
-        return None
-    if key == curses.KEY_HOME:
-        switcher.selected = 0
-        return None
-    if key == curses.KEY_END:
-        switcher.selected = n - 1
-        return None
-
-    if key in (10, 13, curses.KEY_ENTER):
-        target = switcher.selected
-        state.workspace_switcher = None
-        if target != state.active_workspace_index:
-            switch_workspace(state, target)
-            return "switch-workspace"
-        return None
-    return None
+    return handle_workspace_switcher_key_action(state, key)
