@@ -231,7 +231,7 @@ def _body_row_hints(state: State) -> List[Hint]:
     if cur_repo is not None:
         hints.append(Hint(KEY_TAB, "actions…"))
     elif cur_child is not None:
-        child_status = _child_status(state, cur_child[1])
+        child_status = _child_status(state, cur_child[1], cur_child[0])
         if child_status.kind == "submodule":
             hints.append(Hint(KEY_TAB, "actions…"))
 
@@ -561,21 +561,29 @@ def draw_main(stdscr, state: State) -> None:
         if 0 <= body_idx < len(body_rows) and body_idx in y_for_body:
             row = body_rows[body_idx]
             target = None
+            target_message: Optional[str] = None
             if row[0] == "repo":
                 r = row[1]
-                target = r if repo_row_state(state, r).editable else None
+                row_state = repo_row_state(state, r)
+                if row_state.editable:
+                    target = r
+                    target_message = row_state.message
             elif row[0] == "child":
+                parent = row[1]
                 ch = row[2]
-                child_status = _child_status(state, ch)
+                child_status = _child_status(state, ch, parent)
                 if child_status.kind == "submodule":
-                    target = ch if child_row_state(state, ch).editable else None
+                    row_state = child_row_state_for_parent(state, parent, ch)
+                    if row_state.editable:
+                        target = ch
+                        target_message = row_state.message
             if target is not None:
                 # field_w-1 leaves a single trailing cell as an
                 # end-of-field cap; the message itself starts at
                 # field_x so the cursor's home is the first
                 # character (no inert leading column).
                 inner_w = field_w - 1
-                target_message = _holder_message(state, target)
+                target_message = target_message or ""
                 cur = max(0, min(state.field_cursor, len(target_message)))
                 _, cur_in_visible = field_visible(
                     target_message, cur, inner_w, True)

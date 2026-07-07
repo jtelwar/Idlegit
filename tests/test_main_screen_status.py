@@ -24,6 +24,7 @@ try:
         _child_refresh_spinner_visible,
         _repo_refresh_spinner_visible,
         draw_child_row,
+        draw_main,
         draw_repo_row,
     )
     import ui.main_screen as main_screen  # noqa: E402
@@ -177,6 +178,83 @@ class TestRefreshSpinnerVisibility(unittest.TestCase):
             )
 
         self.assertTrue(any("[replacement]" in text for text in drawn))
+
+    def test_draw_main_cursor_handles_stale_selected_child_after_topology_replacement(
+            self) -> None:
+        class FakeScreen:
+            def erase(self) -> None:
+                return None
+
+            def getmaxyx(self) -> tuple[int, int]:
+                return (40, 120)
+
+            def move(self, _y: int, _x: int) -> None:
+                return None
+
+            def addstr(self, *_args, **_kwargs) -> None:
+                return None
+
+            def refresh(self) -> None:
+                return None
+
+        parent = _make_repo("parent")
+        canonical = _make_repo("child")
+        child = ChildRef(
+            repo=canonical,
+            nested_path=parent.path / "child",
+            kind="submodule",
+            dirty=True,
+            message="stale message",
+        )
+        parent.children = [child]
+        state = make_state(parent, canonical, selected=1)
+        replacement = ChildRef(
+            repo=canonical,
+            nested_path=child.nested_path,
+            kind="submodule",
+            dirty=True,
+            message="replacement message",
+        )
+        replaced = False
+
+        def replace_child_during_row_draw(*_args, **_kwargs) -> None:
+            nonlocal replaced
+            if replaced:
+                return
+            replaced = True
+            state.store.replace_workspace_topology(
+                name="ws",
+                folders=[],
+                repos=[parent, canonical],
+                children=[
+                    ChildTopologySnapshot(
+                        parent_repo=parent,
+                        child=replacement,
+                        status=ChildStatusSnapshot(
+                            kind="submodule",
+                            dirty=True,
+                            message="replacement message",
+                        ),
+                    ),
+                ],
+            )
+
+        with (
+            mock.patch.object(main_screen, "safe_addstr"),
+            mock.patch.object(main_screen, "draw_sidebar"),
+            mock.patch.object(main_screen, "draw_child_row",
+                              side_effect=replace_child_during_row_draw),
+            mock.patch.object(main_screen.curses, "color_pair",
+                              side_effect=lambda pair: pair),
+            mock.patch.object(main_screen.curses, "pair_number",
+                              return_value=0),
+            mock.patch.object(main_screen.curses, "curs_set") as curs_set,
+        ):
+            draw_main(FakeScreen(), state)
+
+        self.assertTrue(replaced)
+        self.assertIsNone(state.store.child_id_for(child))
+        curs_set.assert_any_call(2)
 
 
 @unittest.skipUnless(UI_AVAILABLE, "ui module unavailable")

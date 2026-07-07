@@ -1,4 +1,7 @@
-0.31.232
+0.31.233
+
+### 0.31.233
+- 2026-07-05: fix stale child-row cursor rendering during in-flight actions.
 
 ### 0.31.232
 - 2026-06-29: consolidate workspace switch save and load progress into one task row.
